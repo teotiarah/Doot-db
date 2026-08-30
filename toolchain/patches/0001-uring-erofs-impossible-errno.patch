@@ -1,0 +1,30 @@
+--- a/lib/std/Io/Uring.zig
++++ b/lib/std/Io/Uring.zig
+@@ -2726,12 +2726,13 @@
+             error.FileTooBig => return errnoBug(.FBIG),
+             error.NoSpaceLeft => return errnoBug(.NOSPC),
+             error.DeviceBusy => return errnoBug(.BUSY), // EXCL unset.
+             error.FileBusy => return errnoBug(.TXTBSY),
+             error.PathAlreadyExists => return errnoBug(.EXIST), // Not creating.
+             error.OperationUnsupported => return errnoBug(.OPNOTSUPP), // No TMPFILE, no locks.
++            error.ReadOnlyFileSystem => return errnoBug(.ROFS), // Not creating, read-only access.
+             else => |e| return e,
+         },
+     };
+ }
+ 
+ fn dirStat(userdata: ?*anyopaque, dir: Dir) Dir.StatError!Dir.Stat {
+@@ -3151,12 +3152,13 @@
+     const fd = ev.openat(&maybe_sync.cancel_region, dir.handle, sub_path_posix, .{
+         .CLOEXEC = true,
+         .PATH = true,
+     }, 0) catch |err| switch (err) {
+         error.WouldBlock => return errnoBug(.AGAIN),
+         error.OperationUnsupported => return errnoBug(.OPNOTSUPP), // Not asking for locks.
++        error.ReadOnlyFileSystem => return errnoBug(.ROFS), // O_PATH only, not creating.
+         else => |e| return e,
+     };
+     defer ev.closeAsync(fd);
+     return ev.realPath(try maybe_sync.enterSync(ev), fd, out_buffer);
+ }
+ 

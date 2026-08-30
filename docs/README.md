@@ -22,6 +22,11 @@ anywhere durable.
 | `07-decisions.md` | ADR log — every locked call and every rejected alternative |
 | `08-roadmap.md` | milestones to first public deploy |
 
+`07-decisions.md` has an **M0 findings** section (D26–D31) holding everything the
+validation spikes measured, including the three places where a spike contradicted an
+earlier decision. Earlier decisions carry amendments pointing forward rather than being
+silently rewritten.
+
 ## Working rules
 
 1. **No implementation while a decision is open.** Decisions land in `07-decisions.md`

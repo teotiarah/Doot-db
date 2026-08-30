@@ -8,19 +8,25 @@ Each milestone has an exit condition that is a demonstrable fact, not a feeling.
 
 ---
 
-## M0 — Retire the unknowns
+## M0 — Retire the unknowns · **COMPLETE**
 
-Throwaway spikes. None of this code survives into the product; the point is to find out
-whether three assumptions hold before anything is built on them.
+Throwaway spikes in `spikes/`; see `spikes/README.md` to reproduce. Findings are D26–D31
+in `07-decisions.md`, with amendments on D3, D13, D14 and D18.
 
-| spike | question | why it is first |
+| spike | question | outcome |
 |---|---|---|
-| SSE through Cloudflare | does the edge stream `text/event-stream` from the origin without buffering, and hold the connection open? | the live explorer is the adoption driver (`00-vision.md`). If the edge buffers, the dashboard design changes — better to know now than in launch week |
-| Origin TLS | does vendored `tls.zig` complete a TLS 1.3 handshake with a Cloudflare Origin CA cert, under `Full (strict)` with Authenticated Origin Pulls? | D13's whole resolution rests on this. Failure means reopening the topology decision |
-| io_uring throughput and idle cost | requests/sec on a trivial handler, and RSS at 10k idle keep-alive connections | D14 asserts idle connections are cheap. Measure it before the concurrency model is load-bearing |
+| io_uring throughput and idle cost | requests/sec, and RSS at 10k idle keep-alive connections | **2.9–3.2M req/s** single-threaded; **8.11 KB/conn** naive, **0.63–4.14 KB/conn** pooled. D14's estimate was accurate to 1.4% — but the mechanism changed (D27, D28) |
+| Origin TLS | does a vendored pure-Zig TLS 1.3 server work, including Authenticated Origin Pulls? | **Yes, fully.** Verified against OpenSSL 3.5.7, EC and RSA chains, mTLS correct in both directions, 7.3 MB static binary with no OpenSSL. Runs on the raw ring (D29) |
+| SSE through Cloudflare | does the edge stream `text/event-stream` without buffering? | **Our side correct and cheap** (4.33 KB/subscriber at 5,000). Found and fixed a frame-corruption bug (D30). **Cloudflare remains unverified and is a real risk with a documented fix** (D31) |
 
-**Exit:** all three answered with numbers written into `07-decisions.md`. Any failure
-reopens the relevant decision *before* implementation, per the two-pass rule.
+It earned its place. Three things would have gone undetected into later milestones:
+`std.Io` cannot do networking on the pinned toolchain at all; a shared io_uring send
+buffer silently corrupts frames above ~50 concurrent subscribers; and Cloudflare
+buffering SSE is a known, recurring failure that needs specific zone configuration.
+
+**Not closed:** the Cloudflare half of the SSE question needs the live zone. The probe
+that answers it (`spikes/sse/sseprobe.py`) is written and must be run against
+`doot.run` before M4 builds the dashboard on the assumption it streams.
 
 ---
 
@@ -62,9 +68,20 @@ The seven endpoints. Product-visible for the first time.
 - Credit accounting: deduct, refund on failure, `402` on exhaustion
 - Error catalogue with stable codes; HMAC-signed pagination cursors
 
+Also, because this is the first milestone with something deployable, it is where the
+edge gets stood up and the last open M0 question gets closed:
+
+- Origin TLS with a real Cloudflare Origin CA certificate, `Full (strict)`,
+  Authenticated Origin Pulls, firewall restricted to Cloudflare ranges
+- The full zone configuration in D31, applied as code rather than console clicks
+- A throwaway SSE endpoint behind the real zone, and
+  **`spikes/sse/sseprobe.py` run against `doot.run` until it exits zero**
+
 **Exit:** every row of the error table reproducible by a `curl` invocation, held in a
 script that runs in CI. Credits and rate limits verified to be exact under concurrent
-load, not approximately right.
+load, not approximately right. **And the SSE probe passes through Cloudflare** — if it
+cannot be made to pass, the live view falls back to long-polling (D31) and that is
+decided here, not during M4.
 
 ---
 
@@ -86,6 +103,10 @@ request. Enumeration probes on signup, login and reset return identical response
 ## M4 — Dashboard
 
 The adoption driver. Plain HTML/CSS/JS, `@embedFile`d.
+
+**Gate: the SSE probe must already pass through the real Cloudflare zone (M2, D31).**
+Building the live view before that is confirmed risks discovering at the end of the
+most user-visible milestone that the transport does not work.
 
 - Signup and login
 - **First-run screen: the API key beside a paste-ready `curl` command.** This screen is
@@ -136,7 +157,8 @@ about their use case, not about how to use Doot.
 ## Sequencing rules
 
 1. **M0 completes before M1 begins.** Its whole purpose is preventing rework, which is
-   forfeited by running it in parallel.
+   forfeited by running it in parallel. *(Done. Three decisions amended before any
+   product code existed, which is exactly the intended outcome.)*
 2. **Decisions before code, always.** A question surfacing mid-milestone goes to
    `07-decisions.md` first. No design question is settled inside an implementation diff.
 3. **M1's exit conditions are non-negotiable.** Storage bugs found after launch are

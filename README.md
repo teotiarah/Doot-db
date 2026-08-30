@@ -52,7 +52,14 @@ Full reasoning in [`docs/00-vision.md`](docs/00-vision.md).
 
 ## Status
 
-**Pre-implementation.** Design and documentation only — no code yet.
+**Pre-implementation.** Design and documentation, plus the M0 spikes that validate the
+riskiest assumptions before any product code is written. No product code yet.
+
+M0 measured, on one 8-core box: **2.9–3.2M req/s** on a single-threaded io_uring loop,
+**0.63–4.14 KB of memory per idle keep-alive connection**, TLS 1.3 at the origin from a
+7.3 MB static binary with no OpenSSL, and SSE at **4.33 KB per live subscriber**. It also
+surfaced three problems worth finding early — see [`docs/07-decisions.md`](docs/07-decisions.md)
+D26–D31.
 
 Doot runs on a single machine and makes a best-effort durability promise, not a
 guarantee. Data is backed up off-box continuously with a recovery point of a few minutes.
@@ -81,3 +88,10 @@ collapsed into a single `REFERENCE.md` at v1-beta and deleted. Start with
 | [`06-auth.md`](docs/06-auth.md) | accounts, API keys, sessions |
 | [`07-decisions.md`](docs/07-decisions.md) | every locked decision and rejected alternative |
 | [`08-roadmap.md`](docs/08-roadmap.md) | milestones to first public deploy |
+
+Two directories outside `docs/` are permanent:
+
+| | |
+|---|---|
+| [`toolchain/`](toolchain/) | pinned Zig version, hash, and the stdlib patch it requires. `toolchain/setup.sh` builds the environment from scratch |
+| [`spikes/`](spikes/) | M0 validation code. Disposable, deleted at M1 — see [`spikes/README.md`](spikes/README.md) |

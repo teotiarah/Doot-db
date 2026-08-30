@@ -102,21 +102,38 @@ scheduled.
 
 ## Concurrency
 
-Zig **0.16**, pinned. `std.Io` with the io_uring backend on Linux.
+Zig **0.16.0**, pinned, with the stdlib patch from `toolchain/`. io_uring driven
+**directly** via `std.os.linux.IoUring` — not through `std.Io`, which cannot do it on
+this toolchain (D26, D27).
 
-- `SO_REUSEPORT`, N worker threads (N = core count), each with its own io_uring and
-  its own accept queue. No shared accept lock, no thundering herd.
-- Connections are pinned to the worker that accepted them.
+- One event loop per worker thread, each with its own ring and its own `SO_REUSEPORT`
+  accept socket. No shared accept lock, no thundering herd.
+- `accept_multishot` for the listen socket, so the kernel re-arms accepts rather than
+  us re-posting one per connection. Re-post only when `IORING_CQE_F_MORE` is clear.
+- **A repeating `timeout` SQE is mandatory.** An otherwise-idle ring blocks forever in
+  `copy_cqes` and no housekeeping runs. The same timer drives expiry sweeps, SSE
+  heartbeats and stats, so it is not overhead.
+- Connections are pinned to the worker that accepted them. Connection state is a plain
+  struct we size ourselves, from a pooled slab — not a fiber with a reserved stack.
 - Index shards (64) are lock-protected, so any worker can serve any request. Storage
   appends go through per-class staging buffers with a dedicated commit thread.
 - Background threads: commit, snapshot, segment reclamation, backup uploader, outbound
   mail. All off the request path.
 
-The io_uring model is chosen for idle connection cost, not raw throughput.
-Thread-per-connection at 8 MB of stack makes ten thousand idle keep-alive connections
-impossible; io_uring with small per-connection state makes it routine. Since keep-alive
-is the single highest-leverage latency optimisation available, the concurrency model
-has to make idle connections cheap.
+Driving the ring ourselves is more code than calling `std.Io`, and it is the right
+trade: it is the layer Doot most needs control over, and on Zig 0.16.0 the alternative
+does not function. `std.Io.Uring` stubs out its entire networking surface, and
+`std.Io.Threaded` wedges permanently after `async_limit` keep-alive connections because
+each idle one owns a pool thread.
+
+Measured on a single thread, pipelined over loopback with client and server sharing 8
+cores — a floor, not a ceiling: **2.9–3.2M req/s**. Roughly a hundred times any
+plausible demand, which is the point: the box is never the constraint.
+
+**Ring buffer ownership.** Any buffer handed to the ring belongs to the kernel until its
+completion arrives. Reusing one before then corrupts data in flight — measured, not
+theoretical (D30). Buffers shared across many sends must either be written once and
+never mutated, or refcounted and released on completion.
 
 ## HTTP behaviour that actually matters
 
@@ -133,9 +150,14 @@ Each of these is worth more than any storage micro-optimisation.
 - **Handle `Expect: 100-continue`.** `curl` sends it for larger bodies and stalls a
   full second if it is ignored — a real, frequently-shipped bug.
 - **Buffers pooled per in-flight request, not per connection.** 256 concurrent × 256 KB
-  = 64 MB of body buffers total, independent of idle connection count. Idle connections
-  hold ~8 KB each. At around 5M entries idle connections would otherwise outweigh the
-  index (`04-storage.md`).
+  = 64 MB of body buffers total, independent of idle connection count. At around 5M
+  entries idle connections would otherwise outweigh the index (`04-storage.md`).
+  Measured at 10,000 idle keep-alive connections (D28): naive allocation costs
+  **8.11 KB/conn (79 MB)**; pooling connection structs into a static array and read
+  buffers into one arena drops that to **2.14 KB/conn (21 MB)** at a 2 KB buffer, and
+  **0.63 KB/conn (6.3 MB)** at 512 B. Resident cost is pages *touched*, not bytes
+  allocated, so the idle read buffer should be small — a request head is capped at 8 KB,
+  but an idle connection needs only enough to notice one starting.
 - **Bounded request line and header sizes** (8 KB total), rejected early.
 - **No chunked request bodies in v1.** `Content-Length` required on writes; that is
   what lets us reject oversized uploads before reading and keeps buffer sizing static.
@@ -154,15 +176,35 @@ framework, no bundler, no build step, no separate deployment.
 - Rendering keys off the stored `Content-Type`: JSON as a collapsible tree, text as
   text, anything else as a hex/size summary. The server never parses bodies.
 
-**Verify early: Cloudflare's buffering behaviour on SSE.** This is the one edge
-behaviour that could quietly break the feature the product is betting adoption on. It
-is milestone M0 in `08-roadmap.md`, not a launch-week discovery. Responses are sent
-with `Content-Type: text/event-stream`, `Cache-Control: no-cache`,
-`X-Accel-Buffering: no`, and periodic heartbeat comments to keep intermediaries from
-idling the stream out.
+### SSE, and the Cloudflare hazard
 
-Caching is **bypassed for all of `/v1`**. Stale reads would break the state-storage
-use case outright, which is a large fraction of why anyone would adopt Doot.
+Our side is measured and correct (D18, D30): headers flush immediately with an opening
+comment so the client's stream opens before the first event exists, events arrive at
+exactly the emit interval, and 5,000 concurrent subscribers cost **4.33 KB each
+(21.7 MB)**. Response headers are `Content-Type: text/event-stream`,
+`Cache-Control: no-cache, no-store, no-transform`, `X-Accel-Buffering: no`, no
+`Content-Length`, plus periodic heartbeat comments.
+
+**Cloudflare is a live risk to this feature, not a hypothetical one.** Buffering of
+`text/event-stream` has been reported repeatedly across years, and for most of that
+history the only workaround was turning the proxy off. There is now a first-class fix —
+a Configuration Rule setting response body buffering to `none`, available on the Free
+plan — but it must be applied and then *verified*. Full reasoning, the complete zone
+configuration, and the fallback if it fails are in D31.
+
+Two consequences for this document:
+
+- **The heartbeat has a ceiling, not just a purpose.** Cloudflare's proxy read timeout
+  on Free and Pro is 100 seconds; an origin that sends nothing in that window gets a
+  524. Heartbeat interval is therefore **15 seconds**.
+- **Caching is bypassed for all of `/v1` and for the stream path.** A stale read breaks
+  the state-storage use case outright, which is a large part of why anyone would adopt
+  Doot.
+
+`spikes/sse/sseprobe.py` is the verification procedure and survives the deletion of
+`spikes/` as the one artifact worth keeping: point it at the live origin and it judges
+streaming on arrival timing rather than content, because a buffering proxy still
+delivers every event — just late and all at once.
 
 ## Outbound calls
 
