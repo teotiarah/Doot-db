@@ -342,17 +342,24 @@ pub const SegmentSet = struct {
         self.open_id[class] = null;
     }
 
-    /// Appends one already-encoded record. Returns where it landed.
+    /// Claims space for a record of `len` bytes and returns where it will go,
+    /// rotating first if it does not fit.
     ///
-    /// Rotation is transparent: when the record does not fit, the open segment is
-    /// sealed and a fresh one created.
-    pub fn append(self: *SegmentSet, class: config.Class, bytes: []const u8, expires_at: u32) Error!Location {
-        if (bytes.len > record.max_record_bytes) return error.RecordTooLarge;
+    /// Exists because a record's tag back-pointers must be published to the chain
+    /// heads *before* the record is encoded, and publishing them requires knowing
+    /// the record's own address. Callers must follow with `writeReserved`, or
+    /// `unreserve` on failure.
+    ///
+    /// Reservations are not a hole-tolerant mechanism: the caller must serialise
+    /// reserve-then-write, or a failed write would strand an unwritten gap ahead of
+    /// records that later get acknowledged, and a recovery scan would stop at the
+    /// gap and lose them. `Store` holds its write lock across both.
+    pub fn reserve(self: *SegmentSet, class: config.Class, len: u32) Error!Location {
+        if (len > record.max_record_bytes) return error.RecordTooLarge;
 
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const len: u32 = @intCast(bytes.len);
         var id = self.open_id[class] orelse try self.createSegment(class);
         var m = self.metas.getPtr(id) orelse return error.SegmentNotFound;
 
@@ -363,12 +370,43 @@ pub const SegmentSet = struct {
         }
 
         const offset = m.used;
-        try os.pwriteAll(m.fd, bytes, offset);
         m.used += len;
-        m.records += 1;
-        if (expires_at > m.max_expiry) m.max_expiry = expires_at;
-
         return Location.init(class, id, offset);
+    }
+
+    /// Releases a reservation whose write never happened.
+    pub fn unreserve(self: *SegmentSet, loc: Location, len: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const m = self.metas.getPtr(loc.segmentId()) orelse return;
+        // Only if nothing else has claimed space since, which the caller's write
+        // lock guarantees.
+        if (m.used == loc.offset() + len) m.used = loc.offset();
+    }
+
+    pub fn writeReserved(self: *SegmentSet, loc: Location, bytes: []const u8, expires_at: u32) Error!void {
+        self.mutex.lock();
+        const meta = self.metas.getPtr(loc.segmentId());
+        const fd = if (meta) |m| m.fd else -1;
+        self.mutex.unlock();
+        if (fd < 0) return error.SegmentNotFound;
+
+        try os.pwriteAll(fd, bytes, loc.offset());
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.metas.getPtr(loc.segmentId())) |m| {
+            m.records += 1;
+            if (expires_at > m.max_expiry) m.max_expiry = expires_at;
+        }
+    }
+
+    /// Reserve-and-write in one step, for callers with no tag pointers to publish.
+    pub fn append(self: *SegmentSet, class: config.Class, bytes: []const u8, expires_at: u32) Error!Location {
+        const loc = try self.reserve(class, @intCast(bytes.len));
+        errdefer self.unreserve(loc, @intCast(bytes.len));
+        try self.writeReserved(loc, bytes, expires_at);
+        return loc;
     }
 
     /// Makes every append to `class` durable. This is the only point at which a
@@ -456,11 +494,15 @@ pub const SegmentSet = struct {
             };
 
             if (has_cb) {
-                try @as(Error!void, f(ctx, Scanned{
+                var scanned: Scanned = .{
                     .loc = Location.init(m.class, segment_id, off),
                     .rec = rec,
                     .tags = tags,
-                }));
+                };
+                // Point the tag slice at the struct's own copy rather than the
+                // stack local `decode` wrote into.
+                scanned.rec.tags = scanned.tags[0..rec.tags.len];
+                try @as(Error!void, f(ctx, scanned));
             }
 
             if (rec.expires_at > out.max_expiry) out.max_expiry = rec.expires_at;
@@ -536,11 +578,15 @@ pub const SegmentSet = struct {
         return out;
     }
 
+    /// Where each class is currently appending. Named rather than anonymous so
+    /// callers can hold the type.
+    pub const OpenPos = struct { id: u32 = 0, offset: u32 = 0 };
+
     /// Open segment id and append offset per class, for the snapshot header.
-    pub fn openState(self: *SegmentSet) [config.class_count]struct { id: u32, offset: u32 } {
+    pub fn openState(self: *SegmentSet) [config.class_count]OpenPos {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var out: [config.class_count]struct { id: u32, offset: u32 } = undefined;
+        var out: [config.class_count]OpenPos = undefined;
         for (0..config.class_count) |c| {
             if (self.open_id[c]) |id| {
                 const m = self.metas.get(id).?;

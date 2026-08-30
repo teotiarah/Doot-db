@@ -18,11 +18,18 @@ pub const location = @import("storage/location.zig");
 pub const record = @import("storage/record.zig");
 pub const index = @import("storage/index.zig");
 pub const segment = @import("storage/segment.zig");
+pub const commit = @import("storage/commit.zig");
+pub const tagchain = @import("storage/tagchain.zig");
+pub const snapshot = @import("storage/snapshot.zig");
+pub const store = @import("storage/store.zig");
 
 pub const Location = location.Location;
 pub const Record = record.Record;
 pub const Index = index.Index;
 pub const SegmentSet = segment.SegmentSet;
+pub const Committer = commit.Committer;
+pub const TagHeads = tagchain.TagHeads;
+pub const Store = store.Store;
 pub const Clock = clock.Clock;
 pub const Options = config.Options;
 
@@ -36,4 +43,8 @@ test {
     _ = record;
     _ = index;
     _ = segment;
+    _ = commit;
+    _ = tagchain;
+    _ = snapshot;
+    _ = store;
 }

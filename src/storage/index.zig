@@ -453,25 +453,29 @@ pub const Index = struct {
     /// Borrows a shard's arrays under its lock. The callback runs with the lock
     /// held, which is what makes a shard-at-a-time snapshot consistent without
     /// stopping the world.
+    /// The return type is taken from the callback, so a caller keeps its own
+    /// closed error set instead of being widened to `anyerror`.
     pub fn withShard(
         self: *Index,
         idx: u32,
         ctx: anytype,
-        comptime f: fn (@TypeOf(ctx), hashes: []const u64, locs: []const u64, exps: []const u32) anyerror!void,
-    ) !void {
+        comptime f: anytype,
+    ) @typeInfo(@TypeOf(f)).@"fn".return_type.? {
         const s = &self.shards[idx];
         s.mutex.lock();
         defer s.mutex.unlock();
-        try f(ctx, s.hashes, s.locs, s.exps);
+        return f(ctx, s.hashes, s.locs, s.exps);
     }
 
     /// Restores one shard wholesale from a snapshot. Only valid on a fresh index.
+    /// Slices are `align(1)` because they are read straight out of a byte buffer
+    /// at offsets the compiler cannot prove are aligned.
     pub fn loadShard(
         self: *Index,
         idx: u32,
-        hashes: []const u64,
-        locs: []const u64,
-        exps: []const u32,
+        hashes: []align(1) const u64,
+        locs: []align(1) const u64,
+        exps: []align(1) const u32,
         now: u32,
     ) !void {
         const s = &self.shards[idx];

@@ -198,6 +198,20 @@ pub fn syncDir(dir_fd: Fd) Error!void {
     return fsyncCounted(dir_fd);
 }
 
+/// Atomically replaces `new_path` with `old_path`. The mechanism behind
+/// write-to-temp-then-swap: a reader sees either the whole previous file or the
+/// whole new one, never a half-written snapshot.
+pub fn rename(dir_fd: Fd, old_path: [:0]const u8, new_path: [:0]const u8) Error!void {
+    const rc = linux.renameat(dir_fd, old_path.ptr, dir_fd, new_path.ptr);
+    if (failed(rc)) return toError(rc);
+}
+
+pub fn exists(dir_fd: Fd, path: [:0]const u8) bool {
+    const fd = open(dir_fd, path, .{}) catch return false;
+    close(fd);
+    return true;
+}
+
 pub const cwd: Fd = linux.AT.FDCWD;
 
 // ---------------------------------------------------------------------------
@@ -220,7 +234,15 @@ pub const DirIterator = struct {
         is_file: bool,
     };
 
+    /// Rewinds the descriptor first.
+    ///
+    /// `getdents64` advances the directory offset, so a second iteration of the
+    /// same fd would otherwise start at EOF and report an empty directory. The
+    /// engine keeps one long-lived data-directory fd and iterates it on every
+    /// open, so without this the *second* startup discovers no segments at all
+    /// and silently recovers an empty store.
     pub fn init(fd: Fd) DirIterator {
+        _ = linux.lseek(fd, 0, linux.SEEK.SET);
         return .{ .fd = fd };
     }
 
@@ -244,6 +266,41 @@ pub const DirIterator = struct {
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// Futex
+// ---------------------------------------------------------------------------
+
+const futex_wait_op: linux.FUTEX_OP = .{ .cmd = .WAIT, .private = true };
+const futex_wake_op: linux.FUTEX_OP = .{ .cmd = .WAKE, .private = true };
+
+/// Blocks while `ptr` still holds `expect`. Spurious wakeups are possible, so
+/// callers must re-check their condition in a loop.
+pub fn futexWait(ptr: *const std.atomic.Value(u32), expect: u32) void {
+    _ = linux.futex_4arg(&ptr.raw, futex_wait_op, expect, null);
+}
+
+pub fn futexWake(ptr: *const std.atomic.Value(u32), count: u32) void {
+    _ = linux.futex_3arg(&ptr.raw, futex_wake_op, count);
+}
+
+pub const wake_all: u32 = std.math.maxInt(i32);
+
+// ---------------------------------------------------------------------------
+// Monotonic time
+// ---------------------------------------------------------------------------
+
+/// Milliseconds from a monotonic source, for measuring durations only.
+///
+/// Distinct from `clock.zig`, which supplies the *logical* time that expiry and
+/// reclamation depend on and which tests drive by hand. This one measures how
+/// long real work took — recovery duration, latencies — and is never used to
+/// decide whether an entry has expired.
+pub fn monotonicMillis() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+}
 
 // ---------------------------------------------------------------------------
 // Mutex
