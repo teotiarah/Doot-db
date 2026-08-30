@@ -1,0 +1,351 @@
+# API
+
+Base URL: `https://doot.run/v1`
+
+## Design rule: the body is opaque, metadata lives in headers
+
+The single most consequential API decision. All metadata — tags, lifetime,
+idempotency — travels in headers. The request body is nothing but the bytes to
+store.
+
+This is what makes the product's core promise true:
+
+```bash
+curl -X PUT https://doot.run/v1/entries/build/artifact-hash \
+  -H "Authorization: Bearer $DOOT_KEY" \
+  -H "X-Doot-Tags: build,ci" \
+  -H "X-Doot-TTL: 24h" \
+  --data-binary @hash.txt
+```
+
+No JSON envelope, no `jq`, no base64, no escaping. A JSON envelope would force every
+caller to wrap their payload and would force us to decide whether bodies must be
+valid JSON. Opaque bodies avoid both, and `Content-Type` passthrough is what lets
+the dashboard render intelligently without the server ever parsing anything.
+
+## Surface
+
+Seven endpoints. This is the complete data plane.
+
+| method | path | billed | description |
+|---|---|---|---|
+| `PUT` | `/v1/entries/{name}` | **1 credit** | write or overwrite at a chosen name |
+| `POST` | `/v1/entries` | **1 credit** | write at a server-assigned name |
+| `GET` | `/v1/entries/{name}` | free | read one entry |
+| `GET` | `/v1/entries?tag=…` | free | list entry metadata by tag |
+| `DELETE` | `/v1/entries/{name}` | free | delete one entry |
+| `GET` | `/v1/whoami` | free | account state, quota, limits |
+| `GET` | `/healthz` | free | liveness, unauthenticated, unmetered |
+
+All six `/v1` endpoints draw from the pooled rate limit. `/healthz` does not.
+
+The dashboard's control plane (`/app/*`) is a separate surface with separate
+session-cookie authentication and a separate rate-limit bucket. It is not part of
+the public API and is not versioned. See `06-auth.md`.
+
+## Authentication
+
+```
+Authorization: Bearer doot_live_<random>
+```
+
+Missing, malformed, revoked or unknown keys → `401`. There is no other
+authentication mechanism for the data plane: no query-parameter keys (they leak into
+logs and browser history), no cookies, no basic auth.
+
+Reads require a key too. Free is not the same as anonymous — attribution is what
+makes rate limiting and abuse response possible.
+
+## Names in the path
+
+`{name}` is the remainder of the path after `/v1/entries/`, so it may contain `/`:
+
+```
+/v1/entries/tenant/42/session-state   →  name = "tenant/42/session-state"
+```
+
+Slashes are permitted precisely so callers can namespace naturally. Names are
+percent-decoded once. Rules and character set in `03-data-model.md`.
+
+---
+
+## `PUT /v1/entries/{name}`
+
+Create or overwrite. **Consumes one credit on success.**
+
+**Request headers**
+
+| header | required | notes |
+|---|---|---|
+| `Authorization` | yes | `Bearer <key>` |
+| `Content-Type` | no | stored verbatim, echoed on read; defaults to `application/octet-stream` |
+| `X-Doot-Tags` | no | comma-separated, max 5, e.g. `ci,main,run-42` |
+| `X-Doot-TTL` | no | lifetime; defaults to 7 days |
+| `Idempotency-Key` | no | see Idempotency below |
+
+`X-Doot-TTL` accepts a bare integer meaning seconds, or a suffixed duration:
+`90s`, `15m`, `24h`, `14d`. Both `3600` and `1h` are valid and identical. Suffix
+forms exist because shell scripts are written by humans.
+
+**Responses**
+
+- `201 Created` — new entry
+- `200 OK` — existing entry replaced
+- `400` invalid name, tags, or lifetime
+- `401` bad key · `402` no credits · `413` body too large · `429` rate limited
+- `409` idempotency conflict · `503` origin at capacity
+
+Body is a JSON metadata document (see Metadata shape). Response headers include
+`X-Doot-Credits-Remaining`.
+
+**Overwrite semantics.** `PUT` replaces the entry *completely* — body, content type,
+tags, and lifetime. Omitting `X-Doot-TTL` on an overwrite applies the 7-day default;
+it does not preserve the previous lifetime. There is no partial update and there
+will not be one.
+
+```bash
+curl -X PUT https://doot.run/v1/entries/agent/scratch/step-3 \
+  -H "Authorization: Bearer $DOOT_KEY" \
+  -H "Content-Type: application/json" \
+  -H "X-Doot-Tags: agent,run-8f21,scratch" \
+  -H "X-Doot-TTL: 2h" \
+  -H "Idempotency-Key: 8f21-step-3" \
+  -d '{"observation":"tool returned 404","next":"retry with fallback"}'
+```
+
+---
+
+## `POST /v1/entries`
+
+Write at a server-assigned name. **Consumes one credit on success.**
+
+Same headers as `PUT`. Exists for the append case — webhook dumps, trace events,
+log lines — where the caller has no natural name and generating a unique one in
+bash is miserable.
+
+The assigned name is a **ULID**: 26 characters, Crockford base32, lexicographically
+sortable by creation time. Returned in the response body and in the `Location`
+header.
+
+- `201 Created`, `Location: /v1/entries/01JBQ2K9XW4V7N8M3PZR6TYAC5`
+
+```bash
+curl -X POST https://doot.run/v1/entries \
+  -H "Authorization: Bearer $DOOT_KEY" \
+  -H "Content-Type: application/json" \
+  -H "X-Doot-Tags: webhook,stripe,unprocessed" \
+  -H "X-Doot-TTL: 3d" \
+  --data-binary @payload.json
+```
+
+---
+
+## `GET /v1/entries/{name}`
+
+Read one entry. Free.
+
+**Returns the stored bytes as the response body**, not a JSON wrapper. Metadata comes
+back in headers so the body remains byte-identical to what was written — which is
+what makes `curl ... -o file` and shell pipelines work.
+
+**Response headers**
+
+| header | example |
+|---|---|
+| `Content-Type` | `application/json` — exactly as supplied on write |
+| `Content-Length` | `184` |
+| `X-Doot-Tags` | `agent,run-8f21,scratch` |
+| `X-Doot-Created-At` | `2026-08-30T20:41:07Z` |
+| `X-Doot-Expires-At` | `2026-08-30T22:41:07Z` |
+| `X-Doot-Name` | the canonical name |
+
+- `200 OK` · `401` · `404` not found or expired · `429`
+
+**Expired entries are indistinguishable from absent ones.** Both are `404`. Reading
+does **not** extend lifetime — there is no touch-on-read. Overwriting is the only way
+to extend an entry's life.
+
+---
+
+## `GET /v1/entries?tag={tag}`
+
+List entry metadata for a tag, newest first. Free.
+
+**Query parameters**
+
+| param | default | notes |
+|---|---|---|
+| `tag` | required | exactly one tag per request |
+| `limit` | 50 | maximum 100 |
+| `cursor` | — | opaque, from a previous response |
+
+**Metadata only. Bodies are never returned by this endpoint.** That bound is what
+makes a free, rate-limited list operation safe: one call can never return megabytes.
+To read bodies, follow up with `GET /v1/entries/{name}`.
+
+Exactly one tag per request in v1. Multi-tag intersection is deliberately deferred —
+see `07-decisions.md`.
+
+```json
+{
+  "entries": [
+    {
+      "name": "agent/scratch/step-3",
+      "tags": ["agent", "run-8f21", "scratch"],
+      "content_type": "application/json",
+      "size": 184,
+      "created_at": "2026-08-30T20:41:07Z",
+      "expires_at": "2026-08-30T22:41:07Z"
+    }
+  ],
+  "cursor": "eyJ2IjoxLCJhIjo0MiwicyI6..."
+}
+```
+
+`cursor` is absent when the result set is exhausted. Cursors are opaque,
+HMAC-signed, bound to the issuing account, and valid for 1 hour. Do not construct
+or parse them.
+
+A page may occasionally contain fewer than `limit` entries while still returning a
+cursor — a consequence of how tag traversal skips superseded entries
+(`04-storage.md`). **Clients must paginate until `cursor` is absent, not until a
+short page appears.** This is stated in the published docs.
+
+---
+
+## `DELETE /v1/entries/{name}`
+
+Delete one entry. Free.
+
+- `204 No Content` · `404` if absent or already expired · `401` · `429`
+
+Deletion is free because charging for cleanup punishes the behaviour we want.
+
+---
+
+## `GET /v1/whoami`
+
+Account state. Free. Intended for scripts and CI to check standing before a run,
+and for humans to sanity-check a key.
+
+```json
+{
+  "account_id": "acct_7Q2M9XKV",
+  "email": "someone@example.com",
+  "plan": "trial",
+  "credits": { "remaining": 9187, "granted": 10000 },
+  "rate_limit": { "limit": 100, "window": "1m", "remaining": 96 },
+  "limits": {
+    "max_body_bytes": 262144,
+    "max_tags": 5,
+    "max_name_bytes": 256,
+    "default_ttl_seconds": 604800,
+    "max_ttl_seconds": 1209600
+  },
+  "key": { "id": "key_3F8A", "created_at": "2026-08-30T19:02:44Z" }
+}
+```
+
+---
+
+## `GET /healthz`
+
+Unauthenticated, unmetered, never rate limited. `200 OK` with
+`{"status":"ok","seq":<current sequence>}` when the write path is accepting
+traffic; `503` when it is not.
+
+---
+
+## Idempotency
+
+Named as a core primitive from the outset, because retries are unavoidable in the
+environments Doot targets — CI runners, webhook senders, automation platforms with
+their own retry logic.
+
+- Supply `Idempotency-Key` on `PUT` or `POST`. Any string, 1–255 bytes. A UUID or
+  ULID is the obvious choice.
+- Scope is **per account**, window is **24 hours**.
+- First request executes normally; outcome (status and metadata) is recorded against
+  the key.
+- A repeat within the window with the **same key and same body** replays the
+  recorded outcome, adds `Idempotency-Replayed: true`, and **consumes no credit**.
+- A repeat with the **same key and a different body** returns
+  `409 Conflict`, code `idempotency_key_reused`. It does not overwrite anything.
+- A request still in flight for the same key returns `409`, code
+  `idempotency_in_progress`. Retry after a moment.
+- Keys are stored as a hash of `(account_id, key)` alongside a hash of the body.
+  The body itself is not retained for comparison.
+
+Replays being free is a deliberate product decision, not an implementation detail:
+a misconfigured automation retrying in a loop should not generate a bill.
+
+## Rate limit headers
+
+On every `/v1` response:
+
+```
+RateLimit-Limit: 100
+RateLimit-Remaining: 96
+RateLimit-Reset: 34
+```
+
+`RateLimit-Reset` is seconds until the bucket is full again. On `429`, `Retry-After`
+is also present in seconds.
+
+Credits appear on write responses only, since reads don't affect them:
+
+```
+X-Doot-Credits-Remaining: 9187
+```
+
+## Errors
+
+Uniform JSON body on every non-2xx response:
+
+```json
+{
+  "error": {
+    "code": "ttl_too_long",
+    "message": "X-Doot-TTL of 30d exceeds the 14d maximum for the trial plan.",
+    "docs": "https://doot.run/docs/errors#ttl_too_long"
+  }
+}
+```
+
+`code` is a stable machine-readable identifier and never changes once published.
+`message` is human-facing and may be reworded.
+
+| status | code | meaning |
+|---|---|---|
+| 400 | `invalid_name` | name empty, too long, or has forbidden characters |
+| 400 | `invalid_tag` | tag too long or has forbidden characters |
+| 400 | `too_many_tags` | more than 5 |
+| 400 | `invalid_ttl` | unparseable `X-Doot-TTL` |
+| 400 | `ttl_too_long` | exceeds the plan maximum |
+| 400 | `ttl_too_short` | below 60 seconds |
+| 400 | `invalid_cursor` | malformed, expired, or issued to another account |
+| 400 | `invalid_limit` | outside 1–100 |
+| 400 | `missing_tag` | list called without `tag` |
+| 401 | `missing_credentials` | no `Authorization` header |
+| 401 | `invalid_credentials` | unknown or revoked key |
+| 402 | `credits_exhausted` | write credits spent |
+| 404 | `not_found` | absent or expired |
+| 409 | `idempotency_key_reused` | same key, different body |
+| 409 | `idempotency_in_progress` | concurrent request, same key |
+| 413 | `body_too_large` | over 256 KB |
+| 429 | `rate_limited` | bucket empty |
+| 503 | `capacity_exhausted` | origin cannot accept new entries |
+
+`413` is returned from `Content-Length` **before the body is read**. Oversized
+uploads are rejected, not drained.
+
+## Client behaviour worth documenting publicly
+
+- **Reuse connections.** Connection setup dominates request latency (see
+  `05-architecture.md`). `curl` reuses within one invocation; long-lived clients
+  should keep connections alive.
+- **Retry `429` and `503`** with backoff, honouring `Retry-After`.
+- **Do not retry `4xx`** other than `429`. They are deterministic.
+- **Use `Idempotency-Key` on anything automated.** It is free, it prevents duplicate
+  writes, and replays are not billed.
+- **Paginate until `cursor` is absent.**
