@@ -636,6 +636,85 @@ zone.
 
 ---
 
+# M1 findings
+
+---
+
+## D32 — Four spec defects, found by reading the spec as an implementer · locked
+
+Settled before any M1 code was written, per the two-pass rule. Each was a real defect,
+not a clarification, and three of the four would have produced silently wrong behaviour.
+
+**Name length was one byte, but names go to 256.** `04-storage.md` declared `name_len` as
+a single byte holding `1..255`, while `03-data-model.md` allows names of 1–256 bytes.
+An implementer following the record format would have capped names at 255 and quietly
+contradicted the published limit. Fixed by storing the length biased by one: names can
+never be empty, so `0..255` maps exactly onto `1..256` at no cost.
+
+**The checksum did not cover the framing.** `crc32c` was specified over "all bytes after
+this field", which excludes `record_length` and `body_len` — the two fields a recovery
+scan uses to locate the next record. A single corrupted length byte would have walked the
+scanner into garbage with nothing to detect it. The checksum now covers everything except
+itself. This also forced the verification *order* to be written down, since a length
+cannot be trusted before the checksum and the checksum cannot be computed without a
+length: bounds-check the length first, then verify.
+
+Also settled: a failed checksum means two different things, and both are correct. During
+a recovery tail scan it is a torn write at the moment of the crash — stop, and treat that
+record as never having existed. On a record the index still points to, it is corruption
+of data that was once durable — serve `404` and count it. Same signal, opposite
+responses, counted separately.
+
+**Deletion from an open-addressed table was unspecified.** Blanking a slot severs the
+probe sequence and orphans every entry stored past it. The resolution is better than a
+new marker: a slot already carries `expires_at`, so **a dead slot is one whose
+`expires_at` has passed**, and deletion just forces it to `0`. Expired and deleted slots
+become indistinguishable to every code path — which is precisely what `03-data-model.md`
+promises callers, now true in the data structure rather than in a check bolted on top.
+
+It also makes segment reclamation safe with no extra work. A segment is unlinked only
+once all its records have expired, so any slot pointing into it is already dead by
+definition. No index scan at unlink time, and a lookup can never be handed a location in
+a file that no longer exists. Added a shard **rebuild** at 25% dead slots to reclaim
+index memory — deliberately a different thing from segment compaction, and a normal
+steady-state event rather than an escape hatch.
+
+**Nothing was testable.** Covered separately in D33.
+
+---
+
+## D33 — The clock and the crash point are injected parameters · locked
+
+Every M1 exit condition is a statement about time or about crashes, and neither was
+reachable in the design as documented.
+
+**The clock is a parameter.** All expiry, reclamation, tombstone lifetime and snapshot
+scheduling derive from an injected clock; nothing else in the engine may read system
+time. Two implementations: real, and manual.
+
+This is not scaffolding, it is what makes the project's central claim checkable. "Bounded
+lifetime eliminates compaction" (D10) is a claim about behaviour over days, and M1
+requires a 24-hour mixed-lifetime soak to demonstrate it. On a wall clock that takes 24
+hours, cannot run in CI, and therefore in practice never runs — leaving the load-bearing
+argument of the whole storage design permanently unverified. On an injected clock it runs
+in seconds, on every change.
+
+**The crash point is a parameter.** Durability is defined by surviving a crash at the
+worst moment, and the worst moments are `fsync` boundaries. So `fsync` calls are counted
+and a build can abort immediately after the *n*-th. That turns "does it survive a crash"
+from something argued into something enumerated: run the workload once per boundary, kill
+it there, reopen, assert the invariants.
+
+The counter compiles in unconditionally — one increment beside a syscall that already
+costs 50–200 µs — but the abort is armed only by explicit configuration and cannot fire
+in production.
+
+Rejected: testing durability by reasoning about the code, and testing expiry with
+`sleep`. The first is how storage engines lose data, and the second is how time-dependent
+tests get deleted for being slow.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |

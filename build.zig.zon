@@ -1,0 +1,15 @@
+.{
+    .name = .doot,
+    .version = "0.0.0-m1",
+    .fingerprint = 0x6386f118b80f00f8,
+    // Pinned toolchain. See toolchain/zig.lock and docs/07-decisions.md D3, D26.
+    // Zig 0.16.0 also requires the stdlib patch applied by toolchain/setup.sh.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tools",
+    },
+}
