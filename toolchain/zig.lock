@@ -1,0 +1,14 @@
+# Pinned Zig toolchain for Doot. Do not edit by hand except as a reviewed upgrade.
+# See docs/07-decisions.md D3 (language choice) and D26 (this pin and its patch).
+
+ZIG_VERSION=0.16.0
+ZIG_RELEASE_DATE=2026-04-13
+
+# Linux x86_64 release tarball, from https://ziglang.org/download/index.json
+ZIG_TARBALL_URL=https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+ZIG_TARBALL_SHA256=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+
+# 0.16.0 is the only 0.16.x release. Upstream master has renamed and rewritten
+# Io/Uring.zig as Io/IoUring.zig (3000+ lines -> ~1500), so master is not a
+# drop-in target and must not be used as an escape hatch from the patch below.
+ZIG_PATCHES=patches/0001-uring-erofs-impossible-errno.patch

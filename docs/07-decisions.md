@@ -55,6 +55,11 @@ memory-safety incident on a service holding other people's data.
 Pinned to an exact 0.16.x version and tarball hash, enforced in CI. Zig breaks between
 minor releases; upgrading is a reviewed act.
 
+**M0 amendment.** 0.16.0 is the only 0.16.x release, and it ships a broken
+`std.Io.Uring` — see D26. The language choice stands and every stdlib claim above
+verified, but the toolchain now carries a patch, and D27 supersedes the assumption
+that `std.Io` would be the concurrency layer.
+
 ---
 
 ## D4 — Metadata in headers, body stays opaque · locked
@@ -233,6 +238,10 @@ primitive.
 compression; clients get all three at the edge. Cold-request latency roughly halves
 (~390 ms → ~175 ms), which matters because Doot's callers are almost always cold.
 
+**M0 verdict: validated in full.** See D29 for the measured evidence and the exact
+pinned commit. The one part that could not be tested locally — Cloudflare's own
+behaviour — is now tracked separately as D31.
+
 ---
 
 ## D14 — Network is the bottleneck; optimise connections, not lookups · locked
@@ -251,6 +260,11 @@ highest-leverage latency win available.
 
 Also settles that 5 ms group-commit latency needs no optimisation — under 3% of what a
 user experiences.
+
+**M0 verdict: the reasoning holds, the mechanism does not.** Every priority above is
+confirmed and the memory prediction was accurate to within 1.4% (D28). But io_uring
+cannot be reached through `std.Io` on this toolchain, so it is driven directly —
+see D27. The conclusion survived; the implementation route changed.
 
 ---
 
@@ -301,6 +315,12 @@ delivered over SSE.
 The headline dashboard feature falls out of the storage layout at almost no cost. Best
 effort by design: it drives a UI, not a guarantee. Subscribers that fall behind get a
 resync marker rather than silent gaps.
+
+**M0 verdict: cheap as claimed, with two caveats now recorded.** Measured 4.33 KB per
+subscriber at 5,000 concurrent subscribers (21.7 MB), events delivered incrementally
+at exactly the emit interval. But "one shared frame buffer for all subscribers" is
+unsafe under io_uring and had to change (D30), and Cloudflare is a live risk to the
+whole feature (D31).
 
 ---
 
@@ -382,6 +402,240 @@ and the downside of leakage is a few thousand writes.
 
 ---
 
+---
+
+# M0 findings
+
+Everything below came out of the spikes in `spikes/`. Measured numbers, not estimates.
+Where a spike contradicted an earlier decision, the earlier decision carries an
+amendment pointing here rather than being quietly edited.
+
+---
+
+## D26 — The pinned toolchain carries a stdlib patch · locked
+
+**`std.Io.Uring` does not compile in Zig 0.16.0 as shipped.** Two exhaustive error
+switches in `lib/std/Io/Uring.zig` omit `error.ReadOnlyFileSystem`, in `dirOpenDir`
+(~line 2732) and `dirRealPathFile` (~line 3157). Merely calling `Uring.io()` fails
+semantic analysis, because that instantiates the whole vtable. Reproducer:
+`spikes/gate/minimal.zig`, 8 lines. Independently reported
+[on ziggit](https://ziggit.dev/t/error-compiling-concurrency-sample-code/16401) with
+the identical error location, so it is upstream and not local.
+
+Resolution: a two-line patch adding `error.ReadOnlyFileSystem => return errnoBug(.ROFS)`
+to both switches. Both call sites open `O_RDONLY`/`O_PATH` with no `O_CREAT`, so `EROFS`
+genuinely cannot occur, and the file already maps every other impossible errno the same
+way. **The patch changes no public API** — it completes an error mapping the authors
+missed rather than widening an error set.
+
+Carried as `toolchain/patches/0001-uring-erofs-impossible-errno.patch`, applied by
+`toolchain/setup.sh`, which is idempotent, verifies the tarball SHA-256, refuses to
+apply to a tree it does not recognise, and proves the fix by compiling and running a
+program that uses the ring.
+
+Rejected: **tracking Zig master.** Upstream has renamed `Io/Uring.zig` to
+`Io/IoUring.zig` and cut it from 3,000+ lines to roughly 1,500, so master is a
+different API, not a fix — and a moving pre-release contradicts the point of pinning.
+Rejected: **waiting for 0.16.1.** 0.16.0 is the only 0.16.x release and there is no
+announced patch release.
+
+A patched compiler is a real maintenance cost, accepted deliberately: it is
+deterministic, auditable, two lines, and removable the moment upstream ships a fix.
+
+---
+
+## D27 — Drive io_uring directly, not through `std.Io` · locked
+
+**`std.Io.Uring` has no networking in Zig 0.16.0.** 13 of its 111 vtable entries are
+`*Unavailable` stubs returning `error.NetworkDown`, and they are precisely the network
+surface: `netListenIp`, `netAccept`, `netConnectIp`, `netListenUnix`, `netConnectUnix`,
+`netSocketCreatePair`, `netSend`, `netRead`, `netWrite`, `netWriteFile`, `netLookup`,
+`netInterfaceName`, `netInterfaceNameResolve`. A server cannot be built on it at all.
+
+**`std.Io.Threaded` has real networking but wedges under keep-alive.** Measured: it
+accepts exactly 7 connections — `async_limit`, which defaults to cores − 1 — and then
+hangs permanently. The 8th connection never receives a response and throughput goes to
+zero. Cause: every idle keep-alive connection permanently occupies a pool thread. This
+is not slowness, it is a hard stall, and it is caused by the exact feature D14 names as
+the highest-leverage latency win.
+
+So: **`std.os.linux.IoUring`**, the low-level ring, driven by our own event loop. It is
+mature, in-tree, and has `accept_multishot`, `recv`, `send` and `timeout`. Measured on
+`spikes/uring/ringserver.zig`, single-threaded, pipelined over loopback with client and
+server sharing 8 cores, so a floor rather than a ceiling:
+
+| connections | pipeline depth | throughput |
+|---|---|---|
+| 1 | 128 | 2.93M req/s |
+| 8 | 128 | 2.99M req/s |
+| 16 | 128 | 2.80M req/s |
+
+Peak observed server-side: 3.18M req/s. Roughly a hundred times any plausible demand,
+which confirms the D14 conclusion that the box is never the constraint.
+
+Consequences: no fibers, so the 60 MB per-fiber stack reservation in `std.Io.Uring`
+never applies, and connection state is a struct we size ourselves (D28). We also own
+the housekeeping timer — **a repeating `timeout` SQE is mandatory**, because an
+otherwise-idle ring blocks forever in `copy_cqes` and nothing else runs. That same
+timer drives expiry sweeps and SSE heartbeats, so it is not overhead.
+
+This is more code than calling `std.Io`, and it is the right trade: it is the layer
+Doot actually needs control over, and the alternative does not function.
+
+---
+
+## D28 — Connection state is pooled, and per-connection cost is pages touched · locked
+
+D14 predicted roughly 8 KB per idle connection and 80 MB at 10,000. Measured with the
+naive approach — one `page_allocator` allocation per connection struct and per read
+buffer — **8.11 KB per connection, 79 MB at 10,000 idle keep-alive connections.** The
+estimate was accurate to 1.4%.
+
+Two findings change the design:
+
+**Per-connection RSS is driven by pages actually *touched*, not bytes allocated.**
+Resident size was identical (8.10 KB/conn) for read buffers from 512 B to 16 KB;
+only virtual size grew. An idle connection has received one small request, so exactly
+one page of its buffer is resident. A 24-byte connection struct from `page_allocator`
+burns a whole 4 KB page — half the total cost — for nothing.
+
+**Pooling therefore beats the estimate by up to 13×.** Connection structs from one
+static array, read buffers carved from a single arena, 10,000 idle connections:
+
+| read buffer | naive (one allocation each) | pooled |
+|---|---|---|
+| 512 B | 8.10 KB/conn → 81 MB | **0.63 KB/conn → 6.3 MB** |
+| 2 KB | 8.10 KB/conn → 81 MB | **2.14 KB/conn → 21 MB** |
+| 8 KB | 8.10 KB/conn → 81 MB | **4.14 KB/conn → 41 MB** |
+
+RSS returned to 1.2 MB after all connections closed, so no leak. `sizeOf(Conn)` was
+24 bytes.
+
+This is the measured form of D14's "buffers pooled per in-flight request, not per
+connection", and it argues for keeping the idle read buffer small — a request head is
+bounded at 8 KB (`05-architecture.md`) but an *idle* connection needs only enough to
+detect the start of one.
+
+---
+
+## D29 — tls.zig pinned at `fe60069`, driven over raw sockets · locked
+
+D13's resolution validated end to end.
+
+- **The commit matters.** tls.zig HEAD requires Zig `0.17.0-dev` and will not build on
+  our pin. Commit `fe60069029602fb0ca7129f35c1af7c97d6d2473` (2026-04-15, "upgrade to
+  zig 0.16.0") declares `minimum_zig_version = "0.16.0"` and builds clean. Pinned by
+  content hash in `build.zig.zon`.
+- **TLS 1.3 handshake confirmed** against an independent OpenSSL 3.5.7 client with
+  `minimum_version` forced to TLS 1.3, full chain verification and hostname checking.
+  Works with both ECDSA P-256 and RSA 2048 chains; negotiated
+  `TLS_AES_256_GCM_SHA384`.
+- **Authenticated Origin Pulls confirmed in both directions.** With
+  `client_auth = .{ .auth_type = .require, .root_ca = bundle }`, a valid client
+  certificate passes and a client presenting none is rejected —
+  `error.TlsCertificateRequired` at the origin, `TLSV13_ALERT_CERTIFICATE_REQUIRED` at
+  the client. Rejecting correctly matters more than accepting correctly.
+- **It does not need `std.Io` networking.** Its `nonblock` API is a pure buffer
+  transformation: hand it received ciphertext, it returns what it consumed and what to
+  send. `spikes/tls/nonblock.zig` runs TLS 1.3 on the raw io_uring loop of D27. This
+  is what makes D27 and D13 compatible rather than in conflict.
+- **The single-binary claim holds.** 7.3 MB ReleaseFast, statically linked, "not a
+  dynamic executable", zero OpenSSL or libcrypto strings.
+
+The in-house TLS 1.3 server stays a tracked option, no longer urgent.
+
+---
+
+## D30 — An io_uring send buffer must be immutable until its completion · locked
+
+Found by trying to break the SSE broadcast, and it would have been a genuinely nasty
+production bug.
+
+`io_uring` reads a send buffer **asynchronously**, after `submit()` returns. D18's
+"one shared frame buffer for all subscribers, since every subscriber gets identical
+bytes" is therefore unsafe: rewriting that buffer on the next tick corrupts frames
+still in flight.
+
+Measured with `spikes/sse/validate.py`, which validates every frame byte-for-byte:
+
+| subscribers | torn frames |
+|---|---|
+| 50 | 1,000 |
+| 500 | 9,505 |
+| 2,000 | 40,000 |
+
+The corruption signature is a truncated frame — `data:` arriving as `ta:` or `ata:`.
+**It is invisible with a single subscriber**, which is exactly how it would have
+shipped.
+
+Resolution: a pool of 256 **refcounted** frame slots. A broadcast acquires a slot,
+formats the frame into it, and sets the refcount to the number of sends issued; each
+send completion decrements, and the slot returns to the free list at zero. The slot
+index rides in the unused high bits of `user_data`. If no slot is free the broadcast is
+dropped and counted, which is bounded and consistent with the feed being best-effort.
+
+After the fix: **zero torn frames across more than 210,000 validated frames** at 50,
+500, 2,000 and 5,000 subscribers, with no slot exhaustion and no slot leak.
+
+The sharing idea was right and the memory argument for it stands — frame payloads are
+still not duplicated per subscriber. What was wrong was assuming "shared" implies
+"safe to overwrite".
+
+Generalised rule for the implementation: **any buffer handed to the ring is owned by
+the kernel until its completion arrives.** This applies to the shared pipelined
+response buffer in `ringserver.zig` too — that one is safe only because it is written
+once at startup and never mutated.
+
+---
+
+## D31 — Cloudflare zone configuration is part of the deployable artifact · locked
+
+The SSE spike could not test Cloudflare, so it tested the literature instead, and the
+risk is real: **Cloudflare buffering `text/event-stream` is a recurring, repeatedly
+reported failure**, with reports in 2020, 2023, May 2024, June 2025 and August 2025.
+One 2025 report describes responses being withheld until roughly 100 KB accumulates
+even with response buffering nominally off. For most of that history the only reliable
+workaround was disabling the proxy entirely — which would forfeit every benefit in D13.
+
+**There is now a first-class fix.** Cloudflare Configuration Rules expose a
+[Response Body Buffering setting](https://developers.cloudflare.com/rules/configuration-rules/settings/)
+whose `none` value streams the response body straight to the client without inspection.
+[Configuration Rules are available on the Free plan](https://developers.cloudflare.com/rules/configuration-rules/)
+with a limit of 10 rules. Cloudflare notes that disabling buffering also disables WAF
+and Bot Management body inspection on matching paths, which is acceptable for
+`/app/stream`: a session-authenticated `GET` with no request body.
+
+So the zone is configuration we own and version, not a console someone clicked once:
+
+| setting | value | why |
+|---|---|---|
+| Configuration Rule on the stream path | `response_body_buffering: none` | without it, SSE is buffered and the live dashboard silently dies |
+| Compression Rule on the stream path | compression off | Cloudflare always offers `accept-encoding: br, gzip` to the origin, and compression forces buffering |
+| Cache Rule on `/v1/*` and the stream path | bypass | a cached read breaks the state-storage use case outright |
+| SSL/TLS mode | Full (strict) | D13 |
+| Authenticated Origin Pulls | on | D13, D29 |
+| origin firewall | Cloudflare ranges only | D13 |
+
+**Hard number, newly pinned down:** Cloudflare's proxy read timeout on Free and Pro is
+100 seconds, after which an origin that has sent nothing gets a 524. So the SSE
+heartbeat in `05-architecture.md` is not decorative — it has a ceiling. **Set it to
+15 seconds**, comfortably inside 100 and inside most intermediary idle timeouts too.
+
+Still unverified, and honestly so: none of this can be confirmed without the zone, the
+domain and a publicly reachable origin. `spikes/sse/sseprobe.py` is the verification
+procedure — it takes any URL including `https://`, judges streaming on arrival timing
+rather than content, flags a `Content-Length` or `Content-Encoding` that would indicate
+buffering, and exits non-zero when buffered. **Run it against `doot.run` as the first
+act of deployment, before the dashboard is built on the assumption that it works.**
+
+Rejected: switching the live view to polling pre-emptively. Polling would work through
+any proxy, but it degrades the one feature meant to drive adoption, and there is now a
+documented fix worth trying first. The fallback is recorded rather than taken:
+long-polling on the same endpoint, chosen only if the probe fails against the real
+zone.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
@@ -392,8 +646,12 @@ and the downside of leakage is a few thousand writes.
 | Public unauthenticated read links | demand for sharing. Currently all reads require a key so they stay attributable |
 | Automated payments | trial-to-paid conversion volume making manual handling the bottleneck (D9) |
 | Teams and shared accounts | paid single-user retention proving out first |
-| In-house TLS 1.3 server | vendored library becoming a maintenance problem, or wanting the dependency count at zero (D13) |
+| In-house TLS 1.3 server | vendored library becoming a maintenance problem, or wanting the dependency count at zero (D13, D29) |
 | HTTP/2 at the origin | only if the edge stops being the sole client (D13) |
+| Removing the toolchain patch | upstream fixing the 0.16.x `std.Io.Uring` error sets, or a 0.16.1 release (D26) |
+| Revisiting `std.Io` as the concurrency layer | a Zig release where the io_uring backend implements networking. Would be a large rewrite of the event loop for no measured gain, so it needs a reason beyond tidiness (D27) |
+| Long-polling instead of SSE for the live view | only if `sseprobe.py` fails against the real Cloudflare zone after the D31 configuration is applied |
+| One ring per core via `SO_REUSEPORT` | measured single-ring throughput becoming a constraint. At 2.9M req/s on one thread this is far off (D27) |
 | Chunked request bodies | a real caller unable to send `Content-Length` |
 | 90-day retention | usage behaviour justifying it, **and** a proven restore drill (D16). Retention is a config value, not a code change |
 | Read-side soft caps | the pooled rate limit (D6) proving insufficient against a heavy read pattern |
