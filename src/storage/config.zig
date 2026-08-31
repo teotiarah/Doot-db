@@ -90,8 +90,9 @@ pub const index_initial_slots_per_shard: u32 = 1024;
 // Durability
 // ---------------------------------------------------------------------------
 
-pub const commit_interval_ms: u32 = 5;
-pub const commit_size_trigger_bytes: u32 = 1024 * 1024;
+// No commit interval or size trigger: durability is leader-driven, so the first
+// writer needing a flush performs it and the rest are covered by the same one
+// (D34). There is nothing staged for a timer to bound.
 pub const snapshot_interval_s: u32 = 5 * 60;
 
 /// Tracked regression metric, asserted by the M1 harness.
@@ -125,7 +126,6 @@ pub const Options = struct {
     max_ttl_s: u32 = 30 * 24 * 60 * 60,
 
     segment_bytes: u32 = default_segment_bytes,
-    commit_interval_ms: u32 = commit_interval_ms,
     snapshot_interval_s: u32 = snapshot_interval_s,
 
     /// Hard ceiling on index memory. Zero means unlimited, which is only

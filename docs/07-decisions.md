@@ -638,6 +638,13 @@ zone.
 
 # M1 findings
 
+Everything below came out of implementing the storage engine. D32 and D33 were settled
+*before* any code was written, per the two-pass rule; D34 onward were forced by the
+implementation and its measurements.
+
+Where a finding contradicted the specification, `04-storage.md` was corrected and the
+decision recorded here rather than the document being quietly edited.
+
 ---
 
 ## D32 — Four spec defects, found by reading the spec as an implementer · locked
@@ -715,6 +722,150 @@ tests get deleted for being slow.
 
 ---
 
+## D34 — Leader commit replaces the commit timer · locked
+
+The specification described a commit thread firing every 5 ms or every 1 MiB. The
+implementation instead has the first writer needing durability take a lock and perform
+the flush, with every writer waiting at that moment covered by it.
+
+Better on both axes the triggers balanced: a writer waits one `fsync` rather than up to
+5 ms, and batching still amortises because writers arriving during a flush are covered by
+the next. And there is nothing left for a timer to do — the triggers bound how long
+staged data sits unflushed, and nothing is staged. Every acknowledged write has a writer
+waiting on it; an unacknowledged write has no durability requirement to bound.
+
+Related: **records are `pwrite`n on arrival and only the flush is batched.** A user-space
+staging buffer would mostly duplicate the page cache while adding the buffer-lifetime
+failure mode D30 demonstrated. Durability is identical either way.
+
+Both constants are removed from the document rather than left unimplemented.
+
+---
+
+## D35 — One write lock; reads unlocked · locked
+
+The index's own contract (D11) asks callers to serialise same-key mutations, because
+verifying a name needs a disk read and the index holds no names. Rather than key-striped
+locks, the whole write path takes one mutex. Reads take none. Durability waiting happens
+outside it, so writers still group.
+
+D14 measured storage at 0.03% of what a request costs end to end, so parallelising writes
+optimises the wrong 0.03% while introducing the hardest concurrency in the system.
+Appends to a class already serialise and one flush already covers many writers, so the
+lock removes very little real parallelism.
+
+It also dissolves two problems: same-key mutations serialise for free, and a record's tag
+back-pointers can be published to the chain heads before the record is encoded without
+racing another writer on the same tag — which the reserve-then-write split (below) needs.
+
+Accepted consequence: **visibility precedes durability.** The index updates when a write
+is ordered, so a reader can briefly see an entry a crash would erase. Standard for group
+commit, and harmless: the guarantee is about *acknowledged* writes, and nothing in that
+window has been acknowledged.
+
+Segments therefore expose `reserve` / `writeReserved` / `unreserve` rather than only
+`append`, because a record's address must be known before its tag pointers are published.
+Reservations are explicitly not hole-tolerant: a failed write between reserve and write
+would strand a gap ahead of records that later get acknowledged, and a recovery scan would
+stop at the gap and lose them. The write lock is what makes the pair atomic.
+
+---
+
+## D36 — A process kill cannot test durability · locked
+
+The most useful thing M1's crash harness produced was proof that an earlier version of it
+proved nothing.
+
+The harness kills the engine with `SIGKILL` at every `fsync` boundary and checks that no
+acknowledged write was lost. It passed. Then durability was deliberately broken —
+`awaitDurable` made a no-op, so writes are acknowledged before they are flushed — **and it
+still passed.** The workload's flush count fell from 39 to 6 and nothing complained.
+
+The reason is simple and easy to miss: **`SIGKILL` kills a process, but dirty page cache
+survives it.** Un-flushed data is still readable by the next open, because the kernel
+still has it. A process-kill sweep tests *recovery* — torn tails, half-written snapshots,
+rotation in flight, manifest lag — and cannot test `fsync` at all.
+
+Resolution: durability is asserted **white-box, at the moment of acknowledgement.** After
+every operation the engine is asked whether it considers that write durable, in three unit
+tests and after every operation in the crash workload. The same mutation now fails eight
+tests and fails the harness at operation 0.
+
+Stated limit, not a solved problem: **true power-loss durability remains untested.**
+Proving it needs a block layer that discards un-flushed writes — `dm-flakey`, a VM power
+cut, or equivalent — which a container cannot provide. What is proven is that the engine
+calls for a flush before acknowledging, and that recovery is correct at every flush
+boundary. The gap between those two and real power loss is the correctness of `fsync`
+itself on the deployed filesystem.
+
+Also settled: the crash verifier asserts only on keys whose final operation was
+acknowledged. A crash point is a flush boundary, not an operation boundary, so later
+unacknowledged operations may also have landed; if keys were rewritten, every assertion
+would weaken to "some value". Expiry is checked unconditionally instead, since it holds
+regardless of acknowledgement.
+
+---
+
+## D37 — Hardware CRC32C · locked
+
+Every record is checksummed on write and verified on read, so the checksum sits directly
+in the recovery path. Decomposing replay time by body size gave ~3.1 µs fixed per record
+plus ~2.5 ns/byte, and the per-byte half was Zig's byte-at-a-time CRC table — **roughly
+half of total replay time at 1 KiB records.**
+
+x86-64 has had a CRC32C instruction since 2008 that computes this exact polynomial. Using
+it took 1 KiB records from 5,345 ns to 3,230 ns, and replay from 196 to 324 MiB/s. Without
+it the measured recovery of a 3 GB tail would have been roughly 20 s against a 10 s target.
+
+**It is an optimisation, not a format change**, and that is worth being certain of rather
+than assuming, since this is the one code path that decides whether data is considered
+intact. The tests assert byte-identical output against the standard library at every
+length from 0 to 300, on buffers up to 256 KiB, across incremental splits, and against the
+RFC 3720 vectors. A table fallback is retained for other targets.
+
+---
+
+## D38 — Recovery is bounded by the snapshot interval, not the dataset · locked
+
+Measured: **3,000,000 records / 3,147 MiB replayed in 9.5 s** — inside the 10 s target,
+with 5% of margin. Thin enough that the relationship matters more than the number:
+
+```
+recovery time  ≈  (write rate × record size × snapshot interval) / 332 MiB/s
+```
+
+A 10 s budget buys about 3.3 GB of tail, which at 1 KiB records covers sustained write
+rates to roughly 11k/s at the default five-minute snapshot interval. Above that the lever
+is `DOOT_SNAPSHOT_INTERVAL_S` — halving it halves both the tail and recovery time.
+
+The consequence for operations is that **recovery time is a tunable, not a property of how
+much data is stored.** A store holding 100 GB recovers as fast as one holding 1 GB,
+provided the write rate and snapshot interval are the same.
+
+Two implementation notes that were required to get there: replay reads in 1 MiB chunks
+(one `pread` per record would miss the target by orders of magnitude), and the four class
+tails are merged on lowest pending sequence rather than replayed class by class — the
+index carries no sequence number to arbitrate with, so class-at-a-time replay would let an
+older write from one class overwrite a newer one from another.
+
+---
+
+## D39 — Index rebuild is driven by maintenance as well as insert · locked
+
+The documented 25%-dead rebuild threshold was only checked on insert, so a shard that
+stopped receiving writes kept its dead slots indefinitely. Nothing was lost — dead slots
+stay reusable — but the documented behaviour did not hold in the case that most needs it,
+immediately after a wave of expiry. Maintenance now checks it too.
+
+Related clarification, because the number looks alarming otherwise: **bytes per live entry
+is only meaningful near the admission point.** A store whose entries have mostly expired
+holds a table sized for its peak, so the ratio climbs arbitrarily — a soak ending with
+3,023 live entries in a 65,536-slot table reports 434 B/entry. That is the minimum table
+size showing through, not accumulating waste. The 29 B/entry figure is a statement about
+the table at its load limit, which is the point the memory budget describes.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
@@ -728,6 +879,11 @@ tests get deleted for being slow.
 | In-house TLS 1.3 server | vendored library becoming a maintenance problem, or wanting the dependency count at zero (D13, D29) |
 | HTTP/2 at the origin | only if the edge stops being the sole client (D13) |
 | Removing the toolchain patch | upstream fixing the 0.16.x `std.Io.Uring` error sets, or a 0.16.1 release (D26) |
+| Power-loss durability testing | a deployment target where `dm-flakey` or a VM power cut is available. Until then the gap in D36 stands stated |
+| Parallelising the write path | measurement showing the single write lock is a bottleneck. At 0.03% of request cost this is far off (D35) |
+| A user-space staging buffer for appends | measurement showing syscall count on the write path matters (D34) |
+| Implementing the segment compactor | a segment actually meeting the escape-hatch trigger in production. Over a 24 h soak none did (D10) |
+| Widening the index slot to carry `seq` | a need to arbitrate replay order without the class merge. Would cost 8 B/entry, a 40% memory increase (D38) |
 | Revisiting `std.Io` as the concurrency layer | a Zig release where the io_uring backend implements networking. Would be a large rewrite of the event loop for no measured gain, so it needs a reason beyond tidiness (D27) |
 | Long-polling instead of SSE for the live view | only if `sseprobe.py` fails against the real Cloudflare zone after the D31 configuration is applied |
 | One ring per core via `SO_REUSEPORT` | measured single-ring throughput becoming a constraint. At 2.9M req/s on one thread this is far off (D27) |

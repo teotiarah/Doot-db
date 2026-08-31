@@ -30,10 +30,13 @@ that answers it (`spikes/sse/sseprobe.py`) is written and must be run against
 
 ---
 
-## M1 — Storage engine, standalone
+## M1 — Storage engine, standalone · **COMPLETE**
 
 No HTTP. A library plus a test harness, because this is the part that is expensive to get
 wrong and impossible to fix casually later.
+
+Implemented in `src/storage/`; harness in `tools/`. Findings are D32–D39 in
+`07-decisions.md`, four of which corrected the specification.
 
 - Record format, CRC32C verification, packed locations
 - Four lifetime-class append streams, 64 MiB segments, sealing
@@ -44,20 +47,40 @@ wrong and impossible to fix casually later.
 - Wholesale segment reclamation on expiry; class-0 tombstones
 - Capacity ceiling and admission control
 
-**Exit conditions, all measured:**
+**Exit conditions — all met.** Reproduce with `zig build verify && ./zig-out/bin/m1 all`.
 
-- Crash injection at every `fsync` boundary — recovery loses nothing acknowledged and
-  never resurrects a deleted or expired entry
-- Recovery under 10 seconds with 5 minutes of tail at 10k writes/s
-- Index RAM within 10% of 29 bytes/entry at 10M entries
-- Zero compaction events in a 24-hour mixed-lifetime soak
-- Tag traversal correct across overwrite, delete, expiry and class migration
+| condition | target | measured |
+|---|---|---|
+| crash at every `fsync` boundary loses nothing acknowledged, resurrects nothing | all boundaries | **39/39 boundaries**, all killed mid-run, all recovered |
+| recovery with 5 minutes of tail at 10k writes/s | < 10 s | **9.5 s** for 3,000,000 records / 3,147 MiB (332 MiB/s) |
+| index RAM per live entry | 28.57 B ± 10% | **29.40 B** at 972k entries, occupancy 0.680 |
+| compaction events in a 24 h mixed-lifetime soak | 0 | **0**, and 0 segments even met the trigger; 51 reclaimed by unlink |
+| tag traversal across overwrite, delete, expiry, class change | correct | **3 live of 9 hops**; stale, deleted and expired all excluded |
+
+111 unit tests alongside the harness.
+
+**What the crash sweep does and does not prove.** It proves recovery is correct at every
+flush boundary — torn tails, half-written snapshots, rotation in flight. It cannot prove
+`fsync` was called, because `SIGKILL` kills a process while dirty page cache survives it.
+That gap was found by mutation testing and closed with white-box durability assertions at
+the moment of acknowledgement; true power-loss testing needs a block layer that discards
+un-flushed writes. Full reasoning in D36.
+
+**Recovery margin is 5%**, which makes the relationship more useful than the number:
+recovery time is bounded by the snapshot interval, not by how much data is stored. See
+D38 for the formula and the operational lever.
+
+Four bugs worth noting, all found by tests rather than by review, and all of the kind
+that only appear on a second run: a directory iterator that left its file descriptor at
+EOF so the *second* startup discovered no segments and silently recovered an empty store;
+a stream holding a slice into a freed list; a self-referential pointer invalidated by a
+struct copy; and `record.decode` leaving a tag slice aimed at the caller's stack frame.
 
 ---
 
 ## M2 — Data plane
 
-The seven endpoints. Product-visible for the first time.
+The seven endpoints. Product-visible for the first time, on top of the M1 engine.
 
 - HTTP/1.1 with keep-alive, `TCP_NODELAY`, single-`writev` responses,
   `Expect: 100-continue`, early `413`, bounded header sizes
@@ -163,7 +186,8 @@ about their use case, not about how to use Doot.
    `07-decisions.md` first. No design question is settled inside an implementation diff.
 3. **M1's exit conditions are non-negotiable.** Storage bugs found after launch are
    data-loss bugs, and this is the one area where "fix it later" means "lose someone's
-   data first".
+   data first". *(Met. And the sweep that checks them was itself validated by mutation
+   testing, because a durability test that cannot fail is worse than none — D36.)*
 4. **M5 precedes M6.** No public launch without a drilled restore.
 
 ## Explicitly not in v1

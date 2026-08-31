@@ -52,14 +52,26 @@ Full reasoning in [`docs/00-vision.md`](docs/00-vision.md).
 
 ## Status
 
-**Pre-implementation.** Design and documentation, plus the M0 spikes that validate the
-riskiest assumptions before any product code is written. No product code yet.
+**Storage engine built and verified. No HTTP yet.**
 
-M0 measured, on one 8-core box: **2.9–3.2M req/s** on a single-threaded io_uring loop,
-**0.63–4.14 KB of memory per idle keep-alive connection**, TLS 1.3 at the origin from a
-7.3 MB static binary with no OpenSSL, and SSE at **4.33 KB per live subscriber**. It also
-surfaced three problems worth finding early — see [`docs/07-decisions.md`](docs/07-decisions.md)
-D26–D31.
+M0 retired the risky assumptions before any product code existed. M1 is the storage
+engine: records, lifetime-class segments, the index, on-disk tag chains, group commit,
+and snapshot-plus-tail recovery — with all five exit conditions measured.
+
+| | measured on one 8-core box |
+|---|---|
+| recovery | 3M records / 3,147 MiB replayed in **9.5 s** (332 MiB/s) |
+| index memory | **29.4 bytes** per live entry |
+| crash injection | **39/39** `fsync` boundaries, all recovered |
+| 24 h soak | **0 compactions**, 51 segments reclaimed by `unlink` |
+| request throughput | **2.9–3.2M req/s** on a single-threaded io_uring loop (M0) |
+| idle connections | **0.63–4.14 KB** each (M0) |
+
+111 unit tests plus an exit-condition harness: `zig build test && ./zig-out/bin/m1 all`.
+
+Nine decisions were corrected or added by actually building the thing — including the
+discovery that the crash harness, in its first form, could not detect a missing `fsync`
+at all. See [`docs/07-decisions.md`](docs/07-decisions.md) D26–D39.
 
 Doot runs on a single machine and makes a best-effort durability promise, not a
 guarantee. Data is backed up off-box continuously with a recovery point of a few minutes.
