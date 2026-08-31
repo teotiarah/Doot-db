@@ -45,8 +45,8 @@ shape.
 
 ## What it deliberately is not
 
-Not a key-value store, not a document database, not blob storage, not permanent. No
-query language, no joins, no transactions, no teams, no SDKs. 256 KB per entry, hard.
+Not a database, not blob storage, not permanent. No query language, no joins, no
+transactions, no teams, no SDKs. 256 KB per entry, hard.
 
 Full reasoning in [`docs/00-vision.md`](docs/00-vision.md).
 
@@ -60,18 +60,31 @@ and snapshot-plus-tail recovery — with all five exit conditions measured.
 
 | | measured on one 8-core box |
 |---|---|
-| recovery | 3M records / 3,147 MiB replayed in **9.5 s** (332 MiB/s) |
+| recovery | 3M records / 3,147 MiB replayed in **9.5 s** (332 MiB/s), on tmpfs |
 | index memory | **29.4 bytes** per live entry |
 | crash injection | **39/39** `fsync` boundaries, all recovered |
 | 24 h soak | **0 compactions**, 51 segments reclaimed by `unlink` |
 | request throughput | **2.9–3.2M req/s** on a single-threaded io_uring loop (M0) |
 | idle connections | **0.63–4.14 KB** each (M0) |
 
-111 unit tests plus an exit-condition harness: `zig build test && ./zig-out/bin/m1 all`.
+Recovery is a warm-page-cache figure and says so: it moves with the filesystem, and the
+number the operational lever derives from gets re-measured on the deployed volume in M5
+(D48).
+
+111 unit tests plus an exit-condition harness, both run by CI on every push:
+
+```bash
+zig build test
+zig build verify && ./zig-out/bin/m1 all /dev/shm/doot-m1
+```
 
 Nine decisions were corrected or added by actually building the thing — including the
 discovery that the crash harness, in its first form, could not detect a missing `fsync`
 at all. See [`docs/07-decisions.md`](docs/07-decisions.md) D26–D39.
+
+**M2's decisions are settled and its code is not written.** Twelve more (D40–D51) fix where
+control-plane state lives, whether idempotency survives a restart, and one silent data-loss
+path in how the index hash key was going to be configured.
 
 Doot runs on a single machine and makes a best-effort durability promise, not a
 guarantee. Data is backed up off-box continuously with a recovery point of a few minutes.
@@ -101,9 +114,13 @@ collapsed into a single `REFERENCE.md` at v1-beta and deleted. Start with
 | [`07-decisions.md`](docs/07-decisions.md) | every locked decision and rejected alternative |
 | [`08-roadmap.md`](docs/08-roadmap.md) | milestones to first public deploy |
 
-Two directories outside `docs/` are permanent:
+Three directories outside `docs/` are permanent:
 
 | | |
 |---|---|
 | [`toolchain/`](toolchain/) | pinned Zig version, hash, and the stdlib patch it requires. `toolchain/setup.sh` builds the environment from scratch |
-| [`spikes/`](spikes/) | M0 validation code. Disposable, deleted at M1 — see [`spikes/README.md`](spikes/README.md) |
+| [`tools/`](tools/) | the M1 exit-condition harness, its crash subject, and the vocabulary check |
+| [`ops/`](ops/) | deployment artifacts. The SSE verification probe today; the Cloudflare zone configuration in M2 |
+
+`spikes/` held the M0 validation code and was deleted at M1 as always intended. The findings
+are D26–D31; the code is in git history at `4547b32`.

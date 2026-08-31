@@ -37,10 +37,23 @@ Names are byte strings, compared byte-wise. `Order/42` and `order/42` are differ
 entries. Non-ASCII is rejected rather than normalised, because Unicode equivalence
 would make "is this the same entry" a question with more than one defensible answer.
 
+Names are percent-decoded exactly once before validation, so the length limit and character
+rules apply to the decoded bytes. A `%` not followed by two hexadecimal digits is rejected.
+
+Because `/` is a permitted byte and comparison is byte-wise after decoding, **`a%2Fb` and
+`a/b` are the same entry.** Treating an escaped slash as distinct would make identity depend
+on spelling.
+
 Server-assigned names (`POST`) are **ULIDs** — 26 characters, Crockford base32, a
 48-bit millisecond timestamp followed by 80 bits of randomness. Chosen over UUIDv4
 because ULIDs sort lexicographically by creation time, so a caller listing dumped
 webhooks gets chronological order for free.
+
+The **non-monotonic** form is used: 80 bits straight from the CSPRNG, with no per-millisecond
+counter. Sort order is therefore chronological to the millisecond, and two entries created
+inside the same millisecond sort arbitrarily against each other. Nothing in the product
+observes that ordering — list-by-tag orders by write sequence, not by name — and a monotonic
+counter would put shared mutable state on the write path to fix it.
 
 ## Tags
 
@@ -61,6 +74,11 @@ allowing it costs nothing while pre-empting a feature request for structured tag
 Tags are lowercased on write, so `X-Doot-Tags: CI,Main` stores `ci,main` and
 `?tag=CI` matches. This is the one place normalisation is applied, because tags are
 labels a human types, whereas names are identifiers a program constructs.
+
+The header is parsed before any of these rules are checked — split, trimmed, emptied
+elements dropped, lowercased, de-duplicated — and the maximum of 5 is enforced **after**
+de-duplication, so six copies of one tag is one tag rather than an error. Exact parsing order
+in `02-api.md`.
 
 **Tags support exactly one operation: list entries carrying this tag, newest first.**
 No intersection, union, negation, prefix match, wildcard, or counting. The retrieval
@@ -148,3 +166,8 @@ or malformed request is never allowed to consume resources:
 
 Credit is deducted at step 8 and refunded if step 10 fails, so a failed write never
 costs anything.
+
+The same guarantee holds across a crash, and in one direction only: **a deduction is never
+durable unless the write it paid for is also durable.** Balances are authoritative in memory
+and checkpointed periodically, so an unclean restart can rewind a balance and grant a few
+writes for free, but can never charge for a write that did not land (`07-decisions.md` D41).

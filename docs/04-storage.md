@@ -148,6 +148,44 @@ Segment ids are never recycled, which keeps locations globally unambiguous and m
 stale references safely detectable rather than silently wrong. At 24 bits the id
 space outlasts any plausible lifetime of a single box.
 
+## Store identity
+
+One 32-byte file, `STORE`, written when the data directory is first initialised and never
+rewritten:
+
+```
+offset  size  field
+  0       4   magic "DSTR"
+  4       2   format version
+  6       2   reserved
+  8       4   created_at        unix seconds
+ 12      16   index_hash_key    16 random bytes, CSPRNG at initialisation
+ 28       4   crc32c            over bytes 0..27
+```
+
+**The index hash key is store-local state, not configuration** (D43). It is baked into
+every slot in the index and into every hash written to `SNAPSHOT`, so it has to be
+byte-identical on every boot for the lifetime of the data. Supplying it from the
+environment made a silent, unrecoverable data-loss path out of a typo: a different key
+means every lookup misses, nothing errors, and tail replay cannot repair it because sealed
+segments are never re-read.
+
+It is read before the index is constructed. Three cases:
+
+| directory | `STORE` | behaviour |
+|---|---|---|
+| empty | absent | generate a key, write `STORE`, `fsync`, `syncDir` |
+| has segments | present, valid | adopt the persisted key |
+| has segments | absent or corrupt | **refuse to start** |
+
+Refusing beats guessing — a missing `STORE` beside live segments means an incomplete
+restore, and inventing a fresh key there orphans every entry that exists.
+
+Deliberately its own file rather than the reserved bytes in the snapshot header, because
+`SNAPSHOT` is fail-soft: a damaged one returns nothing and degrades to full replay. A key
+living only there would let a damaged snapshot produce a *different* key and an unreadable
+store that reports success.
+
 ## The index
 
 An open-addressed hash table. **20 bytes per slot**, maximum load factor 0.70, so
@@ -168,8 +206,8 @@ compare the stored name to the requested name. On mismatch, continue probing. Si
 colliding names share a probe sequence, continuing is correct. The verifying disk
 read is the same read that fetches the body, so collision handling is free.
 
-The hash is keyed with a per-instance secret so hash-flooding is not a remote
-denial-of-service vector.
+The hash is keyed with a per-store secret so hash-flooding is not a remote
+denial-of-service vector. That secret lives in `STORE` (above), not in the environment.
 
 **Sharding:** 64 shards selected by the top bits of the hash, each with its own lock.
 This serves three purposes at once — write concurrency across cores, bounded lock
@@ -218,6 +256,13 @@ The check runs **both on insert and during maintenance** (D39). Insert alone is 
 shard that stops receiving writes — after a wave of expiry, say — would otherwise hold
 its dead slots indefinitely. Nothing is lost when it does, since dead slots stay
 reusable, but the threshold should hold regardless of traffic.
+
+**Maintenance runs on its own thread, every 60 seconds** (D45). It sweeps expired slots,
+reclaims segments, rebuilds dead-heavy shards, and snapshots when the interval has passed —
+all of it blocking disk work, so it must never run on an event-loop thread. Sixty seconds
+rather than every tick because the sweep is not a correctness mechanism: expiry is
+authoritative at the index and checked lazily on every read, so sweeping only reclaims
+memory. At 10M entries a full sweep walks over 14M slots.
 
 One consequence worth stating, because the number looks alarming otherwise: **bytes per
 live entry is only meaningful near the admission point.** A store whose entries have
@@ -343,9 +388,10 @@ re-reads sealed segments and never scans the full dataset.
 At 10k writes/s averaging 1 KB, five minutes of tail is about 3 GB. **Recovery target is
 under 10 seconds**, and it is a tracked regression metric.
 
-**Measured: 3,000,000 records / 3,147 MiB replayed in 9.5 s — 332 MiB/s, 3.16 µs per
-record.** Inside the target, but with only 5% of margin, so the relationship behind the
-number matters more than the number:
+**Measured on tmpfs: 3,000,000 records / 3,147 MiB replayed in 9.5 s — 332 MiB/s, 3.16 µs
+per record.** Independently reproduced at 8.85 s / 355 MiB/s, also on tmpfs. Inside the
+target, but with only 5% of margin, so the relationship behind the number matters more than
+the number:
 
 ```
 recovery time  ≈  (write rate × record size × snapshot interval) / 332 MiB/s
@@ -363,6 +409,20 @@ cost is ~0.55 ns after moving to the hardware checksum below; before that it was
 
 Reads during replay are buffered in 1 MiB chunks. One `pread` per record would make
 recovery a syscall per record and miss the target by orders of magnitude.
+
+**The filesystem these figures came from is part of the claim** (D48). They were measured
+on tmpfs, replaying bytes already resident in memory, so `332 MiB/s` is a warm-page-cache
+rate and the formula above is an optimistic bound. A cold restart reads the tail from the
+deployed volume. Sequential NVMe reads should clear a 3.3 GB tail comfortably, but "should"
+is weaker than every other number on this page, so **M5 must re-measure on the deployed
+filesystem from a cold page cache** and that becomes the number the operational lever
+derives from.
+
+A related caution for anyone reading the harness: its write phase is single-threaded, so
+every write becomes its own flush leader and pays a full `fsync` with nobody to piggyback.
+On tmpfs that is ~41,000 writes/s; on a persistent volume it is ~200. That is leader commit
+(D34) behaving exactly as designed under a workload with no concurrency — **the write phase
+is a durability test, not a throughput measurement**, and must never be quoted as one.
 
 **Snapshots are taken shard by shard**, each under its short-lived shard lock, so no
 slot is ever copied mid-update and no global stop-the-world is needed. Writes landing
@@ -389,6 +449,64 @@ SSE subscribers filter by `account_id`. A subscriber that falls behind the ring 
 sent a resync marker rather than being silently skipped. The feed is best-effort by
 design; it drives a UI, not a guarantee.
 
+**The ring belongs to the storage engine** (D44), published from inside the write path while
+the write lock is held. Two reasons: `seq` and the location are generated there, so ring
+order matches sequence order for free; and a callback out to the server would run request
+code underneath the global write mutex. Reading is a cursor-based poll — the server asks for
+everything after a sequence it has already seen — so the engine holds no subscriber
+registry.
+
+The ring is built in M2 with the write path. Subscriber fan-out, SSE framing and the
+refcounted frame slots D30 forced are M4.
+
+**Visibility precedes durability here too.** A subscriber can observe a mutation a crash
+would erase, for the same reason a reader can (see Durability above). Consistent with the
+feed being best-effort.
+
+## Control-plane state
+
+Accounts, API key hashes, sessions, OTP challenges, identity anchors and credit balances
+must survive a restart, and none of them can live in the entry store: every entry must
+expire, segment reclamation would `unlink()` them, and "never expires" is not representable
+in a slot whose liveness *is* its expiry (D40).
+
+So they live in **`CONTROL`, an append-only log with the entire state held as an in-RAM
+image.** No index, no segments, no partial loading — at ten thousand accounts the whole
+image is single-digit megabytes, so disk exists only to rebuild it at boot.
+
+| property | value |
+|---|---|
+| mutation | append a length-prefixed, CRC32C-checksummed event, then `fsync` before responding |
+| recovery | replay from the start into empty maps; a torn tail is truncated |
+| reclamation | wholesale rewrite via `CONTROL.tmp` → `fsync` → `rename` → `syncDir`, once the log exceeds 8× the live image |
+| location | `DOOT_DATA_DIR`, beside the segments — segment discovery skips filenames it does not recognise |
+
+Signup, key creation, revocation and login are rare enough that one flush each is
+invisible. Rewriting wholesale is possible precisely because the image fits in RAM, so
+there is no incremental compaction problem — the same reclamation-not-compaction
+distinction drawn for index shards.
+
+**Credit balances are authoritative in RAM and checkpointed as absolute values** at the
+snapshot interval, never logged per write (D41). One invariant governs the design:
+
+> A credit deduction must never be durable unless the write it paid for is also durable.
+
+That permits losing deductions and forbids losing entries, so an unclean restart can only
+ever grant free writes — never charge for a write that did not land. Absolute values rather
+than deltas keep the log from growing with write volume and stop a partial checkpoint from
+compounding.
+
+**Two things stay out of the log entirely, and both are deliberate:**
+
+| state | why RAM only |
+|---|---|
+| rate-limit buckets | 16 B/account; every bucket starts full after a restart, which is the generous direction. Persisting a token count across a ten-second outage preserves a number that has already refilled |
+| idempotency records | ~50 B, capped at 1M, lost on restart (D42). Persisting would put an `fsync` on the path every automated caller is told to use, and would leave orphaned in-progress keys returning `409` for 24 hours after a crash |
+
+At the idempotency cap, records closest to expiry are dropped first. **A full table never
+rejects a write** — an optional header must not be able to fail a valid request, and
+dropping a record degrades to re-execution, which is what omitting the header already does.
+
 ## Backup
 
 Sealed segments are immutable, which is what makes backup nearly trivial. Target is
@@ -396,9 +514,11 @@ Cloudflare R2 (any S3-compatible endpoint works).
 
 | object | upload policy |
 |---|---|
+| `STORE` | once, at initialisation, never again — immutable, and a restore without it cannot proceed |
 | sealed segments | once, on seal, never again |
 | index snapshots | every 5 minutes, last 3 retained |
 | open segment tails | every 5 minutes, current tail bytes only |
+| `CONTROL` | every 5 minutes, whole file — single-digit megabytes, so wholesale is cheaper than tracking a tail |
 
 **Recovery point is the tail interval — 5 minutes by default**, configurable. Nothing
 is ever re-uploaded except the four open tails, so bandwidth is bounded by write rate,
@@ -408,9 +528,11 @@ Cost is negligible. R2 charges nothing for egress; class-A operations run about
 $4.50/million and storage about $0.015/GB/month. Backing up 50 GB with 5-minute tail
 pushes is roughly **$0.75/month**, all in.
 
-**Restore** pulls the newest snapshot plus every segment it references, then replays
-the tails — the same code path as local recovery, with a different source. This must
-be drilled before launch, not after. An untested restore is not a backup.
+**Restore** pulls `STORE` first — without its index hash key nothing written before the
+restore is addressable — then the newest snapshot plus every segment it references, then
+replays the tails, then loads `CONTROL`. The same code path as local recovery, with a
+different source. This must be drilled before launch, not after. An untested restore is not
+a backup.
 
 Segments whose `max_expiry` has passed are deleted from R2 too, so backup storage
 tracks live data rather than growing without bound.
@@ -424,12 +546,18 @@ The number this design exists to control. At 10 million live entries on a 16 GB 
 | index | 29 B/entry | 286 MB |
 | tag chain heads | O(tags/account) | ~32 MB |
 | idempotency records | ~50 B, capped at 1M | ≤ 50 MB |
-| in-flight request buffers | 256 concurrent × 256 KB | 64 MB |
-| connection state | ~8 KB × 2,000 | 16 MB |
+| in-flight request buffers | 256 concurrent × 260 KiB | 65 MB |
+| control-plane image | O(accounts), ~200 B each plus keys and sessions | ~10 MB at 10k accounts |
+| connection state | pooled, 0.63 KB/conn at a 512 B idle read buffer (D28) | ~1.3 MB at 2,000 |
 | rate limit buckets | 16 B/account | < 1 MB |
 | change feed ring | 65,536 × 24 B | 1.5 MB |
 | **application total** | | **~450 MB** |
 | **left to page cache** | | **~15 GB** |
+
+The in-flight buffer slot is **260 KiB, not 256 KB** (D51). A read has to hold an entire
+record, and `record.max_record_bytes` is 262,929 — a 256 KB slot is 785 bytes short, which
+would truncate exactly the largest entries the product permits. 266,240 B is the next page
+multiple, and 256 of them is precisely 65 MiB.
 
 Roughly **97% of RAM is left to the kernel page cache**, which is exactly right —
 that is where hot bodies belong.
@@ -446,9 +574,14 @@ Scaling of the index alone:
 | 10M | 286 MB |
 | 100M | 2.9 GB |
 
-Note what this implies at modest scale: at around 5M entries, **idle connections cost
-more RAM than stored data does**. Buffers are therefore pooled per in-flight request
-rather than per connection (`05-architecture.md`).
+This table originally carried a note that at around 5M entries **idle connections cost more
+RAM than stored data does**. That was true of the naive allocation it assumed — 8.1 KB per
+connection, so the crossover sat near 18,000 idle connections — and D28 moved it by more
+than an order of magnitude: pooled connection structs and arena-carved read buffers cost
+0.63 KB each, putting the crossover past 200,000 connections. The conclusion it was drawn to
+support stands unchanged and is the reason for the measurement: **buffers are pooled per
+in-flight request rather than per connection** (`05-architecture.md`). The alarming version
+of the claim is simply no longer accurate.
 
 ## Capacity ceiling and admission control
 
@@ -530,6 +663,13 @@ configuration and can never trigger in production.
 | change feed ring | 65,536 events | — |
 | backup tail interval | 5 minutes | `DOOT_BACKUP_INTERVAL_S` |
 | recovery target | < 10 seconds | — |
+| index memory ceiling | no default — **required at boot** | `DOOT_MAX_INDEX_BYTES` |
+| index hash key | 16 bytes, generated once into `STORE` | **not configurable** (D43) |
+| maintenance interval | 60 seconds | — |
+| control log rewrite threshold | 8 × live image size | — |
+| credit checkpoint interval | snapshot interval | derived |
+| idempotency record cap | 1,000,000, RAM only | — |
+| in-flight request buffer slot | 266,240 bytes (260 KiB) | — |
 
 The commit interval and size trigger are deliberately absent rather than unset: leader
 commit removes the need for either. See Durability.
