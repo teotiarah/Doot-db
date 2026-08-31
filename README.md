@@ -62,7 +62,7 @@ and snapshot-plus-tail recovery — with all five exit conditions measured.
 |---|---|
 | recovery | 3M records / 3,147 MiB replayed in **9.5 s** (332 MiB/s), on tmpfs |
 | index memory | **29.4 bytes** per live entry |
-| crash injection | **39/39** `fsync` boundaries, all recovered |
+| crash injection | **41/41** `fsync` boundaries, all recovered |
 | 24 h soak | **0 compactions**, 51 segments reclaimed by `unlink` |
 | request throughput | **2.9–3.2M req/s** on a single-threaded io_uring loop (M0) |
 | idle connections | **0.63–4.14 KB** each (M0) |

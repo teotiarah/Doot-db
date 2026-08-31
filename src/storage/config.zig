@@ -132,8 +132,14 @@ pub const Options = struct {
     /// appropriate in tests.
     max_index_bytes: u64 = 0,
 
-    /// Keys the index hash so hash-flooding is not a remote DoS vector.
-    /// Randomised per instance in production; fixed in tests for determinism.
+    /// Keys the index hash so hash-flooding is not a remote DoS vector (D11).
+    ///
+    /// **`Store.open` overrides this**, from the `STORE` file beside the data
+    /// (D43). The key is part of the identity of every slot, so it has to be
+    /// byte-identical on every boot for the lifetime of the store — which makes it
+    /// store-local state rather than configuration, and not something the caller
+    /// gets to choose. Setting it here only affects an `Index` built directly,
+    /// which is what the index's own tests do for determinism.
     index_hash_key: [16]u8 = @splat(0),
 
     pub fn classBound(o: Options, class: Class) u32 {

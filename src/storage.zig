@@ -22,6 +22,8 @@ pub const segment = @import("storage/segment.zig");
 pub const commit = @import("storage/commit.zig");
 pub const tagchain = @import("storage/tagchain.zig");
 pub const snapshot = @import("storage/snapshot.zig");
+pub const identity = @import("storage/identity.zig");
+pub const feed = @import("storage/feed.zig");
 pub const store = @import("storage/store.zig");
 
 pub const Location = location.Location;
@@ -48,5 +50,7 @@ test {
     _ = commit;
     _ = tagchain;
     _ = snapshot;
+    _ = identity;
+    _ = feed;
     _ = store;
 }

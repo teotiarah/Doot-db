@@ -1112,6 +1112,12 @@ attacker, and now *cannot* be misconfigured to a shared value across deployments
 `STORE` is immutable after creation, so backup treats it exactly like a sealed segment —
 uploaded once, never again — and a restore lacking it cannot proceed, which is correct.
 
+**Implementation note.** Creating `STORE` costs two flush boundaries, the file and the
+directory entry, so the M1 crash sweep now enumerates **41 boundaries rather than 39** and
+recovers at every one. The two additions are on the fresh-store path, where a crash is
+trivially survivable because no data exists yet for a regenerated key to orphan. The count
+quoted in D48 was measured before this landed and is left as recorded.
+
 **Related, and settled the other way.** `Options.max_index_bytes` defaults to `0`, meaning
 unlimited, which disables admission control entirely. Unlike the hash key, a wrong value
 here corrupts nothing — it only changes when `503 capacity_exhausted` begins. So this stays

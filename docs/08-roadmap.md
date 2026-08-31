@@ -56,7 +56,7 @@ tmpfs (D48). CI runs exactly this on every push (D50).
 
 | condition | target | measured |
 |---|---|---|
-| crash at every `fsync` boundary loses nothing acknowledged, resurrects nothing | all boundaries | **39/39 boundaries**, all killed mid-run, all recovered |
+| crash at every `fsync` boundary loses nothing acknowledged, resurrects nothing | all boundaries | **41/41 boundaries**, all killed mid-run, all recovered |
 | recovery with 5 minutes of tail at 10k writes/s | < 10 s | **9.5 s** for 3,000,000 records / 3,147 MiB (332 MiB/s), on tmpfs |
 | index RAM per live entry | 28.57 B ± 10% | **29.40 B** at 972k entries, occupancy 0.680 |
 | compaction events in a 24 h mixed-lifetime soak | 0 | **0**, and 0 segments even met the trigger; 51 reclaimed by unlink |

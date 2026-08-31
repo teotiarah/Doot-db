@@ -73,6 +73,21 @@ fn segmentName(buf: []u8, class: config.Class, id: u32) ![:0]u8 {
     return std.fmt.bufPrintZ(buf, "c{d}-{d:0>8}.seg", .{ class, id });
 }
 
+/// Whether the directory already holds segments.
+///
+/// Needed before a `SegmentSet` exists, because the store's identity file has to
+/// be resolved before the index is built (D43) and "is this a fresh store or a
+/// damaged one" is exactly the question that decides whether a missing `STORE`
+/// may be regenerated. Lives here so `parseSegmentName` stays the single place
+/// that knows what a segment is called.
+pub fn anySegments(dir_fd: os.Fd) Error!bool {
+    var it = os.DirIterator.init(dir_fd);
+    while (try it.next()) |entry| {
+        if (parseSegmentName(entry.name) != null) return true;
+    }
+    return false;
+}
+
 /// Parses `c{class}-{id}.seg`. Returns null for anything else in the directory.
 fn parseSegmentName(name: []const u8) ?struct { class: config.Class, id: u32 } {
     if (name.len < 7) return null;
