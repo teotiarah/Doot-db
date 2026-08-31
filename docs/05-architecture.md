@@ -22,7 +22,8 @@ container orchestration.
   │         → control plane /app/* (session)      │
   │         → dashboard assets (@embedFile)       │
   │  storage engine (04-storage.md)               │
-  │  change feed → SSE                            │
+  │  control-plane log + in-RAM image (D40)       │
+  │  change feed ring → SSE                       │
   │  backup uploader → R2                         │
   │  outbound HTTPS client → ZeptoMail, GitHub    │
   └──────────────────────────────────────────────┘
@@ -115,10 +116,18 @@ this toolchain (D26, D27).
   heartbeats and stats, so it is not overhead.
 - Connections are pinned to the worker that accepted them. Connection state is a plain
   struct we size ourselves, from a pooled slab — not a fiber with a reserved stack.
-- Index shards (64) are lock-protected, so any worker can serve any request. Storage
-  appends go through per-class staging buffers with a dedicated commit thread.
-- Background threads: commit, snapshot, segment reclamation, backup uploader, outbound
-  mail. All off the request path.
+- Index shards (64) are lock-protected, so any worker can serve any read. **Writes take one
+  global lock and reads take none** (D35); shard locks protect structure only and are never
+  held across disk I/O.
+- **There is no staging buffer and no commit thread** (D34). Records are `pwrite`n on arrival
+  and only the `fsync` is batched, by whichever writer needs durability first. Every other
+  writer waiting at that moment is covered by the same flush.
+- Background threads: **maintenance** (expiry sweep, segment reclamation, index shard
+  rebuild, snapshot — D45), backup uploader, outbound mail. All off the request path.
+- The event loop's repeating `timeout` SQE fires at **1 s** and does only cheap work:
+  connection idle timeouts, stats, and signalling the maintenance thread. `Store.maintain()`
+  itself runs on that thread every **60 s**, because it blocks on disk and would otherwise
+  stall every connection pinned to the worker.
 
 Driving the ring ourselves is more code than calling `std.Io`, and it is the right
 trade: it is the layer Doot most needs control over, and on Zig 0.16.0 the alternative
@@ -149,8 +158,10 @@ Each of these is worth more than any storage micro-optimisation.
   never drain an upload we intend to refuse.
 - **Handle `Expect: 100-continue`.** `curl` sends it for larger bodies and stalls a
   full second if it is ignored — a real, frequently-shipped bug.
-- **Buffers pooled per in-flight request, not per connection.** 256 concurrent × 256 KB
-  = 64 MB of body buffers total, independent of idle connection count. At around 5M
+- **Buffers pooled per in-flight request, not per connection.** 256 concurrent × 260 KiB
+  = 65 MB of body buffers total, independent of idle connection count. The slot is 260 KiB
+  and not 256 KB because a read must hold a whole record, which tops out at 262,929 bytes —
+  785 more than a 256 KB slot, and 266,240 is the next page multiple (D51). At around 5M
   entries idle connections would otherwise outweigh the index (`04-storage.md`).
   Measured at 10,000 idle keep-alive connections (D28): naive allocation costs
   **8.11 KB/conn (79 MB)**; pooling connection structs into a static array and read
@@ -201,10 +212,10 @@ Two consequences for this document:
   the state-storage use case outright, which is a large part of why anyone would adopt
   Doot.
 
-`spikes/sse/sseprobe.py` is the verification procedure and survives the deletion of
-`spikes/` as the one artifact worth keeping: point it at the live origin and it judges
-streaming on arrival timing rather than content, because a buffering proxy still
-delivers every event — just late and all at once.
+`ops/sseprobe.py` is the verification procedure. It is the one artifact that survived the
+deletion of `spikes/` (D49): point it at the live origin and it judges streaming on arrival
+timing rather than content, because a buffering proxy still delivers every event — just late
+and all at once.
 
 ## Outbound calls
 
@@ -231,17 +242,31 @@ dependency and no ambiguity about precedence.
 ```
 DOOT_LISTEN_ADDR            DOOT_TLS_CERT_PATH        DOOT_TLS_KEY_PATH
 DOOT_DATA_DIR               DOOT_MAX_TTL              DOOT_SEGMENT_BYTES
-DOOT_MAX_INDEX_BYTES        DOOT_COMMIT_INTERVAL_MS   DOOT_SNAPSHOT_INTERVAL_S
-DOOT_BACKUP_INTERVAL_S      DOOT_R2_ENDPOINT          DOOT_R2_BUCKET
+DOOT_MAX_INDEX_BYTES        DOOT_SNAPSHOT_INTERVAL_S  DOOT_BACKUP_INTERVAL_S
+DOOT_R2_ENDPOINT            DOOT_R2_BUCKET
 DOOT_R2_ACCESS_KEY_ID       DOOT_R2_SECRET_ACCESS_KEY
 DOOT_GITHUB_CLIENT_ID       DOOT_GITHUB_CLIENT_SECRET
 DOOT_ZEPTOMAIL_TOKEN        DOOT_SUPPORT_EMAIL
-DOOT_HMAC_SECRET            DOOT_INDEX_HASH_SECRET
-DOOT_ADMIN_TOKEN
+DOOT_HMAC_SECRET            DOOT_ADMIN_TOKEN
 ```
 
 The binary refuses to start if any secret is missing or a path is unwritable. Failing
-loudly at boot beats discovering it during the first write.
+loudly at boot beats discovering it during the first write. `DOOT_MAX_INDEX_BYTES` is
+included in that: without it the index has no ceiling and admission control never engages,
+so it is required rather than defaulted (D43).
+
+**Two variables were removed rather than left unimplemented.**
+
+`DOOT_COMMIT_INTERVAL_MS` went with D34 — leader commit has no interval to configure, and
+`04-storage.md` records the constant as deliberately absent.
+
+`DOOT_INDEX_HASH_SECRET` went with D43, and that one was a hazard rather than dead weight.
+The index hash key is baked into every slot and every hash in `SNAPSHOT`, so it must be
+byte-identical on every boot for the lifetime of the data. As an environment variable, a
+typo silently made every entry unfindable while the store reported itself healthy. It is now
+generated once at initialisation and persisted in `STORE` alongside the data
+(`04-storage.md`). It is not configurable, and rotating it is a destructive operation rather
+than a security one.
 
 ## Deployment
 

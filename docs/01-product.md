@@ -53,7 +53,12 @@ configuration value (`DOOT_MAX_TTL`) and the storage layout derives from it. See
 - **Idempotent replays are not charged.** A retried write carrying the same
   `Idempotency-Key` replays the original outcome and costs nothing. This is worth
   stating on the pricing page: retry storms from a flaky automation don't cost
-  money.
+  money. One documented exception: idempotency state is held in memory, so a retry
+  arriving after a service restart re-executes and does consume a credit
+  (`02-api.md`).
+- **Crediting errs in the customer's favour.** A credit is never durable unless the
+  write it paid for is also durable, so an unclean restart can hand back a few
+  recently spent credits but can never charge for a write that did not land.
 - The trial grant is **per account**, and is bound to both the verified email
   address and the GitHub account ID, so it cannot be reset by issuing new API keys
   or by re-authenticating through the other signup path.

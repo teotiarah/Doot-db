@@ -258,6 +258,26 @@ pub fn rename(dir_fd: Fd, old_path: [:0]const u8, new_path: [:0]const u8) Error!
     if (failed(rc)) return toError(rc);
 }
 
+/// Cryptographically secure random bytes, straight from the kernel.
+///
+/// `getrandom` rather than a userspace CSPRNG because the one thing the engine
+/// needs randomness for — the index hash key in `STORE` (D43) — is generated once,
+/// must never be predictable, and must never depend on a seed we could get wrong.
+/// A one-off call has no throughput requirement, so there is nothing to gain from
+/// keeping state around.
+pub fn getRandom(buf: []u8) Error!void {
+    var done: usize = 0;
+    while (done < buf.len) {
+        const rc = linux.getrandom(buf.ptr + done, buf.len - done, 0);
+        if (failed(rc)) {
+            if (errnoOf(rc) == .INTR) continue;
+            return toError(rc);
+        }
+        if (rc == 0) return error.Unexpected;
+        done += rc;
+    }
+}
+
 pub fn exists(dir_fd: Fd, path: [:0]const u8) bool {
     const fd = open(dir_fd, path, .{}) catch return false;
     close(fd);

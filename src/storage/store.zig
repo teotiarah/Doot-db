@@ -42,8 +42,19 @@ const segment = @import("segment.zig");
 const commit = @import("commit.zig");
 const tagchain = @import("tagchain.zig");
 const snapshot_mod = @import("snapshot.zig");
+const identity = @import("identity.zig");
+const feed_mod = @import("feed.zig");
 
 const Location = loc_mod.Location;
+
+/// The buffer `get` requires, and therefore the size of a pooled read slot in the
+/// server above.
+///
+/// Stated as a constant because getting it wrong is invisible until the largest
+/// possible entry is read: a body is capped at 256 KiB, but a *record* also carries
+/// a 36-byte header, a 256-byte name, a 128-byte content type and five tags, so the
+/// real ceiling is 262,929 bytes — 785 more than 256 KiB (D51).
+pub const read_buffer_bytes: u32 = record.max_record_bytes;
 
 pub const Error = error{
     NameInvalid,
@@ -57,7 +68,7 @@ pub const Error = error{
     /// still accepted, since deleting is how an operator recovers.
     CapacityExhausted,
 } || segment.Error || snapshot_mod.Error || tagchain.Error ||
-    record.Error || ConfigError || IndexError;
+    record.Error || identity.Error || ConfigError || IndexError;
 
 /// Surfaced by `Options.validate`, which runs before anything is opened.
 const ConfigError = error{ SegmentTooLarge, SegmentTooSmall, MaxTtlTooSmall };
@@ -87,6 +98,7 @@ pub const Stats = struct {
     segments: segment.SegmentSet.Stats,
     commit: commit.Committer.Stats,
     tags: tagchain.TagHeads.Stats,
+    feed: feed_mod.Stats,
     /// Records whose checksum failed while the index still pointed at them.
     /// Distinct from a torn tail, which is expected after a crash.
     corruptions: u64,
@@ -104,6 +116,8 @@ pub const Store = struct {
     segs: segment.SegmentSet,
     com: commit.Committer,
     heads: tagchain.TagHeads,
+    /// Published under `write_mutex`, so ring order is `seq` order (D44).
+    feed: feed_mod.Feed,
 
     write_mutex: os.Mutex = .{},
 
@@ -120,6 +134,18 @@ pub const Store = struct {
     ) Error!*Store {
         try opts.validate();
 
+        // D43: the index hash key is store-local state, not configuration, and it
+        // has to be resolved before the index exists — every slot the index holds
+        // is keyed with it, so opening the same data under a different key would
+        // silently find nothing. `anySegments` is what separates a genuinely fresh
+        // store, where a key may be generated, from a damaged one, where inventing
+        // one would orphan every entry.
+        const has_data = try segment.anySegments(dir_fd);
+        const ident = try identity.openOrCreate(dir_fd, has_data, clk.now());
+
+        var effective = opts;
+        effective.index_hash_key = ident.index_hash_key;
+
         const self = try gpa.create(Store);
         errdefer gpa.destroy(self);
 
@@ -127,16 +153,22 @@ pub const Store = struct {
             .gpa = gpa,
             .dir_fd = dir_fd,
             .clock = clk,
-            .opts = opts,
-            .idx = try index_mod.Index.init(gpa, opts),
+            .opts = effective,
+            .idx = try index_mod.Index.init(gpa, effective),
             .segs = undefined,
             .com = undefined,
             .heads = tagchain.TagHeads.init(gpa),
+            .feed = undefined,
         };
         errdefer self.idx.deinit();
         errdefer self.heads.deinit();
 
-        self.segs = try segment.SegmentSet.open(gpa, dir_fd, clk, opts);
+        // Separately, not in the literal above: a failing initialiser inside a
+        // struct literal leaks whatever earlier fields already allocated.
+        self.feed = try feed_mod.Feed.init(gpa);
+        errdefer self.feed.deinit();
+
+        self.segs = try segment.SegmentSet.open(gpa, dir_fd, clk, effective);
         errdefer self.segs.deinit();
         self.com = commit.Committer.init(&self.segs);
 
@@ -149,9 +181,23 @@ pub const Store = struct {
         // Best effort: a failed final snapshot only means a longer replay next
         // time, never lost data.
         self.snapshot() catch {};
+        self.abandon();
+    }
+
+    /// Releases everything **without** the closing snapshot.
+    ///
+    /// The missing snapshot is the entire point: a store dropped this way leaves
+    /// its tail uncaptured, so the next `open` has to replay it. That is how a test
+    /// or a benchmark reproduces an unclean shutdown deliberately, and it is why
+    /// this is a named operation rather than four lines copied at each call site —
+    /// hand-rolled teardown silently stops releasing anything added later.
+    ///
+    /// Production uses `close`.
+    pub fn abandon(self: *Store) void {
         self.segs.deinit();
         self.heads.deinit();
         self.idx.deinit();
+        self.feed.deinit();
         self.gpa.destroy(self);
     }
 
@@ -384,6 +430,10 @@ pub const Store = struct {
         );
         if (existing) |e| self.segs.noteDead(e.loc, e.len);
 
+        // Still under the lock, which is what makes ring order sequence order
+        // without sorting anything (D44).
+        self.feed.publish(.{ .seq = seq, .loc = loc, .account_id = account_id, .op = .put });
+
         // Durability outside the lock, so other writers can join this flush.
         self.write_mutex.unlock();
         unlocked = true;
@@ -410,8 +460,7 @@ pub const Store = struct {
         // the record is never replayed again (D32).
         const expires_at = now + config.tombstone_ttl_s;
 
-        var buf: [record.max_record_bytes]u8 = undefined;
-        const bytes = try record.encode(.{
+        const tomb: record.Record = .{
             .seq = seq,
             .account_id = account_id,
             .created_at = now,
@@ -422,12 +471,25 @@ pub const Store = struct {
             .content_type = "",
             .tags = &.{}, // a tombstone joins no chain
             .body = "",
-        }, &buf);
+        };
 
-        _ = try self.segs.append(0, bytes, expires_at);
+        // Heap, sized to this tombstone, matching `put` (D51). A tombstone carries
+        // no body, content type or tags, so its true ceiling is 36 + 256 = 292
+        // bytes. The stack buffer this replaces reserved 262,929 — harmless on the
+        // harness's main thread, and a stack overflow waiting to happen once
+        // `delete` runs on an event-loop worker whose stack we size ourselves.
+        const buf = try self.gpa.alloc(u8, tomb.encodedLen());
+        defer self.gpa.free(buf);
+        const bytes = try record.encode(tomb, buf);
+
+        const tomb_loc = try self.segs.append(0, bytes, expires_at);
         self.com.noteWritten(0, seq);
         _ = self.idx.kill(h, existing.slot, existing.loc, now);
         self.segs.noteDead(existing.loc, existing.len);
+
+        // The tombstone's own location. A consumer resolves which name was deleted
+        // by reading the record there, exactly as it would for a put.
+        self.feed.publish(.{ .seq = seq, .loc = tomb_loc, .account_id = account_id, .op = .delete });
 
         self.write_mutex.unlock();
         unlocked = true;
@@ -441,6 +503,10 @@ pub const Store = struct {
 
     /// Reads one entry into `buf`. Returns null when absent, expired or deleted —
     /// which callers cannot tell apart, by design.
+    ///
+    /// `buf` must be at least `read_buffer_bytes`, because the whole record is read
+    /// before the body can be located inside it. The returned `body` and
+    /// `content_type` **borrow `buf`**, so it must outlive the `Got`.
     pub fn get(self: *Store, account_id: u32, name: []const u8, buf: []u8) Error!?Got {
         const now = self.clock.now();
         const h = self.idx.hash(account_id, name);
@@ -514,8 +580,20 @@ pub const Store = struct {
         snapshotted: bool,
     };
 
-    /// Time-driven housekeeping. Called from the event loop's tick in production;
-    /// called explicitly with an advanced clock in tests.
+    /// Time-driven housekeeping.
+    ///
+    /// **Runs on the maintenance thread, not the event loop** (D45). Every step
+    /// here blocks: the sweep walks all 64 shards, reclamation `unlink`s files, and
+    /// the snapshot flushes and then writes the entire slot array. On an event-loop
+    /// thread that stalls every connection pinned to the worker. The loop's
+    /// repeating timeout SQE only signals this; it never calls it.
+    ///
+    /// Cadence is 60 s rather than every tick, because this is not a correctness
+    /// mechanism — expiry is authoritative at the index and checked lazily on every
+    /// read, so sweeping only reclaims memory. The snapshot inside it is gated
+    /// separately on `snapshot_interval_s`.
+    ///
+    /// Tests call it directly with an advanced clock.
     pub fn maintain(self: *Store) Error!Maintenance {
         const now = self.clock.now();
 
@@ -538,6 +616,16 @@ pub const Store = struct {
         };
     }
 
+    /// Reads change-feed events published after `from`.
+    ///
+    /// Takes no lock and never blocks. The feed is best-effort (D18): a consumer
+    /// lagging far enough to be lapped gets `resync` set rather than a silent gap.
+    /// Recovery does not publish, so after a restart a consumer starting from
+    /// `feed.Cursor.now` simply sees live traffic.
+    pub fn pollFeed(self: *Store, from: feed_mod.Cursor, out: []feed_mod.Event) feed_mod.Poll {
+        return self.feed.poll(from, out);
+    }
+
     pub fn snapshot(self: *Store) Error!void {
         // Flush first: a snapshot claims its watermark is durable.
         try self.com.flush();
@@ -557,6 +645,7 @@ pub const Store = struct {
             .segments = self.segs.stats(),
             .commit = self.com.stats(),
             .tags = self.heads.stats(),
+            .feed = self.feed.stats(),
             .corruptions = self.corruptions.load(.monotonic),
             .recovery_ms = self.recovery_ms,
             .recovery_records = self.recovery_records,
@@ -1230,10 +1319,7 @@ test "recovery works without a snapshot, from segments alone" {
             const name = try std.fmt.bufPrint(&nb, "ns/{d}", .{i});
             _ = try s.put(1, name, "v", "", &.{"tag"}, day);
         }
-        s.segs.deinit();
-        s.heads.deinit();
-        s.idx.deinit();
-        testing.allocator.destroy(s);
+        s.abandon();
     }
     {
         const s = try h.reopen();
@@ -1318,10 +1404,7 @@ test "a deletion recovered from segments alone also does not resurrect" {
         _ = try s.put(1, "zap", "data", "", &.{}, 20 * day);
         _ = try s.delete(1, "zap");
         // No snapshot: the tombstone must be replayed from the segment.
-        s.segs.deinit();
-        s.heads.deinit();
-        s.idx.deinit();
-        testing.allocator.destroy(s);
+        s.abandon();
     }
     {
         const s = try h.reopen();
@@ -1368,10 +1451,7 @@ test "recovery survives segment rotation since the snapshot" {
             _ = try s.put(1, name, body, "", &.{"r"}, day);
         }
         try testing.expect(s.stats().segments.segments > 1);
-        s.segs.deinit();
-        s.heads.deinit();
-        s.idx.deinit();
-        testing.allocator.destroy(s);
+        s.abandon();
     }
     {
         const s = try h.reopen();
@@ -1403,10 +1483,7 @@ test "recovery is idempotent, so a crash during it is survivable" {
             const name = try std.fmt.bufPrint(&nb, "idem/{d}", .{i});
             _ = try s.put(1, name, "v", "", &.{"t"}, day);
         }
-        s.segs.deinit();
-        s.heads.deinit();
-        s.idx.deinit();
-        testing.allocator.destroy(s);
+        s.abandon();
     }
 
     // Recover repeatedly without ever snapshotting. Each pass replays the same
@@ -1421,10 +1498,7 @@ test "recovery is idempotent, so a crash during it is survivable" {
         const r = try s.list(1, "t", 100, .{}, &c, Collect.emit);
         try testing.expectEqual(@as(u32, 100), r.emitted);
 
-        s.segs.deinit();
-        s.heads.deinit();
-        s.idx.deinit();
-        testing.allocator.destroy(s);
+        s.abandon();
     }
 }
 
@@ -1647,4 +1721,199 @@ test "every acknowledged write in a mixed batch is durable when it returns" {
     const st = s.stats();
     try testing.expect(st.commit.flushes > 0);
     for (0..config.class_count) |c| try testing.expect(st.commit.durable[c] > 0);
+}
+
+
+// ---------------------------------------------------------------------------
+// M2 prerequisites: store identity (D43), the change feed (D44), and the two
+// defects D51 recorded.
+// ---------------------------------------------------------------------------
+
+test "the largest permitted entry round-trips through a read_buffer_bytes buffer" {
+    // The D51 regression. `get` has to hold the whole *record*, not just the body,
+    // so a buffer sized at max_body_bytes is 785 bytes short of what a maximal
+    // entry needs — and it is short only for the very largest entries, which is
+    // exactly why it survived M1 unnoticed. The server's pooled read slot is sized
+    // from `read_buffer_bytes` because of this test.
+    try testing.expectEqual(@as(u32, 785), read_buffer_bytes - config.max_body_bytes);
+
+    var h = try H.init(9101);
+    defer h.deinit();
+
+    var o = h.opts();
+    // A maximal record does not fit the harness's 256 KiB segments.
+    o.segment_bytes = 1024 * 1024;
+
+    const s = try Store.open(testing.allocator, h.dir_fd, h.mclock.clock(), o);
+    defer s.close();
+
+    const name = "n" ** config.max_name_bytes;
+    const content_type = "c" ** config.max_content_type_bytes;
+    const tags = [config.max_tags][]const u8{
+        ("t" ** 63) ++ "0",
+        ("t" ** 63) ++ "1",
+        ("t" ** 63) ++ "2",
+        ("t" ** 63) ++ "3",
+        ("t" ** 63) ++ "4",
+    };
+
+    const body = try testing.allocator.alloc(u8, config.max_body_bytes);
+    defer testing.allocator.free(body);
+    @memset(body, 'b');
+
+    // Pins the constant to reality: this entry encodes to exactly the buffer size.
+    {
+        var rec_tags: [config.max_tags]record.Tag = undefined;
+        for (tags, 0..) |t, i| rec_tags[i] = .{ .text = t, .prev = loc_mod.none };
+        const probe: record.Record = .{
+            .seq = 1,
+            .account_id = 1,
+            .created_at = 0,
+            .expires_at = 1,
+            .class = 0,
+            .tombstone = false,
+            .name = name,
+            .content_type = content_type,
+            .tags = &rec_tags,
+            .body = body,
+        };
+        try testing.expectEqual(read_buffer_bytes, probe.encodedLen());
+    }
+
+    _ = try s.put(1, name, body, content_type, &tags, 3600);
+
+    const buf = try testing.allocator.alloc(u8, read_buffer_bytes);
+    defer testing.allocator.free(buf);
+
+    const got = (try s.get(1, name, buf)).?;
+    try testing.expectEqual(@as(usize, config.max_body_bytes), got.body.len);
+    try testing.expectEqualSlices(u8, body, got.body);
+    try testing.expectEqualSlices(u8, content_type, got.content_type);
+    try testing.expectEqual(@as(u8, config.max_tags), got.tag_count);
+}
+
+test "a tombstone no longer reserves a maximum-size buffer" {
+    // The other half of D51: `delete` used a 262,929-byte stack local. Harmless on
+    // a test's main thread, a stack overflow once it runs on an event-loop worker.
+    // A tombstone carries no body, content type or tags, so 36 + 256 is its true
+    // ceiling — this asserts the shape the fix relies on.
+    const tomb: record.Record = .{
+        .seq = 1,
+        .account_id = 1,
+        .created_at = 0,
+        .expires_at = 1,
+        .class = 0,
+        .tombstone = true,
+        .name = "n" ** config.max_name_bytes,
+        .content_type = "",
+        .tags = &.{},
+        .body = "",
+    };
+    try testing.expectEqual(@as(u32, 292), tomb.encodedLen());
+    try testing.expect(tomb.encodedLen() < read_buffer_bytes / 100);
+}
+
+test "the index hash key belongs to the store and survives a reopen" {
+    var h = try H.init(9102);
+    defer h.deinit();
+
+    // The harness passes 0x5A repeated. The store must ignore it: the key is baked
+    // into every slot it holds, so it is store-local state (D43), not a setting.
+    const configured: [16]u8 = @splat(0x5A);
+
+    var persisted: [16]u8 = undefined;
+    {
+        const s = try h.reopen();
+        defer s.close();
+        _ = try s.put(1, "keep", "v", "", &.{}, 3600);
+        persisted = s.opts.index_hash_key;
+    }
+    try testing.expect(!std.mem.eql(u8, &configured, &persisted));
+
+    {
+        const s = try h.reopen();
+        defer s.close();
+        try testing.expectEqualSlices(u8, &persisted, &s.opts.index_hash_key);
+
+        // The entry is still findable. Under a different key this would return null
+        // while the store reported itself perfectly healthy, which is the failure
+        // D43 exists to prevent.
+        var buf: [4096]u8 = undefined;
+        const got = (try s.get(1, "keep", &buf)).?;
+        try testing.expectEqualSlices(u8, "v", got.body);
+    }
+}
+
+test "a store refuses to open when its identity is missing beside its data" {
+    var h = try H.init(9103);
+    defer h.deinit();
+    {
+        const s = try h.reopen();
+        defer s.close();
+        _ = try s.put(1, "k", "v", "", &.{}, 3600);
+    }
+
+    // An incomplete restore, or a deleted file. Generating a fresh key here would
+    // orphan every entry present while looking like a clean start.
+    try os.unlink(h.dir_fd, identity.file_name);
+    try testing.expectError(error.StoreIdentityMissing, h.reopen());
+}
+
+test "the feed records every mutation, in sequence order" {
+    var h = try H.init(9104);
+    defer h.deinit();
+    const s = try h.reopen();
+    defer s.close();
+
+    const a = try s.put(7, "one", "x", "", &.{}, 3600);
+    const b = try s.put(7, "two", "y", "", &.{}, 3600);
+    try testing.expect(try s.delete(7, "one"));
+
+    var out: [8]feed_mod.Event = undefined;
+    const p = s.pollFeed(.{}, &out);
+    try testing.expect(!p.resync);
+    try testing.expectEqual(@as(usize, 3), p.events.len);
+
+    try testing.expectEqual(a.seq, p.events[0].seq);
+    try testing.expectEqual(feed_mod.Op.put, p.events[0].op);
+    try testing.expectEqual(@as(u32, 7), p.events[0].account_id);
+
+    try testing.expectEqual(b.seq, p.events[1].seq);
+    try testing.expectEqual(feed_mod.Op.delete, p.events[2].op);
+
+    // Publishing under the write lock is what makes this hold without sorting.
+    try testing.expect(p.events[1].seq > p.events[0].seq);
+    try testing.expect(p.events[2].seq > p.events[1].seq);
+
+    // A delete event points at its tombstone, so a consumer can resolve which name
+    // was deleted by reading the record there — the same move it makes for a put.
+    const rbuf = try testing.allocator.alloc(u8, read_buffer_bytes);
+    defer testing.allocator.free(rbuf);
+    const n = try s.segs.readRecord(p.events[2].loc, rbuf);
+    var scratch: [config.max_tags]record.Tag = undefined;
+    const rec = try record.decode(rbuf[0..n], &scratch);
+    try testing.expect(rec.tombstone);
+    try testing.expectEqualSlices(u8, "one", rec.name);
+}
+
+test "recovery does not publish to the feed" {
+    var h = try H.init(9105);
+    defer h.deinit();
+    {
+        const s = try h.reopen();
+        // Abandoned rather than closed, so there is a tail to replay.
+        defer s.abandon();
+        _ = try s.put(1, "a", "1", "", &.{}, 3600);
+        _ = try s.put(1, "b", "2", "", &.{}, 3600);
+    }
+
+    const s = try h.reopen();
+    defer s.close();
+    try testing.expectEqual(@as(u64, 2), s.stats().index.live);
+
+    // A replayed record is history, not a live change. There are no subscribers
+    // during startup, and filling the ring with history would evict the only events
+    // anyone reconnecting actually wants.
+    try testing.expectEqual(@as(u64, 0), s.stats().feed.published);
+    try testing.expectEqual(config.feed_ring_events, s.stats().feed.capacity);
 }

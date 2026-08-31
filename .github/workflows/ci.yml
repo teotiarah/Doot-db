@@ -1,0 +1,72 @@
+# Enforces what the decisions already claim is enforced (docs/07-decisions.md D50).
+#
+# D3 and 05-architecture.md both say the Zig toolchain pin is "enforced in CI". D2 says
+# the vocabulary rule is enforced "in code identifiers, endpoints, error messages, log
+# lines, docs and UI copy". Until this file existed, neither was true anywhere.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Cheap and toolchain-free, so it fails in seconds rather than after a Zig build.
+  vocabulary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: D2 vocabulary rule
+        run: tools/vocab-check.sh
+
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keyed on zig.lock, so a reviewed toolchain upgrade invalidates the cache and an
+      # unreviewed one cannot slip through on a stale hit.
+      - name: Cache pinned toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchain
+          key: zig-${{ hashFiles('toolchain/zig.lock') }}
+
+      # This step *is* the pin enforcement (D3, D26): setup.sh verifies the tarball
+      # SHA-256, refuses to patch a tree it does not recognise, and proves the result by
+      # compiling and running a program that uses the ring. Idempotent, so a cache hit
+      # still re-checks the patch.
+      - name: Install and verify toolchain
+        run: |
+          toolchain/setup.sh "$HOME/toolchain"
+          echo "$HOME/toolchain/zig" >> "$GITHUB_PATH"
+
+      - name: Toolchain matches the pin
+        run: |
+          set -euo pipefail
+          source toolchain/zig.lock
+          actual="$(zig version)"
+          echo "pinned=$ZIG_VERSION actual=$actual"
+          [ "$actual" = "$ZIG_VERSION" ]
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Build the exit-condition harness
+        run: zig build verify
+
+      # Run on tmpfs deliberately. The harness is single-threaded, so every write becomes
+      # its own flush leader and pays a full fsync with nobody to piggyback — ~41,000
+      # writes/s on tmpfs against ~200 on a persistent volume (D48). On disk the recovery
+      # check's write phase would dominate the job by orders of magnitude. This measures
+      # correctness, not throughput, so the mount is free to be fast.
+      - name: M1 exit conditions
+        run: |
+          set -euo pipefail
+          df -h /dev/shm
+          mkdir -p /dev/shm/doot-m1
+          ./zig-out/bin/m1 all /dev/shm/doot-m1

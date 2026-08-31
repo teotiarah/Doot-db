@@ -189,6 +189,12 @@ and that draft treated it as free.
 
 Hash keyed with a per-instance secret so hash-flooding is not a remote DoS vector.
 
+**M2 amendment.** The requirement stands; where the secret lives has changed. Because the
+key is baked into every slot and every hash in `SNAPSHOT`, it must be byte-identical on
+every boot for the lifetime of the data — so it is generated once at initialisation and
+persisted in a `STORE` file rather than supplied from the environment. Configuring it was
+a silent data-loss path. See D43.
+
 ---
 
 ## D12 — Tag chains on disk, heads in RAM · locked
@@ -322,6 +328,11 @@ at exactly the emit interval. But "one shared frame buffer for all subscribers" 
 unsafe under io_uring and had to change (D30), and Cloudflare is a live risk to the
 whole feature (D31).
 
+**M2 amendment.** The ring itself is built in M2, not M4, because the write path is what
+publishes to it — and having it early lets M2's Cloudflare probe stream real events rather
+than synthetic ones. It lives in the storage engine, published under the write lock, and
+is read by cursor-based poll. Only the subscriber side waits for M4. See D44.
+
 ---
 
 ## D19 — Overwrite replaces everything, including lifetime · locked
@@ -348,6 +359,12 @@ replays make idempotency a trust feature as well as a correctness one: a misconf
 automation retrying in a loop does not generate a bill. This belongs on the pricing page.
 
 Only hashes of the key and body are retained; bodies are not kept for comparison.
+
+**M2 amendment.** The window does not survive a restart. Idempotency state is held in RAM
+only, capped at 1M records, because persisting it would put an `fsync` on the path we tell
+every automated caller to use and would leave orphaned in-progress keys `409`ing for 24
+hours after a crash. A retry straddling a restart re-executes and costs one credit; this is
+now stated in `02-api.md` rather than implied away. See D42.
 
 ---
 
@@ -407,6 +424,12 @@ and the downside of leakage is a few thousand writes.
 # M0 findings
 
 Everything below came out of the spikes in `spikes/`. Measured numbers, not estimates.
+
+> **Note on the paths below.** `spikes/` was deleted at M1 as always intended (D49), so the
+> filenames cited in D26–D31 no longer exist in the working tree. They are preserved as
+> written because these entries are the record of what was measured and how; retrieve the
+> code from git history at `4547b32` if a finding needs re-checking. The one file that
+> survived is now `ops/sseprobe.py`.
 Where a spike contradicted an earlier decision, the earlier decision carries an
 amendment pointing here rather than being quietly edited.
 
@@ -848,6 +871,15 @@ tails are merged on lowest pending sequence rather than replayed class by class 
 index carries no sequence number to arbitrate with, so class-at-a-time replay would let an
 older write from one class overwrite a newer one from another.
 
+**M2 amendment — the 332 MiB/s is a warm-page-cache number.** It was measured replaying
+bytes that were already resident, on tmpfs. A cold restart reads the tail from the deployed
+filesystem instead, so the formula above is an optimistic bound rather than the operational
+one. Reproduced independently at 355 MiB/s, also on tmpfs; the same harness on a persistent
+volume writes 200× slower, which is leader commit behaving correctly under a
+single-threaded workload rather than a regression. M5's recovery measurement must be taken
+on the deployed volume from a cold cache, and that is the number this lever derives from.
+See D48.
+
 ---
 
 ## D39 — Index rebuild is driven by maintenance as well as insert · locked
@@ -863,6 +895,614 @@ holds a table sized for its peak, so the ratio climbs arbitrarily — a soak end
 3,023 live entries in a 65,536-slot table reports 434 B/entry. That is the minimum table
 size showing through, not accumulating waste. The 29 B/entry figure is a statement about
 the table at its load limit, which is the point the memory budget describes.
+
+---
+
+# M2 decisions
+
+Settled before any data-plane code exists, per the two-pass rule. The M1 engine is
+complete and measured; everything below is a question that had to be answered before
+anything could be built on top of it.
+
+Five are corrections to earlier documents. One — D43 — is a format addition that would
+have been very expensive to discover later.
+
+---
+
+## D40 — Control-plane state is an append-only log with a full in-RAM image · locked
+
+Accounts, API key hashes, sessions, OTP challenges, identity anchors and credit balances
+all have to survive a restart, and **no document said where they live.** `04-storage.md`
+budgets rate-limit buckets and idempotency records as RAM and is silent on the rest.
+
+Rejected first, because it is the tempting answer: **keeping control-plane state as
+entries in the entry store.** Disqualifying on three counts. Every entry must expire
+(minimum 60 s, maximum bounded by plan), so an account would need a background job
+refreshing its own lifetime forever. Segment reclamation `unlink()`s whole files once
+their maximum expiry passes, so accounts would be deleted by the engine's normal
+operation. And a dead index slot *is* one whose `expires_at` has passed (D32), so "never
+expires" is not representable in the index at all. The entry store is built for data that
+dies; account state is data that must not.
+
+Rejected: **SQLite, or any embedded database.** `build.zig.zon` has zero dependencies and
+D3's argument was that the standard library already covers what Doot needs. A C
+dependency for a few megabytes of state would be the largest dependency in the project
+serving its smallest subsystem.
+
+Rejected: **a second instance of the M1 engine with expiry switched off.** Expiry is not a
+feature of that engine that can be disabled — it is the representation of slot liveness.
+Turning it off forks `index.zig`.
+
+Resolution: **a separate append-only log, `CONTROL`, with the entire state held as an
+in-RAM image.**
+
+The state is tiny and bounded. At ten thousand accounts: ~200 B per account, five API keys
+each at ~80 B, ~40 B per live browser session. Single-digit megabytes, against a budget
+with ~15 GB left to page cache. So there is no index, no segments, no compaction and no
+partial loading — the image is a set of hash maps, and disk exists only to rebuild them at
+boot.
+
+Mechanics reuse what M1 established, deliberately:
+
+- A mutation appends a length-prefixed, CRC32C-checksummed **event** and `fsync`s before
+  the response is written. Signup, key creation, revocation and login are rare; one flush
+  each is invisible.
+- Recovery replays the log from the start into empty maps. A torn tail is truncated,
+  exactly as `replayManifest` already treats one.
+- The log is **rewritten wholesale** once it exceeds eight times the live image:
+  serialise to `CONTROL.tmp`, `fsync`, `rename`, `syncDir` — the same atomic replace
+  `snapshot.zig` already performs. Because the image fits in RAM there is no incremental
+  compaction problem to solve. This is reclamation by rewrite, the same distinction D32
+  drew for index shards.
+- `CONTROL` lives in `DOOT_DATA_DIR` beside the segments. Verified safe rather than
+  assumed: `SegmentSet.discover` skips any filename that is not `c{class}-{id}.seg`
+  instead of unlinking it, which is already how `MANIFEST` and `SNAPSHOT` coexist there.
+
+**Rate-limit buckets stay out of the log.** RAM only, 16 B per account, and every bucket
+starts full after a restart. That is the generous direction, it costs one restart's worth
+of burst, and persisting a token count across a ten-second outage would be preserving a
+number that has already refilled.
+
+Vocabulary: the unit in this log is an **event**, not a record — D2 reserves "record" as a
+banned synonym for *entry*, and `record.zig` already uses it for the physical framing of
+one. `control.Event` and `feed.Event` (D44) are distinct types in distinct namespaces.
+
+---
+
+## D41 — Credit balances are authoritative in RAM and checkpointed, never logged per write · locked
+
+Credits are the only control-plane state mutated on the hot path: every successful write
+deducts one. Logging each deduction with an `fsync` would double the flush cost of the
+write path in order to persist a counter whose granularity is 10,000.
+
+What actually has to hold is an ordering property, worth stating precisely because
+getting it backwards over-charges users. `03-data-model.md` already promises a failed
+write costs nothing. So:
+
+> A credit deduction must never be durable unless the write it paid for is also durable.
+
+That constrains the design in one direction only. A deduction lost while the entry
+survives gives the user a free write — bounded, invisible, in their favour. An entry lost
+while the deduction survives means the user paid for nothing, which is the failure
+`01-product.md` says must not happen.
+
+Resolution: **the balance is authoritative in RAM and persisted as an absolute value in a
+periodic checkpoint**, never as per-write deltas. The in-RAM balance is what enforces the
+`402` wall and what `X-Doot-Credits-Remaining` reports, so user-visible behaviour is exact
+at all times. The checkpoint rides the control log at the snapshot interval.
+
+Absolute values rather than deltas matter twice: the log does not grow with write volume,
+and a duplicated or partially applied checkpoint cannot compound.
+
+**Accepted consequence, stated rather than hidden:** an unclean restart rewinds balances to
+the last checkpoint, granting up to one checkpoint interval of writes for free. It can
+never charge for a write that did not land, because the deduction was never durable in the
+first place. This sits inside the recovery-point language already published in
+`01-product.md`.
+
+Rejected: **flushing the deduction on the same group commit as the entry.** Genuinely
+elegant — one flush covers both and the ordering property holds exactly — but it means
+threading a fifth append stream through `commit.zig`, which is M1 code whose exit
+conditions are measured and whose flush set is asserted in tests. Paying that to make a
+billing counter exact, when inexactness only ever favours the user, is the wrong trade.
+Reopen it if credits become a real revenue mechanism rather than a beta trial grant.
+
+---
+
+## D42 — Idempotency state is in RAM and does not survive a restart · locked
+
+`02-api.md` promises a 24-hour window. `04-storage.md` budgets idempotency at ~50 B per
+record capped at 1M, in the *application memory* table. Those two readings conflict, and
+the conflict had to be resolved before the endpoint was written.
+
+Resolution: **in RAM only, bounded at 1,000,000 records, lost on restart — and said so in
+the published docs.**
+
+Three arguments, in increasing order of weight.
+
+**The protected window is narrow.** Retries arrive seconds after the original; a restart
+is a connection reset plus under ten seconds of recovery. Only a retry straddling that
+window is affected.
+
+**Durability would tax the path we tell people to use.** `02-api.md` advises
+`Idempotency-Key` on anything automated, so it is meant to be the common case. Persisting
+it puts an `fsync` on the common write path to defend a rare race.
+
+**Durability creates a worse failure mode than it removes.** A key with a request in
+flight returns `409 idempotency_in_progress`. Persist that and a crash mid-write leaves a
+key marked in-progress with no request left to finish it — a key that `409`s for a full 24
+hours until it expires, needing recovery logic whose only job is cleaning up after a case
+that has no clean form. In RAM, a restart clears in-progress state and the retry simply
+executes, which is the correct outcome.
+
+**Accepted consequence:** a retry spanning a restart re-executes. For `PUT` that is
+harmless at the data level — same name, same bytes, same result — and costs one credit.
+For `POST` it produces a second entry under a new ULID. Both are stated in `02-api.md`,
+because a published 24-hour window that quietly does not survive restarts is exactly the
+kind of implied guarantee `01-product.md` criticises this category for.
+
+Eviction at the cap: drop the records closest to expiry first. **Never reject a write
+because the idempotency table is full** — an optional header must not be able to fail an
+otherwise valid request. Dropping a record degrades to re-execution, which is what not
+supplying the header at all already does. Under extreme volume the effective window
+shortens below 24 hours: bounded, safe, and visible in `/admin/stats`.
+
+---
+
+## D43 — The index hash key belongs to the store, not to the environment · locked
+
+`05-architecture.md` listed `DOOT_INDEX_HASH_SECRET` among the boot secrets. **That is a
+data-loss bug waiting to be configured**, and it is the most valuable thing this pass
+found.
+
+The index stores a 64-bit keyed SipHash of `(account_id, name)` and nothing else (D11). The
+key is therefore part of the *identity* of every slot: baked into every entry in the
+in-RAM table and into every hash written to `SNAPSHOT`. Supply a different key on the next
+boot and every lookup misses. Nothing reports an error — `get` probes, finds no matching
+hash, returns `404`. Worse, a full tail replay cannot repair it, because replay re-hashes
+only records after the snapshot watermark and sealed segments are never re-read. The store
+would come up "healthy", report its entry count, and be unable to find a single entry
+written before the change.
+
+A secret that must be byte-identical on every boot for the lifetime of the data is not a
+secret the environment should hold. Rotating it is not a security operation, it is a
+destructive one.
+
+Resolution: **the key is generated once, when the store is initialised, and persisted with
+the data.** `DOOT_INDEX_HASH_SECRET` is removed from `05-architecture.md`.
+
+A new file, `STORE`, holds the store's identity:
+
+```
+offset  size  field
+  0       4   magic "DSTR"
+  4       2   format version
+  6       2   reserved
+  8       4   created_at        unix seconds
+ 12      16   index_hash_key    16 random bytes, CSPRNG at initialisation
+ 28       4   crc32c            over bytes 0..27
+```
+
+32 bytes, written once, never rewritten. `Store.open` reads it **before `Index.init`**,
+because the index is constructed from `opts` and the key has to be in `opts` by then. The
+current ordering — `validate` → `Index.init` → `SegmentSet.open` → `recover` — makes this
+an insertion at the top rather than a restructure.
+
+Three cases, and the third is the one that matters:
+
+| directory | `STORE` | behaviour |
+|---|---|---|
+| empty | absent | generate a key, write `STORE`, `fsync`, `syncDir` |
+| has segments | present, valid | adopt the persisted key |
+| has segments | absent or corrupt | **refuse to start** — `error.StoreIdentityMissing` |
+
+Refusing beats guessing. A missing `STORE` beside existing segments means an incomplete
+restore or a deleted file, and inventing a fresh key there silently orphans every entry.
+Failing loudly at boot is the pattern D24 already established.
+
+Deliberately a separate file rather than the 56 reserved bytes in the snapshot header:
+`snapshot.read` is fail-soft by design and returns `null` on any damage, falling back to
+full replay. A key living only there would mean a damaged snapshot silently produces a
+*different* key and an unreadable store that reports success — the worst available failure
+shape. `STORE` is small, always present, and independently checksummed.
+
+D11's requirement is fully met and slightly improved: the key is per-store, unknown to any
+attacker, and now *cannot* be misconfigured to a shared value across deployments.
+
+`STORE` is immutable after creation, so backup treats it exactly like a sealed segment —
+uploaded once, never again — and a restore lacking it cannot proceed, which is correct.
+
+**Implementation note.** Creating `STORE` costs two flush boundaries, the file and the
+directory entry, so the M1 crash sweep now enumerates **41 boundaries rather than 39** and
+recovers at every one. The two additions are on the fresh-store path, where a crash is
+trivially survivable because no data exists yet for a regenerated key to orphan. The count
+quoted in D48 was measured before this landed and is left as recorded.
+
+**Related, and settled the other way.** `Options.max_index_bytes` defaults to `0`, meaning
+unlimited, which disables admission control entirely. Unlike the hash key, a wrong value
+here corrupts nothing — it only changes when `503 capacity_exhausted` begins. So this stays
+a boot concern: the server requires `DOOT_MAX_INDEX_BYTES` and refuses to start without
+it, while the library keeps `0` as its default, because a library should not invent a
+memory ceiling for its own tests.
+
+---
+
+## D44 — The change feed ring ships in M2; only its consumers wait for M4 · locked
+
+`config.feed_ring_events = 65_536` has been defined and referenced by nothing since M1.
+The roadmap places the live view in M4, which left the ring itself unassigned — and the
+ring is written by the write path, which is M2 code.
+
+Resolution: **the ring is built in M2. Subscriber fan-out, refcounted frame slots (D30)
+and resync markers are M4.**
+
+Splitting it there is not scaffolding, for two reasons.
+
+The halves are genuinely different sizes. Publishing is one slot write per mutation — no
+I/O, no allocation, no flush. Consuming is the substantial part: per-account filtering,
+SSE framing, the refcounted slot pool D30 forced, and lag handling. A ring with no
+subscribers is complete and testable on its own: assert order matches `seq`, assert
+wraparound reports a resync condition.
+
+And it makes M2's own exit condition better evidence. M2 already stands up a throwaway SSE
+endpoint behind the real Cloudflare zone to run `sseprobe.py` (D31). If the ring exists,
+that endpoint streams **real feed events** rather than synthetic ones, so the probe
+measures the production shape instead of a stand-in. Strictly stronger, for no extra work.
+
+**The ring lives in the storage engine**, as `src/storage/feed.zig`, published from inside
+the write path while the write lock is held. Two reasons it belongs there rather than in
+the server: `seq` and the location are generated inside `Store.put`/`Store.delete`, so
+publishing there makes ring order match sequence order for free; and the alternative — a
+callback out of the engine — would run server code underneath the global write mutex,
+inviting exactly the re-entrancy hazard lock discipline exists to prevent. `04-storage.md`
+already documents the ring in the storage chapter, so this makes the code agree with the
+document.
+
+Reading is a cursor-based poll, the same shape as `maintain()`: the server asks for
+everything after a sequence it has already seen. No callbacks and no subscriber registry
+inside the engine.
+
+**Visibility precedes durability here too** (D35). A subscriber can observe a mutation a
+crash would erase. The feed is best-effort and drives a UI, not a guarantee (D18), so this
+is consistent — but it is now written down.
+
+---
+
+## D45 — Maintenance is a thread, not an event-loop tick · locked
+
+`store.zig` says `maintain()` is "called from the event loop's tick in production". That
+is wrong, and wrong in a way that would have surfaced as latency nobody could explain.
+
+`maintain()` sweeps all 64 index shards, `unlink()`s reclaimable segments, rebuilds
+dead-heavy shards, and writes a full snapshot when the interval has passed. The snapshot
+alone flushes and then writes the entire slot array. Running that on the event-loop thread
+stalls every connection pinned to that worker for its duration. `05-architecture.md`
+already lists snapshot and segment reclamation among the background threads that are "all
+off the request path"; the engine's comment simply contradicts it.
+
+Resolution: **one maintenance thread.** The event loop's repeating `timeout` SQE —
+mandatory anyway, per D27 — only signals it.
+
+| cadence | driver | work |
+|---|---|---|
+| 1 s | event-loop timeout SQE | connection idle timeouts, stats, signalling the maintenance thread |
+| 15 s | maintenance thread | SSE heartbeats — ceiling is Cloudflare's 100 s read timeout (D31) |
+| 60 s | maintenance thread | `Store.maintain()` |
+| 300 s | inside `maintain()` | snapshot, already gated on `snapshot_interval_s` |
+
+Sixty seconds for `maintain()` rather than every tick, because the sweep is **not** a
+correctness mechanism: expiry is authoritative at the index and checked lazily on every
+read (`03-data-model.md`), so sweeping only reclaims memory. At 10M entries a full sweep
+walks over 14M slots — worth doing once a minute, wasteful once a second.
+
+The engine's doc comment is corrected as part of this decision rather than left to
+contradict the architecture document.
+
+---
+
+## D46 — Pagination cursors have a fixed signed wire format · locked
+
+`tagchain.Cursor` is 40 bytes of internal traversal state — four class frontiers and a
+sequence bound — and `tagchain.zig` notes that "the store signs it before handing it out".
+Nothing signs it. `02-api.md` promises cursors that are opaque, HMAC-signed, bound to the
+issuing account and valid for one hour. Specifying the format now leaves Pass 2 nothing to
+invent.
+
+```
+offset  size  field
+  0       1   format version (1)
+  1       4   account_id
+  5       4   issued_at              unix seconds
+  9      40   cursor state           4 × u64 class frontier, then u64 seq bound
+ 49      16   HMAC-SHA256 truncated  over bytes 0..48, keyed by DOOT_HMAC_SECRET
+```
+
+65 bytes, base64url without padding, **87 characters**. Truncating the tag to 16 bytes
+leaves forgery at 2^128, which is not the weak link in anything here.
+
+Verification, in this order, every failure returning `400 invalid_cursor` with no
+distinction between them:
+
+1. decodes as base64url to exactly 65 bytes
+2. version is 1
+3. HMAC verifies, under **constant-time comparison**
+4. `account_id` equals the authenticated account
+5. `issued_at` is within the last hour
+
+Checking the tag before the account is deliberate: an attacker learns nothing about which
+accounts exist, and step 4 becomes a check on data already proven to be ours.
+
+Signing and verification live in the API layer, not the engine — `tagchain.Cursor` stays a
+plain struct, which is the seam M1 left. `DOOT_HMAC_SECRET` is already in the boot secret
+list, and unlike the index hash key (D43) it is genuinely rotatable: rotation invalidates
+outstanding cursors, and a client's documented response to `invalid_cursor` is to restart
+pagination.
+
+---
+
+## D47 — Request parsing is specified, not left to the implementer · locked
+
+Four wire-format questions were unanswered. Each is the kind of gap every implementer
+fills differently, and then it becomes a compatibility obligation.
+
+**`X-Doot-TTL` grammar.** `02-api.md` gave examples (`90s`, `15m`, `24h`, `14d`, bare
+`3600`) without a grammar. Settled: one or more ASCII digits, optionally followed by
+exactly one lowercase suffix from `s`, `m`, `h`, `d`. Nothing else — no compound forms
+(`1h30m`), no fractions (`1.5h`), no sign, no internal whitespace, no uppercase. Digits
+are bounded at 10 and the multiplied result at `u32`, so overflow is a parse failure
+rather than a wraparound. Unparseable is `400 invalid_ttl`; parseable but out of range is
+`ttl_too_short` or `ttl_too_long`, which keeps "I typed it wrong" distinct from "my plan
+won't allow it". `0` and `0s` parse, then fail as `ttl_too_short`.
+
+Compound and fractional forms are refused because they are the start of a duration
+language, and every extension invites another: `1h30m` invites `1h 30m`, then
+`90 minutes`. Four suffixes cover what a shell script needs.
+
+**`X-Doot-Tags` parsing.** Settled, in this order: split on `,`; trim leading and trailing
+spaces and tabs from each element; **drop empty elements**; lowercase; de-duplicate keeping
+first-occurrence order; then enforce ≤ 5 and validate each against the character set. An
+absent or empty header is zero tags, which is valid.
+
+Empty elements are dropped rather than rejected because `a,b,` is a shell artefact, not a
+caller bug, and `03-data-model.md` already sets the tolerant precedent that duplicates
+collapse instead of erroring. Note the ordering: the count is enforced **after**
+de-duplication, so `ci,ci,ci,ci,ci,ci` is one tag rather than `too_many_tags`. Lowercasing
+here is what lets the engine's `validateTag` keep rejecting uppercase as a caller bug
+instead of normalising it — the engine's comment already says normalisation is the API
+layer's job, and this is that job.
+
+**Name percent-decoding.** Decoded exactly once, before validation. A `%` not followed by
+two hex digits is `400 invalid_name`, as is any decoded byte outside printable ASCII, which
+`validateName` already enforces. The 1–256 byte limit applies to the decoded bytes, as
+`03-data-model.md` says.
+
+One consequence, stated now because callers will find it: **`%2F` and a literal `/`
+produce the same name.** Names are byte strings compared after decoding and `/` is a
+permitted byte, so `a%2Fb` and `a/b` are one entry, not two. That follows from decoding
+once and comparing bytes. The alternative — treating an escaped slash as distinct — would
+require carrying the encoded form around and make "is this the same entry" depend on how it
+was spelled.
+
+**Server-assigned names.** ULIDs are non-monotonic: 48-bit millisecond timestamp, 80 bits
+from the CSPRNG, Crockford base32, 26 characters. The monotonic variant of the spec is
+deliberately not used. D5 wants lexicographic sort by creation time, which the timestamp
+delivers at millisecond granularity; two entries created inside the same millisecond sort
+arbitrarily against each other, and nothing in the product depends on their relative
+order — list-by-tag is ordered by `seq`, not by name. A monotonic counter would add shared
+mutable state to the write path to fix an ordering nobody observes.
+
+---
+
+## D48 — M1's throughput figures are properties of the filesystem they were measured on · locked
+
+Reproducing M1's exit conditions on a second machine produced a discrepancy worth
+recording, because one of those numbers has been promoted into an operational formula.
+
+Everything passes, and recovery came in slightly better than documented: **3,000,000
+records / 3,147 MiB replayed in 8.85 s, 355 MiB/s**, against 9.5 s and 332 MiB/s
+originally. All 111 unit tests pass. All five exit conditions pass. The crash sweep
+enumerated 39 boundaries and recovered at all 39.
+
+But that run was on **tmpfs**. The same harness against a persistent volume wrote at
+roughly **200 writes/s, against ~41,000 writes/s on tmpfs** — over two orders of
+magnitude, enough that the 3M-record write phase does not finish in half an hour.
+
+That gap is not a defect. It is D34 working as designed: the harness is single-threaded, so
+every `put` becomes its own flush leader with nobody to piggyback, giving one `fsync` per
+write. Under concurrent load — the only load that exists in production — writers batch
+behind one flush, which is the entire point of leader commit. **The harness's write phase
+is a durability test, not a throughput measurement, and must never be quoted as one.**
+
+Two consequences.
+
+`04-storage.md` and `08-roadmap.md` now state the filesystem each figure was measured on. A
+number that moves by 200× with the mount deserves that much.
+
+**D38's formula is a warm-page-cache figure, and is amended.** `recovery ≈ tail ÷
+332 MiB/s` was measured replaying bytes that were already resident. A cold restart reads
+the tail from the deployed filesystem instead, and while sequential NVMe reads should clear
+a 3.3 GB tail comfortably, "should" is not what M1's other four conditions settled for. M5
+already has an exit condition measuring recovery against the claim published in
+`01-product.md`; that measurement is now explicitly required to be taken on the deployed
+volume, from a cold page cache, and to be the number the operational lever is derived from.
+
+Also worth knowing for anyone reproducing: `m1 all` runs the recovery check with the
+**default 300,000 records**, not the 3,000,000 the published figure describes. The headline
+needs `m1 recovery <dir> 3000000` explicitly.
+
+---
+
+## D49 — `spikes/` retires into `ops/` · locked
+
+`spikes/README.md` says the directory "is deleted at M1". M1 is complete and merged and it
+is still present. Root `README.md` meanwhile lists `spikes/` as one of two directories that
+"are permanent". Both statements cannot stand.
+
+Resolution: **`spikes/` is deleted.** Its purpose was retiring three unknowns; the findings
+are D26–D31, the code is in git history at `4547b32`, and keeping a directory of throwaway
+probes invites treating them as maintained.
+
+One artifact survives, as D31 and `05-architecture.md` both already promised:
+`sseprobe.py`, the procedure that decides whether Cloudflare streams SSE. It moves to a new
+**`ops/`** directory, where deployment artifacts belong — and which D31 already requires for
+a second reason, since the zone configuration is "part of the deployable artifact" and must
+be "applied as code rather than console clicks". `ops/` receives that configuration in
+Pass 2, when there is a real zone to write it against. Nothing empty is created now to hold
+the space.
+
+Root `README.md` is corrected.
+
+---
+
+## D50 — CI enforces what the decisions already claim is enforced · locked
+
+D3 says the toolchain pin is "enforced in CI". `05-architecture.md` says it is "recorded in
+the repository and enforced in CI". M2's exit condition is a `curl` script "that runs in
+CI".
+
+There is no CI. There never has been.
+
+Three commitments against no infrastructure, and M2 is where the first comes due — so it
+is built now rather than after the milestone that depends on it. GitHub Actions, on the
+repository that already exists, with the toolchain cached on the hash of
+`toolchain/zig.lock`.
+
+Four jobs, each enforcing something a decision already claims:
+
+| job | enforces |
+|---|---|
+| `toolchain/setup.sh` | D3, D26 — the pinned tarball still hashes correctly and the patch still applies cleanly |
+| `zig build test` | the 111 unit tests |
+| `zig build verify && m1 all` | M1's five exit conditions, including the 39-boundary crash sweep |
+| vocabulary check | D2 |
+
+The vocabulary check is the interesting one, and it is deliberately narrow. D2 is enforced
+"in code identifiers, endpoints, error messages, log lines, docs and UI copy" and until now
+nothing checked it. A general ban on "key" is unworkable — "API key", "Idempotency-Key",
+"index hash key", "keep-alive" and "keyed hash" are all legitimate and frequent. So the
+check bans only tokens that cannot be innocent: `key-value`, `keyvalue`, `key_value`,
+`/v1/kv`, and `kv` as a standalone word. That catches the specific drift D2 fears — the
+vocabulary sliding back toward "key-value store" — and is honest about not catching
+subtler slippage. A check with no false positives that runs on every commit beats a
+thorough one that gets disabled.
+
+The exit-condition job is worth its runtime. It is ~10 s on tmpfs, and it is the only thing
+standing between a refactor and a silent durability regression, which D36 demonstrated is a
+failure mode that hides.
+
+---
+
+## D51 — Two M1 defects, found by reading the engine as its first caller · locked
+
+Neither is reachable from the M1 harness. Both are prerequisites for M2 rather than
+optional cleanups.
+
+**`Store.delete` puts 257 KiB on the stack.** It encodes its tombstone into
+`var buf: [record.max_record_bytes]u8` — 262,929 bytes — as a stack local, while
+`Store.put` heap-allocates exactly the length it needs. A tombstone carries no body,
+content type or tags, so the buffer is enormous precisely where it is least needed. It
+survives today because the harness calls `delete` from the main thread, which has a large
+stack. M2 puts it on event-loop worker threads with stacks we size ourselves, where a
+257 KiB frame is how a stack overflow gets discovered in production. Fixed by allocating
+`encodedLen()`, matching `put`. A tombstone's true maximum is 36 + 256 = **292 bytes**.
+
+**`Store.get`'s buffer contract does not match the documented pool.** `get` requires a
+caller-supplied buffer large enough for the whole record, which is
+`record.max_record_bytes` = **262,929 B**, not 256 KiB. `05-architecture.md` budgets "256
+concurrent × 256 KB = 64 MB of body buffers" — 785 bytes per slot short of what `get` can
+need, so a maximum-size entry would come back truncated. Pool slots are therefore
+**266,240 B (260 KiB)**, the next page multiple, for a total of exactly **65 MiB**.
+Corrected in the memory budget rather than left as an off-by-a-page that only appears on
+the largest possible entry.
+
+---
+
+## D52 — Seven error codes the catalogue was missing · locked
+
+Surfaced by implementing the catalogue rather than reading it. `02-api.md` publishes
+eighteen codes and promises that `code` "is a stable machine-readable identifier and
+never changes once published" — which makes inventing one inside an implementation
+diff exactly the wrong move. Each gap below is a response the specification already
+requires, with no code named for it.
+
+| status | code | the gap it fills |
+|---|---|---|
+| 411 | `length_required` | `05-architecture.md` requires `411 Length Required` when a write omits `Content-Length`, and names no code |
+| 400 | `content_type_too_long` | `03-data-model.md` caps `Content-Type` at 128 bytes and does not say what happens above it. The engine already returns a distinct error |
+| 405 | `method_not_allowed` | a known path with a method it does not support. Seven endpoints are published; nothing said what the eighth combination does |
+| 431 | `headers_too_large` | `05-architecture.md` bounds the request line and headers at 8 KB total and rejects early, without naming a status. 431 is the status for exactly this |
+| 400 | `invalid_request` | a malformed request line or header block — not a validation failure of a *field*, so none of the existing 400s fit |
+| 500 | `internal_error` | the catalogue had no 5xx but `503`, while promising a uniform body on **every** non-2xx |
+| 404 | `not_found` — **reused, deliberately** | an unrouted path |
+
+Three of these are worth the reasoning.
+
+**`internal_error` carries a fixed, generic message and never any detail.** The
+failures that reach it are the engine's I/O errors, a checksum failure on a record the
+index still pointed at, and allocation failure. Every one of those is a sentence about
+our disks or our memory, and none of it is a caller's business — `05-architecture.md`
+already forbids logging bodies, names and keys, and the same instinct applies to
+putting internals in a response. The detail goes to the structured log, where the
+operator is; the caller gets a code and a `docs` link. This is also why it is not
+tempting to make it informative: an error body is the one place where being helpful to
+the reporter and helpful to an attacker are the same act.
+
+**An unrouted path reuses `not_found` rather than getting its own code.** A distinct
+code would tell an unauthenticated prober which paths exist, which is a small
+enumeration oracle for no benefit. It also cannot be confused with a missing entry in
+practice, because the validation order in `03-data-model.md` puts authentication
+first: an unknown `/v1` path with a bad key is `401` and never reaches routing at all.
+
+**`431` rather than `400` for oversized headers.** The bound is on the request
+*framing*, not on a value the caller supplied, and 431 exists precisely so a client
+can tell "your headers are too big" from "your input was wrong". Same reasoning that
+keeps `413` separate from `400` for bodies.
+
+`method_not_allowed` carries an `Allow` header listing what the path does support,
+because a client that guessed wrong deserves to be told rather than made to read docs.
+
+All six are added to the table in `02-api.md`, which remains the published catalogue.
+Nothing already published changed.
+
+---
+
+## D53 — A scheduling-dependent property is asserted by retry, not by hope · locked
+
+Found by stress-testing the change feed: `commit.zig`'s "concurrent writers all reach
+durability with far fewer flushes than writers" fails roughly one run in twenty when
+pinned to two cores, and every run on one core. The property it checks is real and the
+code is correct — four writer threads simply do not always overlap, and when they do
+not, every write leads its own flush and `flushes < writers` is false.
+
+This is the same effect D48 recorded from the other end: a workload with no concurrency
+gets one `fsync` per write, because leader commit has nobody to piggyback. Correct
+behaviour, wrong assertion.
+
+It matters because CI runs on two cores, so this would have gone red intermittently
+for reasons unrelated to whatever was being reviewed — and an intermittently red suite
+teaches people to press re-run, which is how a real regression gets waved through.
+
+Rejected: **weakening the assertion to `flushes <= writers`.** That can never fail, and
+D36 is the standing lesson that a test which cannot fail is worse than no test.
+
+Rejected: **skipping the check whenever it does not batch.** Same defect wearing a
+disguise — break batching entirely and `piggybacked` drops to zero, the check is
+skipped, and the suite goes green.
+
+Resolution: **run the workload up to five times and require batching to be observed at
+least once.** Overlap is the scheduler's to grant, so asking repeatedly is legitimate;
+never being granted it across five attempts on a multi-core machine is a genuine
+regression and fails the test. On a single-core machine the claim is unmeasurable —
+there is no parallelism to amortise — so it is stated as such rather than papered over.
+
+The correctness half is unchanged and still asserted on **every** attempt: every writer
+reaches durability, and `isDurable` agrees at the moment each one returns. Only the
+amortisation claim, which is a statement about performance, is the one allowed to need
+more than one try.
+
+General rule this sets, since more of these will appear once the event loop exists:
+**assert correctness unconditionally, and measure performance by retry with a bounded
+budget.** Never assert a timing outcome once and call it a property.
 
 ---
 
@@ -890,3 +1530,7 @@ the table at its load limit, which is the point the memory budget describes.
 | Chunked request bodies | a real caller unable to send `Content-Length` |
 | 90-day retention | usage behaviour justifying it, **and** a proven restore drill (D16). Retention is a config value, not a code change |
 | Read-side soft caps | the pooled rate limit (D6) proving insufficient against a heavy read pattern |
+| Flushing credit deductions on the entry's own group commit | credits becoming a real revenue mechanism rather than a beta trial grant. Would make the balance exact across a crash, at the cost of a fifth append stream through measured M1 code (D41) |
+| Durable idempotency state | evidence that retries straddling a restart actually happen. Costs an `fsync` on the common write path and reintroduces orphaned in-progress keys (D42) |
+| Monotonic ULIDs | a caller depending on the ordering of two entries created in the same millisecond. Nothing in the product observes it today (D47) |
+| Compound `X-Doot-TTL` forms such as `1h30m` | callers actually asking. Each extension invites the next, and four suffixes cover what a shell script needs (D47) |

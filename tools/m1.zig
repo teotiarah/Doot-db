@@ -233,10 +233,7 @@ fn recoveryTiming(gpa: std.mem.Allocator, workdir: []const u8, records: u64, bod
         });
 
         // Tear down without a final snapshot: the tail must be replayed.
-        s.segs.deinit();
-        s.heads.deinit();
-        s.idx.deinit();
-        gpa.destroy(s);
+        s.abandon();
     }
 
     os.close(dir);

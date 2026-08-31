@@ -67,6 +67,15 @@ makes rate limiting and abuse response possible.
 Slashes are permitted precisely so callers can namespace naturally. Names are
 percent-decoded once. Rules and character set in `03-data-model.md`.
 
+Decoding happens once, before validation, and the 1–256 byte limit applies to the decoded
+bytes. A `%` not followed by two hexadecimal digits is `400 invalid_name`, as is any decoded
+byte outside printable ASCII.
+
+One consequence worth knowing: **`%2F` and a literal `/` address the same entry.** Names are
+byte strings compared after decoding, and `/` is a permitted byte, so `a%2Fb` and `a/b` are
+one entry rather than two. Treating an escaped slash as distinct would make "is this the
+same entry" depend on how the caller spelled it.
+
 ---
 
 ## `PUT /v1/entries/{name}`
@@ -86,6 +95,27 @@ Create or overwrite. **Consumes one credit on success.**
 `X-Doot-TTL` accepts a bare integer meaning seconds, or a suffixed duration:
 `90s`, `15m`, `24h`, `14d`. Both `3600` and `1h` are valid and identical. Suffix
 forms exist because shell scripts are written by humans.
+
+**Grammar, exactly:** one or more ASCII digits, optionally followed by exactly one
+lowercase suffix from `s`, `m`, `h`, `d`. Nothing else is accepted — no compound forms
+(`1h30m`), no fractions (`1.5h`), no sign, no internal or surrounding whitespace, no
+uppercase. A value too large to represent is a parse failure rather than a wraparound.
+
+Unparseable is `400 invalid_ttl`. Parseable but outside the plan's range is
+`400 ttl_too_short` or `400 ttl_too_long`, which keeps "I typed it wrong" distinct from "my
+plan won't allow it". `0` and `0s` parse and then fail as `ttl_too_short`.
+
+Compound forms are refused because they are the beginning of a duration language, and each
+extension invites the next. Four suffixes cover what a shell script needs.
+
+**`X-Doot-Tags` parsing**, in this order: split on `,`; trim leading and trailing spaces and
+tabs from each element; drop empty elements; lowercase; de-duplicate keeping first-occurrence
+order; then enforce the maximum of 5 and validate each against the character set in
+`03-data-model.md`. An absent or empty header means zero tags, which is valid.
+
+A trailing comma is a shell artefact rather than a caller bug, so `ci,main,` is two tags and
+not an error. Note that the count is enforced **after** de-duplication, so
+`ci,ci,ci,ci,ci,ci` is one tag, not `too_many_tags`.
 
 **Responses**
 
@@ -279,6 +309,21 @@ their own retry logic.
 Replays being free is a deliberate product decision, not an implementation detail:
 a misconfigured automation retrying in a loop should not generate a bill.
 
+**Idempotency state does not survive a restart of the service, and the window can shorten
+under extreme volume.** Both are stated here rather than left to be discovered, because a
+published 24-hour guarantee with quiet exceptions is worse than a smaller honest one.
+
+- A retry arriving after a restart re-executes. For `PUT` the result is identical — same
+  name, same bytes — and it consumes a credit. For `POST` it creates a second entry under a
+  new name.
+- The table holds up to 1,000,000 records. Past that, the records closest to expiry are
+  dropped first, which shortens the effective window.
+- A full table never causes a write to fail. Losing a record degrades to re-execution,
+  which is exactly what omitting the header does.
+
+Restarts are brief and infrequent — a connection reset plus under ten seconds of recovery —
+so the exposed window is narrow. Reasoning in `07-decisions.md` D42.
+
 ## Rate limit headers
 
 On every `/v1` response:
@@ -324,6 +369,8 @@ Uniform JSON body on every non-2xx response:
 | 400 | `ttl_too_long` | exceeds the plan maximum |
 | 400 | `ttl_too_short` | below 60 seconds |
 | 400 | `invalid_cursor` | malformed, expired, or issued to another account |
+| 400 | `content_type_too_long` | `Content-Type` over 128 bytes |
+| 400 | `invalid_request` | malformed request line or headers |
 | 400 | `invalid_limit` | outside 1–100 |
 | 400 | `missing_tag` | list called without `tag` |
 | 401 | `missing_credentials` | no `Authorization` header |
@@ -332,9 +379,23 @@ Uniform JSON body on every non-2xx response:
 | 404 | `not_found` | absent or expired |
 | 409 | `idempotency_key_reused` | same key, different body |
 | 409 | `idempotency_in_progress` | concurrent request, same key |
+| 405 | `method_not_allowed` | known path, unsupported method. Carries an `Allow` header |
+| 411 | `length_required` | a write without `Content-Length` |
 | 413 | `body_too_large` | over 256 KB |
 | 429 | `rate_limited` | bucket empty |
+| 431 | `headers_too_large` | request line and headers exceed 8 KB in total |
+| 500 | `internal_error` | an unexpected server-side failure. Carries no detail, by design |
 | 503 | `capacity_exhausted` | origin cannot accept new entries |
+
+Two notes on codes that exist but are easy to mis-expect:
+
+- **An unrouted path is `404 not_found`**, the same code a missing entry gets. A
+  distinct code would tell an unauthenticated prober which paths exist, for no
+  benefit. In practice the two never collide, because authentication happens first
+  (`03-data-model.md`): an unknown `/v1` path with a bad key is `401` and never
+  reaches routing.
+- **`400 invalid_request`** covers a malformed request line or header block, as
+  distinct from a validation failure on a field that was parsed successfully.
 
 `413` is returned from `Content-Length` **before the body is read**. Oversized
 uploads are rejected, not drained.
