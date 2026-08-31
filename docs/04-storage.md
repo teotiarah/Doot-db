@@ -81,21 +81,57 @@ offset  size  field
  16       4   created_at         unix seconds
  20       4   expires_at         unix seconds
  24       1   flags              bit0 tombstone, bits1-2 class, bits3-7 reserved
- 25       1   name_len           1..255
+ 25       1   name_len_m1        name length minus one: 0..255 encodes 1..256
  26       1   tag_count          0..5
  27       1   content_type_len   0..128
  28       4   body_len           0..262144
- 32       4   crc32c             over all bytes after this field
+ 32       4   crc32c             over bytes 0..31 and 36..record_length
  36       …   name
         …     content_type
         …     tags: per tag → 1 byte length, tag bytes, 8 byte prev_chain_ptr
         …     body
 ```
 
-`crc32c` is verified on read. A failed check is served as `404` with the corruption
-counted and logged, never as a partial or wrong body.
+**Name length is stored biased by one.** Names are 1–256 bytes (`03-data-model.md`) and
+can never be empty, so `0..255` maps exactly onto `1..256`. This keeps the field one byte
+wide while matching the documented limit; an unbiased byte would silently cap names at
+255 and contradict the data model.
+
+**The checksum covers the header, not just the payload.** Everything except the four
+`crc32c` bytes themselves is protected. Covering only the payload would leave
+`record_length` and `body_len` unverified, and those two fields are what a recovery scan
+uses to find the next record — a single corrupted length byte would walk the scanner into
+garbage with nothing to detect it. The framing must be as trustworthy as the contents.
 
 `prev_chain_ptr` per tag is the on-disk tag traversal chain; see below.
+
+**The checksum uses the hardware CRC32C instruction** (D37) where the target has it, falling
+back to a table implementation elsewhere. x86-64 has had it since 2008 and it computes
+this exact polynomial, so output is byte-identical and this is an optimisation rather
+than a format change — segments written by either path verify under the other. It
+matters because the checksum sits in the recovery path: with the table implementation it
+was about half of total replay time at 1 KiB records.
+
+### Verifying a record
+
+`record_length` cannot be trusted before the checksum is verified, and the checksum
+cannot be computed without knowing how many bytes to read. So verification is ordered:
+
+1. Read the fixed 36-byte header.
+2. Bounds-check `record_length` against the minimum possible record and the maximum
+   (header + 256-byte name + 128-byte content type + 5 tags + 256 KB body). A value
+   outside that range is rejected without ever being used as a length.
+3. Read the remainder and verify `crc32c`.
+
+**The same failure means different things in different places, and both are correct:**
+
+| where | meaning | response |
+|---|---|---|
+| tail scan during recovery | a torn write at the moment of the crash | stop the scan; this record and everything after it never existed |
+| read of an already-indexed record | corruption of data that was once durable | serve `404`, count and log it; never a partial or wrong body |
+
+A torn tail is expected — it is what a crash mid-append looks like. Corruption of a
+record the index still points to is not, which is why the two are counted separately.
 
 ## Locations
 
@@ -139,6 +175,58 @@ denial-of-service vector.
 This serves three purposes at once — write concurrency across cores, bounded lock
 hold times, and consistent shard-at-a-time snapshots (below).
 
+### Slot lifecycle: expiry and deletion are the same thing
+
+Open addressing cannot simply blank a slot. Doing so severs the probe sequence, and
+every entry stored past the hole becomes unreachable. Removal has to leave something
+behind that probes still traverse.
+
+Doot needs no separate marker for this, because **a slot already carries `expires_at`,
+and a dead slot is exactly one whose `expires_at` has passed:**
+
+| state | `expires_at` | lookup | insert |
+|---|---|---|---|
+| live | in the future | returns it | must not overwrite |
+| expired | in the past | skips it, keeps probing | may reuse in place |
+| deleted | forced to `0` | skips it, keeps probing | may reuse in place |
+
+Deletion sets `expires_at = 0` — a value permanently in the past — and clears the
+location. So deleted and expired slots are indistinguishable to every code path, which
+is the correct outcome: `03-data-model.md` requires that expired and absent entries be
+indistinguishable to callers, and this makes that true in the data structure rather than
+in a check layered on top.
+
+This also makes **segment reclamation safe for free.** A segment is only unlinked once
+every record in it has expired, so any slot still pointing into it necessarily has
+`expires_at` in the past and is already treated as absent. No index scan is needed at
+unlink time, and a lookup can never be handed a location in a file that no longer
+exists.
+
+### Rebuild, not compaction
+
+Dead slots stay probe-transparent until reused, so a shard's *occupancy* — live plus
+dead — is what governs probe length, while only the live count matters to the memory
+budget. Those diverge over time under overwrite and delete traffic.
+
+A shard is therefore **rebuilt** when dead slots exceed 25% of its capacity: reinsert
+the live entries into a fresh table, discard the dead, swap under the shard lock. This
+is bounded per shard, off the request path, and unrelated to segment compaction — it
+reclaims index memory, never touches disk, and is a normal steady-state event rather
+than the escape hatch that segment compaction is.
+
+The check runs **both on insert and during maintenance** (D39). Insert alone is not enough: a
+shard that stops receiving writes — after a wave of expiry, say — would otherwise hold
+its dead slots indefinitely. Nothing is lost when it does, since dead slots stay
+reusable, but the threshold should hold regardless of traffic.
+
+One consequence worth stating, because the number looks alarming otherwise: **bytes per
+live entry is only meaningful near the admission point.** A store whose entries have
+mostly expired holds a table sized for its peak, so the ratio climbs arbitrarily high —
+a soak ending with 3,023 live entries in a 65,536-slot table reports 434 B/entry. That
+is the minimum table size showing through, not waste that accumulates.
+
+Admission control (below) measures occupancy, because that is what actually runs out.
+
 ## Tag traversal
 
 A posting list per tag would cost `O(entries)` RAM, which would dwarf the index and
@@ -174,20 +262,65 @@ what keeps a free operation from becoming an unbounded disk scan.
 
 ## Durability
 
-**Group commit.** Writers stage records into a per-class buffer. A commit thread
-flushes and `fsync`s every **5 ms**, or immediately when a buffer crosses 1 MiB.
-Requests are acknowledged only after their `seq` is durable.
+Reasoning for the departures in this section: D34 (leader commit, no staging buffer)
+and D35 (single write lock, visibility before durability).
 
-Up to 5 ms of added write latency is invisible: a request from a distant client costs
-around 175 ms end to end (`05-architecture.md`), so commit latency is under 3% of what
-the user experiences. Optimising it further would be measuring the wrong thing.
+**Group commit by leader, not by timer.** Records are `pwrite`n as they arrive; the
+only thing that has to be batched is the `fsync`. The first writer that needs
+durability takes the flush lock and performs it, and every other writer waiting at
+that moment is satisfied by the same flush. Requests are acknowledged only after their
+`seq` is durable.
 
-Up to four `fsync` calls per commit window instead of one, since classes are separate
-files. On NVMe each is 50–200 µs, and in practice most windows touch one or two
-classes. Accepted, and worth re-measuring under real load.
+This replaces the earlier design — a commit thread firing every 5 ms or every 1 MiB —
+and is better on both axes those triggers balanced:
+
+- **Latency.** A writer waits one `fsync` (50–200 µs on NVMe), never up to 5 ms.
+- **Batching.** Writers arriving while the leader is inside `fsync` are covered by the
+  next one, so throughput still amortises.
+
+There is also nothing left for a timer to do. The triggers existed to bound how long
+staged data sits unflushed, and nothing is staged: every acknowledged write has a
+writer actively waiting on it, and an unacknowledged write has no durability
+requirement to bound. Both constants are therefore gone rather than implemented.
+
+**No user-space staging buffer.** Coalescing writes in user space would mostly
+duplicate what the page cache already does, while adding the buffer-lifetime failure
+mode that D30 showed is easy to get wrong. Durability is identical either way: a record
+is durable exactly when its class has been flushed. Available later if measurement ever
+justifies it.
+
+Up to four `fsync` calls per flush instead of one, since classes are separate files. In
+practice most flushes touch one or two.
 
 **Ordering** across the four files is established by the global `seq` stamped in every
-record, so recovery can reconstruct a total order regardless of file layout.
+record, so recovery can reconstruct a total order regardless of file layout. Durability,
+by contrast, is tracked **per class**: each class is its own file, and appends within a
+class are serialised, so flush completion order matches sequence order there. That is
+what lets a waiter reason about its own sequence number without tracking a completed
+prefix across concurrently written classes.
+
+### Writes are serialised; reads are not
+
+One lock covers the whole write path. Reads take none.
+
+The cost is close to zero — appends to a class already serialise, group commit already
+shares one flush, and the per-write CPU work is an encode plus a hash — and
+`05-architecture.md` measured storage at 0.03% of what a request costs end to end.
+Parallelising the write path would optimise the wrong 0.03% while introducing the
+hardest concurrency in the system.
+
+It also dissolves two problems outright: same-key mutations serialise without needing
+key-striped locks, and a record's tag back-pointers can be published to the chain heads
+before the record is encoded without racing another writer on the same tag.
+
+Durability waiting happens *outside* the lock, which is what lets writers pile up behind
+one flush.
+
+**Visibility precedes durability.** The index is updated when a write is *ordered*, so a
+reader can briefly observe an entry that a crash would erase. Deliberate, and standard
+for group commit: the guarantee is that no *acknowledged* write is lost, and an entry in
+that window has not been acknowledged to anyone. Making visibility wait for `fsync`
+would serialise readers behind disk latency to remove an anomaly nobody can act on.
 
 ## Snapshots and recovery
 
@@ -207,9 +340,29 @@ snapshot header
 the recorded offset, applying records in `seq` order. Later `seq` wins. Recovery never
 re-reads sealed segments and never scans the full dataset.
 
-At 10k writes/s averaging 1 KB, five minutes of tail is about 3 GB, scanned in a
-couple of seconds on NVMe. **Recovery target is under 10 seconds**, and it is a
-tracked regression metric.
+At 10k writes/s averaging 1 KB, five minutes of tail is about 3 GB. **Recovery target is
+under 10 seconds**, and it is a tracked regression metric.
+
+**Measured: 3,000,000 records / 3,147 MiB replayed in 9.5 s — 332 MiB/s, 3.16 µs per
+record.** Inside the target, but with only 5% of margin, so the relationship behind the
+number matters more than the number:
+
+```
+recovery time  ≈  (write rate × record size × snapshot interval) / 332 MiB/s
+```
+
+A 10-second budget therefore buys roughly **3.3 GB of tail** (D38). At 1 KiB records that
+covers sustained write rates up to about 11k/s with the default five-minute snapshot
+interval. Above that, the lever is `DOOT_SNAPSHOT_INTERVAL_S`: halving it halves the
+tail and halves recovery time. The interval is what bounds recovery, not the dataset.
+
+Two things dominate replay, and both were measured rather than assumed. Fixed cost is
+~2.6 µs per record (buffered read, decode, index insert, chain-head update). Per-byte
+cost is ~0.55 ns after moving to the hardware checksum below; before that it was
+~2.5 ns/byte and accounted for roughly half of total replay time.
+
+Reads during replay are buffered in 1 MiB chunks. One `pread` per record would make
+recovery a syscall per record and miss the target by orders of magnitude.
 
 **Snapshots are taken shard by shard**, each under its short-lived shard lock, so no
 slot is ever copied mid-update and no global stop-the-world is needed. Writes landing
@@ -314,6 +467,51 @@ especially, since deleting is how a user recovers from this state.
 
 Disk is monitored on the same pattern, at 85% and 95% of the configured volume.
 
+## Testability is a structural requirement
+
+Almost everything above is a function of two things the engine does not control: **what
+time it is** and **when the machine dies**. Neither can be observed usefully if they are
+reached for directly, so both are injected.
+
+### The clock is a parameter
+
+Every expiry decision, segment reclamation, tombstone lifetime and snapshot interval
+derives from a single injected clock rather than a direct system call.
+
+This is not test scaffolding. The engine's central claim is that bounded lifetime
+eliminates compaction, and that claim is about behaviour over **days** — a 24-hour
+mixed-lifetime soak is one of M1's exit conditions. With a wall clock, verifying it
+takes 24 hours and cannot be run in CI, so in practice it never gets run and the
+central claim stays unverified. With an injected clock it runs in seconds, on every
+change.
+
+Two implementations: the real clock, and a manual one that only advances when told.
+Nothing else in the engine may read the system time.
+
+### The crash point is a parameter
+
+Durability is defined by what survives a crash at the worst possible moment, and the
+worst possible moments are the `fsync` boundaries. So `fsync` calls are counted, and a
+build can be told to abort immediately after the *n*-th one.
+
+That converts "does it survive a crash" from a question answered by argument into one
+answered by enumeration: run the same workload once per boundary, kill it at that
+boundary, reopen, and check the invariants. M1's crash-injection exit condition depends
+on this hook existing.
+
+The counter is always compiled in — it is one increment on a path that already performs
+a syscall costing 50–200 µs, so it is free — but the abort is only armed by explicit
+configuration and can never trigger in production.
+
+### What the seams must guarantee
+
+- **No acknowledged write is ever lost.** A write acknowledged before the crash is
+  present after recovery.
+- **Nothing resurrects.** A deleted or expired entry never reappears, at any crash
+  point.
+- **Recovery is idempotent.** Replaying the same tail twice yields the same state, so a
+  crash *during* recovery is survivable too.
+
 ## Constants
 
 | constant | value | env override |
@@ -321,16 +519,20 @@ Disk is monitored on the same pattern, at 85% and 95% of the configured volume.
 | segment size | 64 MiB | `DOOT_SEGMENT_BYTES` |
 | lifetime classes | 1h / 24h / 7d / max | derived |
 | max lifetime | 14d trial, 30d paid | `DOOT_MAX_TTL` |
-| group commit interval | 5 ms | `DOOT_COMMIT_INTERVAL_MS` |
-| group commit size trigger | 1 MiB | — |
+| group commit | leader-driven, no interval | — |
 | snapshot interval | 5 minutes | `DOOT_SNAPSHOT_INTERVAL_S` |
 | index slot size | 20 bytes | — |
 | index max load factor | 0.70 | — |
 | index shards | 64 | — |
+| index rebuild threshold | 25% dead slots | — |
 | tag traversal hop budget | 500 per page | — |
+| tombstone lifetime | 2 × snapshot interval | derived |
 | change feed ring | 65,536 events | — |
 | backup tail interval | 5 minutes | `DOOT_BACKUP_INTERVAL_S` |
 | recovery target | < 10 seconds | — |
+
+The commit interval and size trigger are deliberately absent rather than unset: leader
+commit removes the need for either. See Durability.
 
 ## Deliberately absent
 
