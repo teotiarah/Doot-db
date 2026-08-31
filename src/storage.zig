@@ -15,6 +15,7 @@ pub const config = @import("storage/config.zig");
 pub const clock = @import("storage/clock.zig");
 pub const os = @import("storage/os.zig");
 pub const location = @import("storage/location.zig");
+pub const crc32c = @import("storage/crc32c.zig");
 pub const record = @import("storage/record.zig");
 pub const index = @import("storage/index.zig");
 pub const segment = @import("storage/segment.zig");
@@ -40,6 +41,7 @@ test {
     _ = clock;
     _ = os;
     _ = location;
+    _ = crc32c;
     _ = record;
     _ = index;
     _ = segment;

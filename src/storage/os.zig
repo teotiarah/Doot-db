@@ -100,6 +100,58 @@ pub fn fsyncCounted(fd: Fd) Error!void {
     maybeCrash(n);
 }
 
+/// Durable flush that is neither counted nor a crash point.
+///
+/// Exists for the crash harness's own acknowledgement journal. That journal must
+/// be durable — an ack lost to a crash would make the test under-require — but it
+/// is not part of the engine, so counting its flushes would shift every crash
+/// point and make the enumeration meaningless. Nothing in the engine may call
+/// this.
+pub fn fsyncUncounted(fd: Fd) Error!void {
+    const rc = linux.fsync(fd);
+    if (failed(rc)) return toError(rc);
+}
+
+// ---------------------------------------------------------------------------
+// Processes (crash harness only)
+// ---------------------------------------------------------------------------
+
+pub const Exit = union(enum) {
+    exited: u8,
+    signaled: u32,
+};
+
+/// `fork` + `execve`. The harness needs a child it can have die abruptly, and
+/// `std.process.Child` in Zig 0.16 is more machinery than that requires.
+pub fn spawn(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) Error!i32 {
+    const rc = linux.fork();
+    if (failed(rc)) return toError(rc);
+    const pid: i32 = @bitCast(@as(u32, @truncate(rc)));
+    if (pid == 0) {
+        const empty: [*:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{};
+        _ = linux.execve(path, argv, empty);
+        // Only reachable if exec failed; must not return into the parent's code.
+        _ = linux.exit_group(127);
+        unreachable;
+    }
+    return pid;
+}
+
+pub fn wait(pid: i32) Error!Exit {
+    var status: u32 = 0;
+    while (true) {
+        const rc = linux.waitpid(pid, &status, 0);
+        if (failed(rc)) {
+            if (errnoOf(rc) == .INTR) continue;
+            return toError(rc);
+        }
+        break;
+    }
+    // WIFEXITED / WEXITSTATUS / WTERMSIG
+    if (status & 0x7f == 0) return .{ .exited = @intCast((status >> 8) & 0xff) };
+    return .{ .signaled = status & 0x7f };
+}
+
 // ---------------------------------------------------------------------------
 // Files
 // ---------------------------------------------------------------------------

@@ -32,7 +32,9 @@ const std = @import("std");
 const config = @import("config.zig");
 const Location = @import("location.zig").Location;
 
-const Crc32c = std.hash.crc.Crc32Iscsi;
+// Hardware CRC32C where available. Byte-identical to the table implementation
+// (see crc32c.zig), and about half of replay time at 1 KiB records.
+const Crc32c = @import("crc32c.zig").Crc32c;
 
 pub const header_bytes: u32 = 36;
 const crc_offset: u32 = 32;

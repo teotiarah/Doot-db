@@ -25,3 +25,6 @@ spikes/tls/zig-pkg/
 # Engine build output
 .zig-cache/
 zig-out/
+
+# M1 harness scratch directories
+/tmp/doot_*

@@ -331,6 +331,30 @@ pub const Index = struct {
         return true;
     }
 
+    /// Rebuilds any shard whose dead slots exceed the threshold, reclaiming them.
+    /// Returns the number of shards rebuilt.
+    ///
+    /// `ensureRoom` also rebuilds, but only when something is being inserted. A
+    /// shard that stops receiving writes — after a wave of expiry, say — would
+    /// otherwise hold its dead slots indefinitely. They stay reusable, so nothing
+    /// is lost, but the documented threshold should hold regardless of traffic,
+    /// so maintenance drives it too.
+    pub fn rebuildDeadHeavy(self: *Index, now: u32) !u32 {
+        var rebuilt: u32 = 0;
+        for (&self.shards) |*s| {
+            s.mutex.lock();
+            defer s.mutex.unlock();
+            const cap = s.capacity();
+            if (cap == 0) continue;
+            const dead_heavy = @as(u64, s.dead) * config.index_rebuild_dead_den >
+                @as(u64, cap) * config.index_rebuild_dead_num;
+            if (!dead_heavy) continue;
+            try self.resize(s, cap, now);
+            rebuilt += 1;
+        }
+        return rebuilt;
+    }
+
     /// Reconciles the counters with the clock. Slots whose lifetime has passed
     /// are still counted live until something notices, so expiry-driven rebuild
     /// needs a sweep. Cheap: touches only the exps array.

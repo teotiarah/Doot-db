@@ -30,7 +30,7 @@ const os = @import("os.zig");
 const index_mod = @import("index.zig");
 const tagchain = @import("tagchain.zig");
 
-const Crc32c = std.hash.crc.Crc32Iscsi;
+const Crc32c = @import("crc32c.zig").Crc32c;
 
 pub const file_name = "SNAPSHOT";
 const temp_name = "SNAPSHOT.tmp";

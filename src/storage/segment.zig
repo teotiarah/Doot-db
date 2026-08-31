@@ -32,7 +32,7 @@ const loc_mod = @import("location.zig");
 const record = @import("record.zig");
 
 const Location = loc_mod.Location;
-const Crc32c = std.hash.crc.Crc32Iscsi;
+const Crc32c = @import("crc32c.zig").Crc32c;
 
 pub const header_bytes: u32 = 64;
 const header_magic: u32 = 0x47_45_53_44; // "DSEG"
@@ -59,6 +59,11 @@ pub const Meta = struct {
     max_expiry: u32 = 0,
     /// Bytes written, including the header.
     used: u32 = header_bytes,
+    /// Bytes belonging to records that have since been superseded or deleted.
+    /// Tracked so the compaction escape hatch can be *evaluated*, which is how
+    /// the claim that bounded lifetime replaces compaction gets checked rather
+    /// than asserted.
+    dead_bytes: u32 = 0,
     records: u32 = 0,
     sealed: bool = false,
     fd: os.Fd = -1,
@@ -143,9 +148,17 @@ pub const SegmentSet = struct {
     next_id: u32 = 1,
     manifest_fd: os.Fd = -1,
 
-    /// Counts wholesale reclamations. The 24-hour soak asserts compaction never
-    /// happens; this is the counter that shows reclamation happened instead.
+    /// Counts wholesale reclamations — the intended mechanism.
     reclaimed_segments: u64 = 0,
+    /// Compactions actually performed. No compactor is implemented, so this is
+    /// zero by construction; it exists so the number is stated rather than
+    /// assumed.
+    compactions: u64 = 0,
+    /// Times a sealed segment met the escape-hatch trigger from
+    /// docs/04-storage.md: more than 70% dead bytes with over 24 hours of life
+    /// left. This is the number that matters — if it stays zero across a soak,
+    /// compaction was never *needed*, which is the actual claim.
+    compaction_candidates: u64 = 0,
 
     pub fn open(
         gpa: std.mem.Allocator,
@@ -409,6 +422,16 @@ pub const SegmentSet = struct {
         return loc;
     }
 
+    /// Notes that the record at `loc` is no longer live, so its bytes are dead.
+    /// Called on overwrite and on delete.
+    pub fn noteDead(self: *SegmentSet, loc: Location, len: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.metas.getPtr(loc.segmentId())) |m| {
+            m.dead_bytes = @min(m.used, m.dead_bytes + len);
+        }
+    }
+
     /// Makes every append to `class` durable. This is the only point at which a
     /// write becomes acknowledgeable.
     pub fn sync(self: *SegmentSet, class: config.Class) Error!void {
@@ -529,7 +552,17 @@ pub const SegmentSet = struct {
         while (it.next()) |m| {
             if (!m.sealed) continue; // the open segment can still receive records
             if (m.max_expiry == 0) continue; // unresolved: never guess
-            if (m.max_expiry > now) continue;
+
+            if (m.max_expiry > now) {
+                // Evaluate the escape hatch: mostly dead, but with a long time
+                // still to run, so waiting for expiry would waste real space.
+                const payload = m.used - header_bytes;
+                const mostly_dead = payload > 0 and
+                    @as(u64, m.dead_bytes) * 100 > @as(u64, payload) * 70;
+                const long_lived = m.max_expiry - now > 24 * 60 * 60;
+                if (mostly_dead and long_lived) self.compaction_candidates += 1;
+                continue;
+            }
             try doomed.append(self.gpa, m.id);
         }
 
@@ -550,8 +583,11 @@ pub const SegmentSet = struct {
         segments: u32,
         sealed: u32,
         bytes: u64,
+        dead_bytes: u64,
         records: u64,
         reclaimed: u64,
+        compactions: u64,
+        compaction_candidates: u64,
         open_per_class: [config.class_count]bool,
     };
 
@@ -563,8 +599,11 @@ pub const SegmentSet = struct {
             .segments = 0,
             .sealed = 0,
             .bytes = 0,
+            .dead_bytes = 0,
             .records = 0,
             .reclaimed = self.reclaimed_segments,
+            .compactions = self.compactions,
+            .compaction_candidates = self.compaction_candidates,
             .open_per_class = @splat(false),
         };
         var it = self.metas.valueIterator();
@@ -572,6 +611,7 @@ pub const SegmentSet = struct {
             out.segments += 1;
             if (m.sealed) out.sealed += 1;
             out.bytes += m.used;
+            out.dead_bytes += m.dead_bytes;
             out.records += m.records;
         }
         for (0..config.class_count) |c| out.open_per_class[c] = self.open_id[c] != null;

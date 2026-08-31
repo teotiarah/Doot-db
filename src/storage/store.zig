@@ -382,6 +382,7 @@ pub const Store = struct {
             expires_at,
             now,
         );
+        if (existing) |e| self.segs.noteDead(e.loc, e.len);
 
         // Durability outside the lock, so other writers can join this flush.
         self.write_mutex.unlock();
@@ -426,6 +427,7 @@ pub const Store = struct {
         _ = try self.segs.append(0, bytes, expires_at);
         self.com.noteWritten(0, seq);
         _ = self.idx.kill(h, existing.slot, existing.loc, now);
+        self.segs.noteDead(existing.loc, existing.len);
 
         self.write_mutex.unlock();
         unlocked = true;
@@ -508,6 +510,7 @@ pub const Store = struct {
     pub const Maintenance = struct {
         swept: u64,
         segments_reclaimed: u32,
+        shards_rebuilt: u32,
         snapshotted: bool,
     };
 
@@ -518,13 +521,21 @@ pub const Store = struct {
 
         const swept = self.idx.sweepExpired(now);
         const reclaimed = try self.segs.reclaim(now);
+        // Sweeping turns live slots into dead ones, so reclaiming them belongs
+        // here rather than waiting for insert traffic to notice.
+        const rebuilt = try self.idx.rebuildDeadHeavy(now);
 
         var snapped = false;
         if (now - self.last_snapshot_at >= self.opts.snapshot_interval_s) {
             try self.snapshot();
             snapped = true;
         }
-        return .{ .swept = swept, .segments_reclaimed = reclaimed, .snapshotted = snapped };
+        return .{
+            .swept = swept,
+            .segments_reclaimed = reclaimed,
+            .shards_rebuilt = rebuilt,
+            .snapshotted = snapped,
+        };
     }
 
     pub fn snapshot(self: *Store) Error!void {
@@ -556,7 +567,7 @@ pub const Store = struct {
     // Internals
     // -----------------------------------------------------------------------
 
-    const Live = struct { slot: u32, loc: Location };
+    const Live = struct { slot: u32, loc: Location, len: u32 };
 
     /// Finds the live record for a name, verifying candidates against disk.
     fn findLive(self: *Store, h: u64, account_id: u32, name: []const u8, now: u32) Error!?Live {
@@ -576,7 +587,7 @@ pub const Store = struct {
             const rec = record.decode(buf[0..len], &tags) catch continue;
             if (rec.account_id == account_id and std.mem.eql(u8, rec.name, name)) {
                 if (rec.tombstone) return null;
-                return .{ .slot = c.slot, .loc = c.loc };
+                return .{ .slot = c.slot, .loc = c.loc, .len = len };
             }
         }
         return null;
@@ -611,6 +622,11 @@ const Stream = struct {
     i: usize = 0,
     offset: u32,
     seg_size: u32 = 0,
+    /// Cached for the segment currently being read. Looking these up per record
+    /// cost a mutex acquisition, a hash lookup and an `lseek` *per record*, which
+    /// dominated replay time.
+    cur_meta: ?segment.Meta = null,
+    cur_id: u32 = 0,
 
     buf: []u8,
     /// Valid bytes in `buf`, starting at file offset `buf_at`.
@@ -646,13 +662,34 @@ const Stream = struct {
         s.gpa.destroy(s);
     }
 
+    /// Resolves the segment being read, reusing the cached handle while the
+    /// stream stays inside it.
     fn openCurrent(s: *Stream) segment.Error!?segment.Meta {
+        if (s.cur_meta) |m| {
+            if (s.i < s.ids.len and s.ids[s.i] == s.cur_id) return m;
+        }
         while (s.i < s.ids.len) {
-            if (s.segs.metaOf(s.ids[s.i])) |m| return m;
+            if (s.segs.metaOf(s.ids[s.i])) |m| {
+                s.cur_meta = m;
+                s.cur_id = m.id;
+                s.seg_size = @intCast(try os.fileSize(m.fd));
+                return m;
+            }
             s.i += 1; // reclaimed underneath us
             s.offset = segment.header_bytes;
+            s.cur_meta = null;
         }
+        s.cur_meta = null;
         return null;
+    }
+
+    /// Moves to the next segment, dropping the cache and buffered bytes.
+    fn nextSegment(s: *Stream) void {
+        s.i += 1;
+        s.offset = segment.header_bytes;
+        s.buf_len = 0;
+        s.buf_pos = 0;
+        s.cur_meta = null;
     }
 
     /// Loads the next record into `current`, or sets it to null at the end.
@@ -662,22 +699,15 @@ const Stream = struct {
                 s.current = null;
                 return;
             };
-            s.seg_size = @intCast(try os.fileSize(m.fd));
 
             if (s.offset >= s.seg_size) {
-                s.i += 1;
-                s.offset = segment.header_bytes;
-                s.buf_len = 0;
-                s.buf_pos = 0;
+                s.nextSegment();
                 continue;
             }
 
             // Ensure a header is buffered.
             if (!try s.ensure(m, record.header_bytes)) {
-                s.i += 1;
-                s.offset = segment.header_bytes;
-                s.buf_len = 0;
-                s.buf_pos = 0;
+                s.nextSegment();
                 continue;
             }
 
@@ -1542,4 +1572,79 @@ test "an empty body is valid, which a lock or flag needs" {
     var buf: [256]u8 = undefined;
     const got = (try s.get(1, "flag", &buf)).?;
     try testing.expectEqual(@as(usize, 0), got.body.len);
+}
+
+
+// -- durability of acknowledgement ----------------------------------------
+//
+// These are the tests that catch a missing flush. The crash harness cannot: it
+// kills the process with SIGKILL, and dirty page cache survives process death,
+// so un-flushed data is still readable afterwards. Killing a process tests
+// recovery from a crash; it does not test durability. Only a white-box assertion
+// at the moment of acknowledgement does that.
+
+test "put does not return until its write is durable" {
+    var h = try H.init(29);
+    defer h.deinit();
+    const s = try h.reopen();
+    defer s.close();
+
+    // Every class, since durability is tracked per class.
+    const ttls = [_]u32{ 600, 6 * 60 * 60, 3 * day, 20 * day };
+    for (ttls, 0..) |ttl, i| {
+        var nb: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&nb, "durable/{d}", .{i});
+        const r = try s.put(1, name, "payload", "", &.{"d"}, ttl);
+        try testing.expect(s.com.isDurable(r.loc.class(), r.seq));
+    }
+}
+
+test "delete does not return until the tombstone is durable" {
+    var h = try H.init(30);
+    defer h.deinit();
+    const s = try h.reopen();
+    defer s.close();
+
+    _ = try s.put(1, "gone", "x", "", &.{}, day);
+    const before = s.com.lastSeq();
+    try testing.expect(try s.delete(1, "gone"));
+
+    // The tombstone took the next sequence number, in class 0.
+    try testing.expect(s.com.lastSeq() > before);
+    try testing.expect(s.com.isDurable(0, s.com.lastSeq()));
+}
+
+test "every acknowledged write in a mixed batch is durable when it returns" {
+    var h = try H.init(31);
+    defer h.deinit();
+    const s = try h.reopen();
+    defer s.close();
+
+    var nb: [32]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 60) : (i += 1) {
+        const ttl: u32 = switch (i % 4) {
+            0 => 600,
+            1 => 6 * 60 * 60,
+            2 => 3 * day,
+            else => 20 * day,
+        };
+        const name = try std.fmt.bufPrint(&nb, "mix/{d}", .{i});
+        const r = try s.put(1, name, "b", "", &.{"m"}, ttl);
+        if (!s.com.isDurable(r.loc.class(), r.seq)) {
+            std.debug.print("op {d} acknowledged before durable\n", .{i});
+            return error.TestUnexpectedResult;
+        }
+        if (i % 7 == 6) {
+            const victim = try std.fmt.bufPrint(&nb, "mix/{d}", .{i - 6});
+            if (try s.delete(1, victim)) {
+                try testing.expect(s.com.isDurable(0, s.com.lastSeq()));
+            }
+        }
+    }
+
+    // A flush really happened per class that was written.
+    const st = s.stats();
+    try testing.expect(st.commit.flushes > 0);
+    for (0..config.class_count) |c| try testing.expect(st.commit.durable[c] > 0);
 }
