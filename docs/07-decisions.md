@@ -1466,6 +1466,46 @@ Nothing already published changed.
 
 ---
 
+## D53 — A scheduling-dependent property is asserted by retry, not by hope · locked
+
+Found by stress-testing the change feed: `commit.zig`'s "concurrent writers all reach
+durability with far fewer flushes than writers" fails roughly one run in twenty when
+pinned to two cores, and every run on one core. The property it checks is real and the
+code is correct — four writer threads simply do not always overlap, and when they do
+not, every write leads its own flush and `flushes < writers` is false.
+
+This is the same effect D48 recorded from the other end: a workload with no concurrency
+gets one `fsync` per write, because leader commit has nobody to piggyback. Correct
+behaviour, wrong assertion.
+
+It matters because CI runs on two cores, so this would have gone red intermittently
+for reasons unrelated to whatever was being reviewed — and an intermittently red suite
+teaches people to press re-run, which is how a real regression gets waved through.
+
+Rejected: **weakening the assertion to `flushes <= writers`.** That can never fail, and
+D36 is the standing lesson that a test which cannot fail is worse than no test.
+
+Rejected: **skipping the check whenever it does not batch.** Same defect wearing a
+disguise — break batching entirely and `piggybacked` drops to zero, the check is
+skipped, and the suite goes green.
+
+Resolution: **run the workload up to five times and require batching to be observed at
+least once.** Overlap is the scheduler's to grant, so asking repeatedly is legitimate;
+never being granted it across five attempts on a multi-core machine is a genuine
+regression and fails the test. On a single-core machine the claim is unmeasurable —
+there is no parallelism to amortise — so it is stated as such rather than papered over.
+
+The correctness half is unchanged and still asserted on **every** attempt: every writer
+reaches durability, and `isDurable` agrees at the moment each one returns. Only the
+amortisation claim, which is a statement about performance, is the one allowed to need
+more than one try.
+
+General rule this sets, since more of these will appear once the event loop exists:
+**assert correctness unconditionally, and measure performance by retry with a bounded
+budget.** Never assert a timing outcome once and call it a property.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
