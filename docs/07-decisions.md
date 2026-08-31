@@ -1217,8 +1217,8 @@ offset  size  field
  49      16   HMAC-SHA256 truncated  over bytes 0..48, keyed by DOOT_HMAC_SECRET
 ```
 
-65 bytes, base64url without padding, 88 characters. Truncating the tag to 16 bytes leaves
-forgery at 2^128, which is not the weak link in anything here.
+65 bytes, base64url without padding, **87 characters**. Truncating the tag to 16 bytes
+leaves forgery at 2^128, which is not the weak link in anything here.
 
 Verification, in this order, every failure returning `400 invalid_cursor` with no
 distinction between them:
@@ -1414,6 +1414,55 @@ need, so a maximum-size entry would come back truncated. Pool slots are therefor
 **266,240 B (260 KiB)**, the next page multiple, for a total of exactly **65 MiB**.
 Corrected in the memory budget rather than left as an off-by-a-page that only appears on
 the largest possible entry.
+
+---
+
+## D52 — Seven error codes the catalogue was missing · locked
+
+Surfaced by implementing the catalogue rather than reading it. `02-api.md` publishes
+eighteen codes and promises that `code` "is a stable machine-readable identifier and
+never changes once published" — which makes inventing one inside an implementation
+diff exactly the wrong move. Each gap below is a response the specification already
+requires, with no code named for it.
+
+| status | code | the gap it fills |
+|---|---|---|
+| 411 | `length_required` | `05-architecture.md` requires `411 Length Required` when a write omits `Content-Length`, and names no code |
+| 400 | `content_type_too_long` | `03-data-model.md` caps `Content-Type` at 128 bytes and does not say what happens above it. The engine already returns a distinct error |
+| 405 | `method_not_allowed` | a known path with a method it does not support. Seven endpoints are published; nothing said what the eighth combination does |
+| 431 | `headers_too_large` | `05-architecture.md` bounds the request line and headers at 8 KB total and rejects early, without naming a status. 431 is the status for exactly this |
+| 400 | `invalid_request` | a malformed request line or header block — not a validation failure of a *field*, so none of the existing 400s fit |
+| 500 | `internal_error` | the catalogue had no 5xx but `503`, while promising a uniform body on **every** non-2xx |
+| 404 | `not_found` — **reused, deliberately** | an unrouted path |
+
+Three of these are worth the reasoning.
+
+**`internal_error` carries a fixed, generic message and never any detail.** The
+failures that reach it are the engine's I/O errors, a checksum failure on a record the
+index still pointed at, and allocation failure. Every one of those is a sentence about
+our disks or our memory, and none of it is a caller's business — `05-architecture.md`
+already forbids logging bodies, names and keys, and the same instinct applies to
+putting internals in a response. The detail goes to the structured log, where the
+operator is; the caller gets a code and a `docs` link. This is also why it is not
+tempting to make it informative: an error body is the one place where being helpful to
+the reporter and helpful to an attacker are the same act.
+
+**An unrouted path reuses `not_found` rather than getting its own code.** A distinct
+code would tell an unauthenticated prober which paths exist, which is a small
+enumeration oracle for no benefit. It also cannot be confused with a missing entry in
+practice, because the validation order in `03-data-model.md` puts authentication
+first: an unknown `/v1` path with a bad key is `401` and never reaches routing at all.
+
+**`431` rather than `400` for oversized headers.** The bound is on the request
+*framing*, not on a value the caller supplied, and 431 exists precisely so a client
+can tell "your headers are too big" from "your input was wrong". Same reasoning that
+keeps `413` separate from `400` for bodies.
+
+`method_not_allowed` carries an `Allow` header listing what the path does support,
+because a client that guessed wrong deserves to be told rather than made to read docs.
+
+All six are added to the table in `02-api.md`, which remains the published catalogue.
+Nothing already published changed.
 
 ---
 

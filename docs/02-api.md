@@ -369,6 +369,8 @@ Uniform JSON body on every non-2xx response:
 | 400 | `ttl_too_long` | exceeds the plan maximum |
 | 400 | `ttl_too_short` | below 60 seconds |
 | 400 | `invalid_cursor` | malformed, expired, or issued to another account |
+| 400 | `content_type_too_long` | `Content-Type` over 128 bytes |
+| 400 | `invalid_request` | malformed request line or headers |
 | 400 | `invalid_limit` | outside 1–100 |
 | 400 | `missing_tag` | list called without `tag` |
 | 401 | `missing_credentials` | no `Authorization` header |
@@ -377,9 +379,23 @@ Uniform JSON body on every non-2xx response:
 | 404 | `not_found` | absent or expired |
 | 409 | `idempotency_key_reused` | same key, different body |
 | 409 | `idempotency_in_progress` | concurrent request, same key |
+| 405 | `method_not_allowed` | known path, unsupported method. Carries an `Allow` header |
+| 411 | `length_required` | a write without `Content-Length` |
 | 413 | `body_too_large` | over 256 KB |
 | 429 | `rate_limited` | bucket empty |
+| 431 | `headers_too_large` | request line and headers exceed 8 KB in total |
+| 500 | `internal_error` | an unexpected server-side failure. Carries no detail, by design |
 | 503 | `capacity_exhausted` | origin cannot accept new entries |
+
+Two notes on codes that exist but are easy to mis-expect:
+
+- **An unrouted path is `404 not_found`**, the same code a missing entry gets. A
+  distinct code would tell an unauthenticated prober which paths exist, for no
+  benefit. In practice the two never collide, because authentication happens first
+  (`03-data-model.md`): an unknown `/v1` path with a bad key is `401` and never
+  reaches routing.
+- **`400 invalid_request`** covers a malformed request line or header block, as
+  distinct from a validation failure on a field that was parsed successfully.
 
 `413` is returned from `Content-Length` **before the body is read**. Oversized
 uploads are rejected, not drained.

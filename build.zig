@@ -20,6 +20,15 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "storage", .module = storage }},
     });
 
+    // ---- request layer (M2: parsing, cursors, names, error catalogue) ----
+    // Pure functions over request bytes. No sockets, so it is testable on its own.
+    const api = b.addModule("api", .{
+        .root_source_file = b.path("src/api.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "storage", .module = storage }},
+    });
+
     // ---- unit tests ----
     const test_step = b.step("test", "Run unit tests");
 
@@ -28,6 +37,7 @@ pub fn build(b: *std.Build) void {
     inline for (.{
         .{ "storage-tests", storage },
         .{ "control-tests", control },
+        .{ "api-tests", api },
     }) |t| {
         const unit_tests = b.addTest(.{ .name = t[0], .root_module = t[1] });
         const run_unit_tests = b.addRunArtifact(unit_tests);
