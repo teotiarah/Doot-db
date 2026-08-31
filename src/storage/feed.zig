@@ -302,9 +302,18 @@ test "an empty ring polls clean" {
 }
 
 test "a poller never tears an event under a concurrent publisher" {
-    // The publisher laps the ring many times while a poller reads continuously.
-    // Every event handed out must be internally consistent — account_id derived
-    // from seq — or the double-check in `poll` is not doing its job.
+    // The publisher laps a small ring thousands of times while a poller reads
+    // continuously. Two properties have to hold for every event handed out:
+    // `account_id` is derivable from `seq`, so a mixture of an old and a new event
+    // is detectable; and `seq` strictly ascends, so a resync skips whole events
+    // rather than rewinding or repeating them.
+    //
+    // Failures are **counted, not asserted, inside the loop**: returning early
+    // would run `f.deinit()` while the publisher is still writing into the ring,
+    // turning a clear assertion failure into a segfault in an unrelated test.
+    const total: u64 = 50_000;
+    const mix: u64 = 2654435761;
+
     var f = try Feed.initCapacity(testing.allocator, 16);
     defer f.deinit();
 
@@ -314,11 +323,11 @@ test "a poller never tears an event under a concurrent publisher" {
 
         fn publisher(self: *@This()) void {
             var i: u64 = 1;
-            while (i <= 50_000) : (i += 1) {
+            while (i <= total) : (i += 1) {
                 self.f.publish(.{
                     .seq = i,
                     .loc = Location.init(0, 1, 64),
-                    .account_id = @truncate(i *% 2654435761),
+                    .account_id = @truncate(i *% mix),
                     .op = .put,
                 });
             }
@@ -330,16 +339,19 @@ test "a poller never tears an event under a concurrent publisher" {
     const t = try std.Thread.spawn(.{}, Runner.publisher, .{&r});
 
     var cursor: Cursor = .{};
-    var out: [16]Event = undefined;
+    var out: [8]Event = undefined;
     var seen: u64 = 0;
+    var resyncs: u64 = 0;
+    var torn: u64 = 0;
+    var out_of_order: u64 = 0;
     var last_seq: u64 = 0;
+
     while (!r.done.load(.acquire) or cursor.pos < f.published.load(.acquire)) {
         const p = f.poll(cursor, &out);
+        if (p.resync) resyncs += 1;
         for (p.events) |e| {
-            const expect: u32 = @truncate(e.seq *% 2654435761);
-            try testing.expectEqual(expect, e.account_id);
-            // Order holds even across a resync; only whole events are skipped.
-            try testing.expect(e.seq > last_seq);
+            if (e.account_id != @as(u32, @truncate(e.seq *% mix))) torn += 1;
+            if (e.seq <= last_seq) out_of_order += 1;
             last_seq = e.seq;
             seen += 1;
         }
@@ -347,6 +359,12 @@ test "a poller never tears an event under a concurrent publisher" {
     }
     t.join();
 
+    try testing.expectEqual(@as(u64, 0), torn);
+    try testing.expectEqual(@as(u64, 0), out_of_order);
+    try testing.expectEqual(total, f.stats().published);
     try testing.expect(seen > 0);
-    try testing.expectEqual(@as(u64, 50_000), f.stats().published);
+    // A ring of 16 cannot hold 50,000 events, so the reader must have been lapped.
+    // Without this the test could pass while proving nothing about resync.
+    try testing.expect(resyncs > 0);
+    try testing.expect(seen < total);
 }

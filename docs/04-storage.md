@@ -478,7 +478,7 @@ image is single-digit megabytes, so disk exists only to rebuild it at boot.
 |---|---|
 | mutation | append a length-prefixed, CRC32C-checksummed event, then `fsync` before responding |
 | recovery | replay from the start into empty maps; a torn tail is truncated |
-| reclamation | wholesale rewrite via `CONTROL.tmp` → `fsync` → `rename` → `syncDir`, once the log exceeds 8× the live image |
+| reclamation | wholesale rewrite via `CONTROL.tmp` → `fsync` → `rename` → `syncDir`, once the log exceeds 8× the live image — or 8× one page, whichever is larger, since without a floor a store holding one account would rewrite on almost every mutation |
 | location | `DOOT_DATA_DIR`, beside the segments — segment discovery skips filenames it does not recognise |
 
 Signup, key creation, revocation and login are rare enough that one flush each is
