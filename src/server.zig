@@ -38,6 +38,7 @@ pub const Job = pool.Job;
 pub const Loop = loop.Loop;
 pub const Options = loop.Options;
 pub const Stats = loop.Stats;
+pub const Tick = loop.Tick;
 
 test {
     _ = config;

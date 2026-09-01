@@ -57,6 +57,21 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ---- process layer (M2: configuration, maintenance thread, signals) ----
+    // What turns an environment and a signal into a running, stoppable Doot. Separate
+    // from main.zig for one reason: it can be tested and a main.zig cannot (D63).
+    const boot = b.addModule("boot", .{
+        .root_source_file = b.path("src/boot.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "storage", .module = storage },
+            .{ .name = "control", .module = control },
+            .{ .name = "api", .module = api },
+            .{ .name = "server", .module = server },
+        },
+    });
+
     // ---- unit tests ----
     const test_step = b.step("test", "Run unit tests");
 
@@ -68,6 +83,7 @@ pub fn build(b: *std.Build) void {
         .{ "api-tests", api },
         .{ "server-tests", server },
         .{ "service-tests", service },
+        .{ "boot-tests", boot },
     }) |t| {
         const unit_tests = b.addTest(.{ .name = t[0], .root_module = t[1] });
         const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -125,6 +141,26 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(dataplane);
+
+    // ---- the origin binary ----
+    // The deployable artifact: one statically linked executable, one process, one machine
+    // (05-architecture.md). A composition root over the modules above (D63).
+    const doot = b.addExecutable(.{
+        .name = "doot",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "storage", .module = storage },
+                .{ .name = "control", .module = control },
+                .{ .name = "server", .module = server },
+                .{ .name = "service", .module = service },
+                .{ .name = "boot", .module = boot },
+            },
+        }),
+    });
+    b.installArtifact(doot);
 
     const verify_step = b.step("verify", "Build the exit-condition harnesses");
     verify_step.dependOn(b.getInstallStep());

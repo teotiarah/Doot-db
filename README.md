@@ -52,7 +52,7 @@ Full reasoning in [`docs/00-vision.md`](docs/00-vision.md).
 
 ## Status
 
-**Storage engine and data plane both built and verified. Not yet deployable.**
+**Storage engine, data plane and origin binary built and verified. Not yet public.**
 
 M0 retired the risky assumptions before any product code existed. M1 built the storage
 engine: records, lifetime-class segments, the index, on-disk tag chains, group commit, and
@@ -62,20 +62,37 @@ goes through, the append-only control-plane log, and **all seven endpoints, with
 the pooled rate limit, idempotency and signed cursors** — all exercised by `curl` rather
 than only by a client of our own.
 
-What is left of M2 is the part that makes it run somewhere:
+It runs:
+
+```bash
+zig build
+DOOT_LISTEN_ADDR=127.0.0.1:8080 \
+DOOT_DATA_DIR=/var/lib/doot \
+DOOT_MAX_INDEX_BYTES=300000000 \
+DOOT_HMAC_SECRET="$(openssl rand -hex 32)" \
+  ./zig-out/bin/doot
+```
+
+Configuration is environment variables only, and the binary refuses to start rather than
+starting degraded — a missing variable is named, not defaulted. What is left of M2 is the
+edge:
 
 | | state |
 |---|---|
 | M0 — retire the unknowns | complete, except the Cloudflare half of the SSE question, which needs a live zone |
 | M1 — storage engine | complete, five exit conditions measured |
 | M2 — data plane | endpoints, credits, rate limit, idempotency: **complete and verified over HTTP** |
-| M2 — origin binary | **outstanding.** `src/` is libraries and harnesses; there is no `doot` yet, so the maintenance thread D45 locked has nowhere to run (D63) |
+| M2 — origin binary | **complete.** `zig build` produces `doot`: configuration from the environment, the maintenance thread, and a graceful shutdown that keeps credit balances exact across a deploy (D63) |
 | M2 — SSE and the edge | **outstanding.** The change feed ring is built and published to; nothing consumes it. Origin TLS and the Cloudflare zone gate on infrastructure that does not exist yet |
 | M3–M6 | not started |
 
-Two of M2's exit conditions are not met yet and are the next thing after the binary: five
-rows of the error catalogue are not reproduced by a `curl` check in CI, and credits and the
-rate limit are verified single-threaded rather than exact under concurrent load.
+Two of M2's exit conditions remain and need no infrastructure: five rows of the error
+catalogue are not reproduced by a `curl` check in CI, and credits and the rate limit are
+verified single-threaded rather than exact under concurrent load.
+
+**It has no way to create an account yet.** M3 owns signup, so a fresh deployment answers
+`401` to everything — deliberately, rather than growing an operator subcommand built to be
+replaced (D63).
 
 | | measured on one 8-core box |
 |---|---|
@@ -90,14 +107,15 @@ Recovery is a warm-page-cache figure and says so: it moves with the filesystem, 
 number the operational lever derives from gets re-measured on the deployed volume in M5
 (D48).
 
-**404 unit tests plus four harnesses, all run by CI on every push:**
+**430 unit tests plus five harnesses, all run by CI on every push:**
 
 ```bash
 tools/vocab-check.sh                                    # D2 vocabulary rule
-zig build test                                          # 404 unit tests
+zig build test                                          # 430 unit tests
 zig build verify && ./zig-out/bin/m1 all /dev/shm/doot-m1  # 5 M1 exit conditions
 tools/transport-check.sh                                # 44 curl checks
 tools/dataplane-check.sh                                # 145 curl checks
+tools/boot-check.sh                                     # 30 checks against the real binary
 ```
 
 `m1 all` runs the recovery check at its 300,000-record default, which measures the replay
@@ -152,7 +170,7 @@ Three directories outside `docs/` are permanent:
 | | |
 |---|---|
 | [`toolchain/`](toolchain/) | pinned Zig version, hash, and the stdlib patch it requires. `toolchain/setup.sh` builds the environment from scratch |
-| [`tools/`](tools/) | the M1 exit-condition harness and its crash subject, the transport and data-plane harnesses with the `curl` check scripts that drive them, and the vocabulary check |
+| [`tools/`](tools/) | the M1 exit-condition harness and its crash subject, the transport and data-plane harnesses with the `curl` check scripts that drive them, the origin binary's boot and shutdown checks, and the vocabulary check |
 | [`ops/`](ops/) | deployment artifacts. The SSE verification probe today; the Cloudflare zone configuration in M2 |
 
 `spikes/` held the M0 validation code and was deleted at M1 as always intended. The findings

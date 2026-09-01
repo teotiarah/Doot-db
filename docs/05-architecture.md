@@ -312,11 +312,14 @@ than a security one.
 - One `systemd` unit, one binary, one data directory.
 - Deploy is: copy binary, `systemctl restart`. Recovery is under 10 seconds
   (`04-storage.md`), which is the entire restart window.
-- **`SIGTERM` is a graceful shutdown, not a crash** (D63). It stops accepting, drains what
-  is in flight, joins the maintenance thread, then closes the store and the control log —
-  and closing the control log is what checkpoints credit balances (D41). Without it every
-  deploy would rewind every account to its last checkpoint, so the restart path is the
-  reason the shutdown path has to exist rather than a nicety on top of it.
+- **`SIGTERM` is a graceful shutdown, not a crash** (D63). It stops the loop, joins the
+  maintenance thread and the I/O worker pool — so every storage operation already in the
+  pool finishes, and no `fsync` is cut short — then closes the store and the control log.
+  Closing the control log is what checkpoints credit balances (D41); without it every deploy
+  would rewind every account, so the restart path is the reason the shutdown path exists
+  rather than a nicety on top of it. Connections still open when the loop stops are reset,
+  which is the same brief reset noted above: the write behind a lost response is durable, and
+  idempotency makes the retry free (D20).
 - Restarts are visible as a brief connection reset. Acceptable and documented on a
   beta-labelled single-box service; pretending otherwise would require a second
   machine.
