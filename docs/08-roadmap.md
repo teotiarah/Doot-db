@@ -216,6 +216,13 @@ M1's 332 MiB/s was measured on tmpfs, replaying bytes that were already resident
 an optimistic bound rather than the operational one — and D38 turns that figure into an
 operator-facing lever. This is where the honest number gets established.
 
+**Also on the deployed link: whether to cap `SO_SNDBUF`** (D54). A response parked against
+a slow reader sits in kernel socket memory — up to 260 KiB per connection, outside both the
+65 MB body budget and anything `/admin/stats` can see. Capping bounds it, and disables send
+buffer autotuning in exchange; whether that is free or a throughput ceiling depends on the
+edge-to-origin bandwidth-delay product, which loopback cannot tell us. Same reason as D48:
+the measurement has to happen on the real path.
+
 ---
 
 ## M6 — Beta launch

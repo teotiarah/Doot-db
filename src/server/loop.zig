@@ -22,6 +22,12 @@
 //! submitting function's stack, and why a response's head and body are never touched
 //! between submission and completion. D30 was measured, not theorised: a shared send
 //! buffer tore 40,000 frames at 2,000 subscribers and was invisible with one.
+//!
+//! **Accepted sockets are blocking, deliberately** (D54). Measured at one thread and zero
+//! `io-wq` workers with 10,000 idle connections, 2,000 half-sent heads and 320 responses
+//! parked mid-write: the ring retries through poll rather than handing work to a kernel
+//! worker, so a slow client costs no thread. `O_NONBLOCK` would buy nothing and would put
+//! an `-EAGAIN` re-arm path on both hot paths.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -1042,14 +1048,19 @@ test "a slow reader gets its whole response, however the kernel chooses to deliv
     // flight at once and the server has to make progress against a client that drains
     // slowly.
     //
-    // Note what this does *not* assert. Whether `writev` ever reports a short count is
-    // the kernel's decision: these sockets are blocking, and io_uring completes a
-    // blocking socket write internally rather than handing back a partial count, so
-    // `stats.partial_writes` is typically zero here even with a 20 KB send buffer.
-    // Resumption is therefore proved deterministically by `response.zig`'s cursor tests
-    // — including the byte-at-a-time reassembly — rather than by hoping this test
-    // triggers it. The logic is required either way: it is what makes the response
-    // correct if a short count ever does arrive.
+    // Note what this does *not* assert, which D54 settled by measurement:
+    // `stats.partial_writes` is normally **zero** even here. The socket send buffer
+    // autotunes to `tcp_wmem`'s maximum — 4 MB on the deployment kernel — which is an
+    // order of magnitude past the 260 KiB ceiling on a response, so the kernel accepts
+    // the whole thing at once and drip-feeds it to the receiver. The write really is
+    // stalled: with a 2 KB receive window only 2,048 bytes are readable until the client
+    // drains. It simply does not come back short.
+    //
+    // So resumption is proved deterministically by `response.zig`'s cursor tests,
+    // including the byte-at-a-time reassembly, rather than by hoping this test triggers
+    // it — D53's rule, applied to a buffer instead of a clock. The logic stays because a
+    // lowered `net.core.wmem_max` or memory pressure on `sk_wmem` restores short writes,
+    // and correctness that depends on a tunable staying generous is not correctness.
     const s = try Server.start(testing.allocator);
     defer s.stop();
 

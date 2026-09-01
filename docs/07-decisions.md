@@ -539,6 +539,36 @@ connection", and it argues for keeping the idle read buffer small — a request 
 bounded at 8 KB (`05-architecture.md`) but an *idle* connection needs only enough to
 detect the start of one.
 
+**M2 amendment — the shipped transport's marginal cost is zero, and the table above no
+longer describes it.** Both columns measured a spike that allocated *per connection*, so
+both were per-connection numbers; the question was only which one was smaller. The
+implementation reserves everything at startup instead — a descriptor-indexed `Conn` slab
+plus two pools — so accepting a connection allocates nothing at all. Re-measured against
+`tools/transport` in `ReleaseFast`:
+
+| idle keep-alive connections | RSS | marginal cost |
+|---|---|---|
+| 0 | 39,984 kB | — |
+| 1,000 | 39,984 kB | **0 B/conn** |
+| 2,500 | 39,984 kB | **0 B/conn** |
+| 5,000 | 39,984 kB | **0 B/conn** |
+| 10,000 | 39,984 kB | **0 B/conn** |
+
+Each of those connections had completed a real request and was sitting idle with a
+pending read, which is the state D28 was about. RSS did not move by a single page.
+
+The cost moved rather than vanished, and it is now a **fixed reservation**: 107 MB
+virtual — a 38 MB `Conn` table (65,536 × 616 B), a 66 MB request-slot pool
+(256 × 272,560 B) and a 2 MB head-buffer pool — of which **39 MB is resident at boot**
+because `Table.init` touches every entry, rising to about **93 MB** once traffic has
+touched all 256 slots. Virtual stays at 110 MB throughout.
+
+That trade is the right way round for a single box: a fixed ceiling known at startup
+beats a per-connection slope, because the slope is what turns a connection spike into an
+out-of-memory kill. The 0.63 KB/conn figure keeps its point — the *idle read buffer
+should still be small*, and `idle_read_bytes` is 512 because of it — but it is no longer
+the cost of a connection.
+
 ---
 
 ## D29 — tls.zig pinned at `fe60069`, driven over raw sockets · locked
@@ -1506,6 +1536,82 @@ budget.** Never assert a timing outcome once and call it a property.
 
 ---
 
+## D54 — Accepted sockets stay blocking · locked
+
+Building the transport raised a question the M0 spikes never had to answer, because they
+never wrote a response large enough to stall: **should accepted sockets be `O_NONBLOCK`?**
+
+It is not a stylistic question. io_uring attempts an operation inline, and when it cannot
+complete it either arms an internal poll and retries — cheap — or hands the work to an
+`io-wq` kernel worker thread, which performs it with blocking semantics. If the second
+path is what happens, then a slow client owns a kernel thread for as long as it is slow,
+and that is a milder version of the exact failure D27 rejected `std.Io.Threaded` for:
+"every idle connection permanently owns a pool thread". Reasoning cannot settle which
+path the kernel takes. Measurement can.
+
+Measured against `tools/transport` on the deployment kernel (6.1.180, 8 cores), counting
+threads in `/proc/<pid>/task` and `io-wq` workers by their `iou-` name prefix:
+
+| situation | threads | `io-wq` workers | still serving? |
+|---|---|---|---|
+| idle | 1 | 0 | — |
+| 10,000 idle keep-alive connections | **1** | **0** | yes |
+| 2,000 half-sent request heads (slow loris) | **1** | **0** | yes |
+| 256 stalled 200 KB writes | **1** | **0** | yes, 6 ms |
+| 320 stalled 200 KB writes | **1** | **0** | yes |
+
+**Zero worker threads, in every case.** The ring uses its poll-based retry path
+throughout, so a blocking socket costs nothing and D27's failure does not recur. A new
+request was served in 6 ms while 256 responses were parked mid-write.
+
+Resolution: **leave accepted sockets blocking.** `O_NONBLOCK` has nothing to buy — there
+are no threads to save — and it would cost real complexity: with the flag set, io_uring
+declines to arm poll and returns `-EAGAIN` to us instead, so every read and every write
+would need a re-arm path, on the two hottest paths in the process. Adding failure modes
+to buy nothing is the wrong direction.
+
+Rejected: **`O_NONBLOCK` for the sake of textbook io_uring style.** The textbook advice
+exists to avoid worker-thread punting. Measurement says we are not punting.
+
+Rejected: **`IOSQE_ASYNC` to force the async path.** That asks for the behaviour the
+question was worried about.
+
+**Why a single `writev` almost always finishes, and why the resumption logic stays.** A
+stalled write is genuinely stalled — with a 2 KB client receive window, only 2,048 bytes
+were readable while the response was parked, and all 200,144 arrived once the client
+drained. Yet the completion reports the full count and the request slot is released
+immediately: 320 slow readers never exhausted a 256-slot pool, and no `503` was ever
+produced. The reason is that the socket send buffer autotunes up to `tcp_wmem`'s maximum,
+4 MB here, which is an order of magnitude beyond the 260 KiB ceiling on a Doot response.
+The kernel accepts the whole thing and drip-feeds it to the receiver.
+
+So `stats.partial_writes` is normally **zero**, and the cursor in `response.zig` is not
+reachable by any traffic pattern we can construct from outside. It stays regardless, for
+two reasons: it is not *guaranteed* — an operator lowering `net.core.wmem_max`, or memory
+pressure capping `sk_wmem`, restores short writes — and correctness that depends on a
+tunable staying generous is not correctness. It is proved deterministically by unit tests
+over the cursor, including byte-at-a-time reassembly, rather than by hoping an
+integration test triggers it. This is D53's rule applied to a buffer instead of a clock:
+assert the property directly where it is deterministic, and do not assert kernel
+behaviour you do not control.
+
+**Accepted consequence, and it is a real one: a slow reader's response is buffered in
+kernel socket memory, which none of our accounting sees.** `05-architecture.md` budgets
+65 MB of body buffers and D28 now adds a 107 MB fixed reservation, but a parked response
+also occupies up to 260 KiB of `sk_wmem` per connection — roughly 83 MB across the 320
+stalled writes above, invisible to `VmRSS` and to `/admin/stats`. Capping `SO_SNDBUF` on
+accepted sockets would bound it, and would have the tidy side effect of making the
+partial-write path ordinary rather than theoretical.
+
+It is deliberately **not** decided here, because the cost is not measurable on loopback.
+Fixing `SO_SNDBUF` disables send-buffer autotuning, and the edge-to-origin hop is a real
+WAN path whose bandwidth-delay product decides whether a 64 KiB buffer is generous or a
+throughput ceiling. Deciding that from a measurement taken over `127.0.0.1` would be
+guessing with a number attached. It is in the Deferred table, to be answered on the
+deployed link alongside the other figures M5 re-measures for the same reason (D48).
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
@@ -1530,6 +1636,7 @@ budget.** Never assert a timing outcome once and call it a property.
 | Chunked request bodies | a real caller unable to send `Content-Length` |
 | 90-day retention | usage behaviour justifying it, **and** a proven restore drill (D16). Retention is a config value, not a code change |
 | Read-side soft caps | the pooled rate limit (D6) proving insufficient against a heavy read pattern |
+| Capping `SO_SNDBUF` on accepted sockets | **M5, on the deployed link.** A parked response holds up to 260 KiB of kernel socket memory that no accounting of ours sees (D54). Capping bounds it and makes the partial-write path ordinary, but it disables send-buffer autotuning, and whether that is free or a throughput ceiling depends on the edge-to-origin bandwidth-delay product. Not answerable over loopback |
 | Flushing credit deductions on the entry's own group commit | credits becoming a real revenue mechanism rather than a beta trial grant. Would make the balance exact across a crash, at the cost of a fifth append stream through measured M1 code (D41) |
 | Durable idempotency state | evidence that retries straddling a restart actually happen. Costs an `fsync` on the common write path and reintroduces orphaned in-progress keys (D42) |
 | Monotonic ULIDs | a caller depending on the ordering of two entries created in the same millisecond. Nothing in the product observes it today (D47) |
