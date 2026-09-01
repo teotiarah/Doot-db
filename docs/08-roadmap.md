@@ -54,6 +54,15 @@ D48 and D51.
 `zig build verify && ./zig-out/bin/m1 all <workdir>`, and note that `<workdir>` should be on
 tmpfs (D48). CI runs exactly this on every push (D50).
 
+**One caveat on the recovery row.** `m1 all` runs the recovery check at its 300,000-record
+default — about 30 seconds of tail, not the five minutes the condition names. It reproduces
+the replay *rate* (measured again at 349 MiB/s) but not the *scale*, so the 3,000,000-record
+figure below comes from asking for it explicitly:
+`./zig-out/bin/m1 recovery <workdir> 3000000`. Since recovery time is bounded by the
+snapshot interval rather than the dataset (D38), the rate is the load-bearing number and the
+scale is the condition's wording — whether CI should run the full scale is grouped with M2's
+outstanding exit-condition work rather than settled here.
+
 | condition | target | measured |
 |---|---|---|
 | crash at every `fsync` boundary loses nothing acknowledged, resurrects nothing | all boundaries | **41/41 boundaries**, all killed mid-run, all recovered |
@@ -62,7 +71,8 @@ tmpfs (D48). CI runs exactly this on every push (D50).
 | compaction events in a 24 h mixed-lifetime soak | 0 | **0**, and 0 segments even met the trigger; 51 reclaimed by unlink |
 | tag traversal across overwrite, delete, expiry, class change | correct | **3 live of 9 hops**; stale, deleted and expired all excluded |
 
-111 unit tests alongside the harness.
+111 unit tests alongside the harness at the time M1 closed. The engine module carries **140**
+now, having gained the `STORE` identity file and the change feed ring as M2 prerequisites.
 
 **What the crash sweep does and does not prove.** It proves recovery is correct at every
 flush boundary — torn tails, half-written snapshots, rotation in flight. It cannot prove
@@ -90,9 +100,13 @@ struct copy; and `record.decode` leaving a tag slice aimed at the caller's stack
 
 ---
 
-## M2 — Data plane
+## M2 — Data plane · **IN PROGRESS**
 
 The seven endpoints. Product-visible for the first time, on top of the M1 engine.
+
+**Where it stands:** the endpoints are built and verified over HTTP. What remains is the
+origin binary that runs them (D63), the SSE consumer for the D44 ring, the edge, and two
+exit conditions that the code can already be measured against.
 
 ### Pass 1 — decisions · **COMPLETE**
 
@@ -110,22 +124,30 @@ data plane was left for an implementation diff to decide. The substantial ones:
 | D46 | the pagination cursor's signed wire format, byte for byte |
 | D47 | the `X-Doot-TTL` grammar, `X-Doot-Tags` parsing order, name percent-decoding, and non-monotonic ULIDs |
 
-### Pass 2 — engine prerequisites
+Twelve further decisions (D52–D63) were forced by writing the code, each settled in its own
+pass before the code it governs, per sequencing rule 2.
 
-Small, and they come first because they change a file format and a threading contract:
+### Pass 2 — engine prerequisites · **COMPLETE**
+
+Small, and they came first because they change a file format and a threading contract:
 
 - `STORE` identity file, read before the index is constructed (D43)
 - `src/storage/feed.zig` — the change feed ring, published under the write lock (D44)
 - `Store.delete`'s 257 KiB stack buffer, and `Store.get`'s buffer contract (D51)
-- `Store.maintain()`'s doc comment corrected to match where it actually runs (D45)
+- `Store.maintain()`'s doc comment corrected to match where it actually runs (D45). **The
+  comment was corrected; the thread it describes was not created.** That gap is D63's, and
+  it matters more than a comment: `maintain()` is the only production path to `snapshot()`
 
-### Pass 2 — the data plane
+### Pass 2 — the data plane · **COMPLETE**
+
+Verified by 404 unit tests, 44 `curl` transport checks and 145 `curl` data-plane checks,
+all in CI.
 
 - HTTP/1.1 with keep-alive, `TCP_NODELAY`, single-`writev` responses,
-  `Expect: 100-continue`, early `413`, bounded header sizes · **done**, and verified against
-  `curl` as well as against our own client
+  `Expect: 100-continue`, early `413`, bounded header sizes — verified against `curl` as
+  well as against our own client
 - The I/O worker pool every storage call goes through, and the `eventfd` its completions
-  come back on (D57). It comes before the endpoints because it is the thing they are built
+  come back on (D57). It came before the endpoints because it is the thing they are built
   on, and because it is what makes leader commit batch at all
 - Plan limits as a table, so the rate limit, `whoami` and `ttl_too_long` all read the same
   numbers (D56)
@@ -133,9 +155,26 @@ Small, and they come first because they change a file format and a threading con
 - The `CONTROL` log and its in-RAM image (D40, D41)
 - All seven endpoints per `02-api.md`
 - Validation in the order given in `03-data-model.md`, with the parsing rules in D47
-- Idempotency: 24-hour window, free replays, `409` on conflict (D42)
+- Idempotency: 24-hour window, free replays, `409` on conflict (D42, D61, D62)
 - Credit accounting: deduct, refund on failure, `402` on exhaustion
 - Error catalogue with stable codes; HMAC-signed pagination cursors (D46)
+
+### Pass 2 — the origin binary
+
+Decided in D63. Nothing here is new design; it is the missing caller for decisions already
+locked, and it is what turns a set of libraries into something that can be deployed.
+
+- `src/main.zig` as a composition root: configuration, `Control`, `Store`, the idempotency
+  table, `Service`, the maintenance thread, the `Loop`. No logic that is not already a
+  library call
+- Environment-variable configuration (D24) — the first code in the tree to read one.
+  Required in M2: `DOOT_LISTEN_ADDR`, `DOOT_DATA_DIR`, `DOOT_MAX_INDEX_BYTES`,
+  `DOOT_HMAC_SECRET`
+- **The maintenance thread (D45).** Without it nothing sweeps expired slots, reclaims
+  segments, rebuilds dead-heavy shards or snapshots — and with no snapshots, recovery
+  replays the whole log and D38's bound does not hold
+- Graceful shutdown on `SIGTERM`, via a `signalfd` read posted on the ring, so
+  `Control.close()` checkpoints credits instead of every deploy rewinding them (D41)
 
 ### Pass 2 — the edge
 
@@ -159,6 +198,20 @@ script that runs in CI. Credits and rate limits verified to be exact under concu
 load, not approximately right. **And the SSE probe passes through Cloudflare** — if it
 cannot be made to pass, the live view falls back to long-polling (D31) and that is
 decided here, not during M4.
+
+**Status of each, measured rather than assumed:**
+
+| condition | state |
+|---|---|
+| every error row reproducible by `curl` in CI | **19 of 24 codes.** Five are not asserted by code: `method_not_allowed` and `headers_too_large` are checked by status line only, and `idempotency_in_progress`, `capacity_exhausted` and `internal_error` are not exercised at all |
+| credits and rate limits exact under concurrent load | **not met.** `dataplane-check.sh` is single-threaded and asserts the burst as a bounded range (101 allowed of 140), which is "approximately right" by construction |
+| SSE probe passes through Cloudflare | **not met, and not yet possible.** Needs the live zone |
+
+The first two need no infrastructure — only a concurrent driver and three fault-injection
+paths. `idempotency_in_progress` needs two requests carrying one key in flight at once,
+which a sequential script cannot produce; `capacity_exhausted` needs a store held at its
+capacity ceiling; `internal_error` needs an injected fault. Being unreachable from `curl`
+alone is the reason they were missed, not a reason to leave them.
 
 ---
 

@@ -5,8 +5,9 @@
 //! pagination cursor D46 specified. No allocation, no clock, no I/O, no sockets — so
 //! the whole surface is exactly testable before an event loop exists.
 //!
-//! The HTTP transport that drives these, and the seven endpoint handlers, sit above
-//! this and are the remaining half of M2.
+//! The HTTP transport that drives these lives in `src/server/` and the seven endpoint
+//! handlers in `src/service/`; both are built. What remains of M2 is the origin binary
+//! that runs them (D63) and the edge.
 //!
 //! Specification: `docs/02-api.md` and `docs/03-data-model.md`. Decisions:
 //! `docs/07-decisions.md` D46 (cursors), D47 (parsing), D52 (the error codes the

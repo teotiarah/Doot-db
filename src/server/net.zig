@@ -131,10 +131,11 @@ fn parsePort(text: []const u8) Error!u16 {
 
 /// Creates a bound, listening socket.
 ///
-/// `SO_REUSEPORT` is set because it is the mechanism the process model depends on:
-/// one ring and one accept socket per worker thread, with the kernel distributing
-/// connections, so there is no shared accept lock and no thundering herd. It has to be
-/// set before `bind`, which is why it lives here rather than in the loop.
+/// `SO_REUSEPORT` is set even though only one loop runs. D57 **deferred** the
+/// one-ring-per-core model rather than adopting it, so the kernel has nothing to
+/// distribute between today — but the option has to be set before `bind`, which is why it
+/// lives here rather than in the loop, and setting it now is what keeps that model a
+/// configuration change rather than a rewrite. It is inert with a single listener.
 pub fn listen(addr: Address, backlog: u31) Error!Fd {
     const rc = linux.socket(
         addr.family(),

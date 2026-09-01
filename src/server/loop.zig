@@ -1,9 +1,14 @@
 //! The io_uring event loop.
 //!
-//! One loop per worker thread, each with its own ring and its own `SO_REUSEPORT`
-//! accept socket, so there is no shared accept lock and no thundering herd
-//! (`05-architecture.md`). Connections are pinned to the loop that accepted them, so
-//! nothing here is shared between threads and nothing here takes a lock.
+//! One loop, owning the ring, with a bounded pool of I/O worker threads behind it that
+//! every storage call is handed to (D57). The loop does only memory-only work — sockets,
+//! parsing, routing, authentication — so nothing in here takes a lock.
+//!
+//! One loop *per core*, each with its own ring and its own `SO_REUSEPORT` accept socket,
+//! was **rejected** by D57 and sits in the Deferred table: it multiplies the transport's
+//! fixed reservation by the core count, and a single loop already does roughly 100× any
+//! plausible demand (D27). The listener still sets `SO_REUSEPORT`, because that option has
+//! to be set before `bind`.
 //!
 //! The ring is driven directly rather than through `std.Io`, which on the pinned
 //! toolchain cannot do networking at all (D26, D27).

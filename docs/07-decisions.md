@@ -1954,6 +1954,132 @@ refused to inherit from a durable table, and it would be no better for being in 
 
 ---
 
+## D63 — The binary is a composition root, and it ships in M2 · locked
+
+`src/` holds five library modules and no entry point. `build.zig` produces four
+executables and every one of them is a harness: `m1`, `crashchild`, `transport` and
+`dataplane`. There is no `doot`.
+
+That was correct while M2 was building the layers. It stopped being correct once they were
+finished, because three locked decisions now have no production caller at all:
+
+- **D45** locked one maintenance thread. Nothing spawns one. `Store.maintain()` is called
+  only from `tools/m1.zig`, and `Control.maintain()` only from tests.
+- **D24** locked environment variables as the only configuration mechanism. Nothing in
+  `src/` reads an environment variable.
+- **D41** depends on a clean shutdown to make credit balances exact. Nothing calls
+  `Control.close()` outside tests and harnesses.
+
+The first is not paperwork. `maintain()` is the only production path to `snapshot()`, so a
+deployed Doot with no maintenance thread never snapshots — and recovery then replays the
+log from the beginning, which is exactly what **D38** says recovery is *not* bounded by. It
+also never sweeps expired index slots, never `unlink()`s reclaimable segments, and never
+rebuilds dead-heavy shards. M1's fourth exit condition — zero compactions, 51 segments
+reclaimed by `unlink` — is a property of maintenance running, and the harness runs it by
+hand. On a real box, disk and index would both grow without bound and the ten-second
+recovery target would fail on the first long-lived store.
+
+So the binary is not deferred work. It is the missing half of decisions already locked.
+
+**Milestone: M2.**
+
+M5 owns *operations* — the `systemd` unit, boot-time validation as an operator concern, the
+restore drill, threshold alerting. It does not own the process those things operate. M2's
+edge half has to stand up Origin TLS behind a real Cloudflare zone and run
+`ops/sseprobe.py` against `doot.run` until it exits zero, and a milestone cannot verify an
+origin it has no way to run. D45 is an M2 decision, so M2 is where it gets implemented
+rather than left inert across two more milestones.
+
+**Scope: composition, and nothing else.**
+
+`src/main.zig` reads configuration, opens `Control` and `Store`, allocates the idempotency
+table, constructs `Service`, spawns the maintenance thread, arms the `Loop` and runs it,
+then shuts down in the reverse order. The `Loop` already owns the I/O worker pool (D57), so
+the binary does not wire that.
+
+The rule is that **the binary contains no logic that is not already a library call.**
+Anything it would otherwise decide belongs in a module that has tests. This is what keeps
+D58's split worth having — the transport's tests still run without a store, a control log
+or an account existing — and it keeps the one file that cannot be unit-tested small enough
+that not testing it is honest rather than convenient. Behaviour appearing in `main.zig` is
+a signal that a module is missing, not that the binary needs a test.
+
+**Configuration: every variable the process uses, and only those.**
+
+D24 is unchanged. But `05-architecture.md` lists the whole eventual set, including R2,
+GitHub, ZeptoMail and the admin token, and it also says the binary "refuses to start if any
+secret is missing". Requiring all of them in M2 would mean refusing to start over
+subsystems that do not exist yet.
+
+So the rule is per-variable rather than per-list: **a variable is required by the milestone
+that gains the code which reads it, and nothing is defaulted where a default would be a
+hazard.** For M2 that is `DOOT_LISTEN_ADDR`, `DOOT_DATA_DIR`, `DOOT_MAX_INDEX_BYTES`
+(required, not defaulted — D43) and `DOOT_HMAC_SECRET`. The storage-shape variables keep
+the defaults `04-storage.md` documents. TLS paths become required with the TLS listener; M3
+and M5 add theirs alongside the code that reads them.
+
+`DOOT_HMAC_SECRET` is required rather than defaulted for D43's reason in a weaker form. A
+cursor signing secret is genuinely rotatable (D46), so a missing one is not data loss — but
+a *defaulted* one is a secret no operator ever sets, and pagination cursors would then be
+forgeable with a value published in our own source. A fallback here is the same class of
+mistake `DOOT_INDEX_HASH_SECRET` was, minus the permanence.
+
+**The maintenance thread, exactly as D45 specified it.**
+
+One thread, and the event loop's one-second tick signals it. The thread wakes, checks
+whether sixty seconds have elapsed, and runs `Store.maintain()` when they have.
+`Control.maintain()` runs on the same thread: it is a log-rewrite check that costs a
+comparison when there is nothing to do and blocks on disk when there is — the same shape,
+and the same reason for being off the request path. A second thread for it would be cost
+without a benefit. SSE heartbeats join this thread when SSE does.
+
+Signalling rather than sleeping is what D45 already chose, and it has a second payoff here:
+a thread waiting to be woken can be woken by shutdown too, so stopping does not wait out a
+sleep.
+
+**Graceful shutdown, because a restart is not a crash.**
+
+D41 accepted that a crash can only ever under-charge, and that is a sound trade for a
+crash. It is not a sound trade for `systemctl restart`. `Control.close()` writes a credits
+checkpoint and `fsync`s it; `abandon()` does not. With no signal handling, every deploy
+would rewind every account to its last checkpoint — turning an accepted crash behaviour
+into routine leakage on an ordinary operation.
+
+So `SIGTERM` and `SIGINT` stop accepting, drain what is in flight, join the maintenance
+thread, then `Store.close()` and `Control.close()`. A response already promised is finished
+before the process exits.
+
+Mechanism: a `signalfd` whose read is posted on the ring, so a signal arrives as a
+completion alongside every other event rather than through a handler that may do almost
+nothing safely. That is the shape D57 already uses for the worker pool's `eventfd`, for the
+same reason.
+
+Rejected: **the binary belongs to M5, with the `systemd` unit.** Costed above — M2's own
+exit condition needs a running origin, and M5 would inherit two milestones' worth of inert
+locked decisions.
+
+Rejected: **promoting `tools/dataplane.zig` to the server.** It hardcodes five API keys,
+creates fixture accounts for them, and prints them to stdout. It is a fixture, and shipping
+it would ship the credentials every check script authenticates with. The harnesses stay
+harnesses.
+
+Rejected: **requiring the full `05-architecture.md` variable list at boot.** It would make
+the binary unstartable until M5, which is not failing loudly — it is failing loudly about
+the wrong thing.
+
+Rejected: **a plain signal handler that sets a flag.** A handler cannot safely `fsync`, and
+a flag the loop polls is what the `signalfd` read already is, without the window between
+the flag being set and the loop noticing it.
+
+Rejected: **a configuration file.** D24 settled this and nothing here reopens it.
+
+**Accepted consequence: a shutdown can hang on a stuck `fsync`** past `systemd`'s
+`TimeoutStopSec`, at which point the process is `SIGKILL`ed mid-close. That degrades to
+exactly the crash shape D41 already accepted and documented, so the worst case is one
+already reasoned about rather than a new one.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
