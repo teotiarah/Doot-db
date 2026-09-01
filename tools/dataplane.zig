@@ -30,6 +30,8 @@ const other_key = "doot_live_harness_other_0000000000";
 /// A third, used only for exhausting a bucket — so the rate-limit check starts from a full
 /// one and does not have to reason about what the checks before it already spent.
 const rate_key = "doot_live_harness_rate_00000000000";
+/// A fourth with no credits at all, so `402` is reachable without spending ten thousand.
+const broke_key = "doot_live_harness_broke_0000000000";
 
 /// Deterministic, so a cursor issued by one run is rejected by the next only because of
 /// its account binding and age rather than because the secret moved.
@@ -76,8 +78,19 @@ pub fn main(init: std.process.Init) !u8 {
         const id = try ctl.createAccount("rate@example.com", .trial, .active, 10_000);
         _ = try ctl.issueKey(id, "harness-rate", rate_key);
     }
+    if (ctl.resolveKey(broke_key) == null) {
+        // Zero credits: writes are refused, and reads, lists and deletes keep working
+        // (`01-product.md`).
+        const id = try ctl.createAccount("broke@example.com", .trial, .active, 0);
+        _ = try ctl.issueKey(id, "harness-broke", broke_key);
+    }
 
     try seed(store, trial.account_id, other.account_id);
+
+    // ~56 MB, so it is allocated once and borrowed rather than embedded (D62).
+    const idem = try gpa.create(service.IdempotencyTable);
+    defer gpa.destroy(idem);
+    idem.init();
 
     var svc = service.Service.init(.{
         .store = store,
@@ -85,6 +98,7 @@ pub fn main(init: std.process.Init) !u8 {
         .clock = clock.clock(),
         .cursor_secret = cursor_secret,
         .max_ttl_s = (storage.config.Options{}).max_ttl_s,
+        .idempotency = idem,
     });
 
     const loop = server.Loop.init(gpa, .{
@@ -102,6 +116,7 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("dataplane: paid_key {s}\n", .{paid_key});
     std.debug.print("dataplane: other_key {s}\n", .{other_key});
     std.debug.print("dataplane: rate_key {s}\n", .{rate_key});
+    std.debug.print("dataplane: broke_key {s}\n", .{broke_key});
 
     try loop.run();
     return 0;

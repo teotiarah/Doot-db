@@ -86,6 +86,13 @@ pub const Put = struct {
 
 pub const Got = struct {
     seq: u64,
+    /// The record's own name, borrowing `buf` like `body` does.
+    ///
+    /// Redundant for `get`, which was handed the name to find it. It is the point of
+    /// `readAt`, which recovers a record from a location alone and has no other way to
+    /// learn what it is called — a `POST` replay has to report a name the server assigned
+    /// (D61).
+    name: []const u8 = &.{},
     body: []const u8,
     content_type: []const u8,
     created_at: u32,
@@ -548,6 +555,7 @@ pub const Store = struct {
 
             var got: Got = .{
                 .seq = rec.seq,
+                .name = rec.name,
                 .body = rec.body,
                 .content_type = rec.content_type,
                 .created_at = rec.created_at,
@@ -561,6 +569,49 @@ pub const Store = struct {
             return got;
         }
         return null;
+    }
+
+    /// Reads the record at an exact location, whatever the index now says.
+    ///
+    /// This is **not** `get` by another route, and the difference is the whole reason it
+    /// exists. `get` answers "what is at this name now"; this answers "what was written
+    /// here", which is what replaying a recorded outcome means (D61).
+    ///
+    /// So it deliberately does **not** check expiry, and does not consult the index at
+    /// all. Segments are append-only and reclaimed wholesale, so a record that has since
+    /// been superseded is still sitting where it was — and reporting the original write is
+    /// the correct answer for a replay, where reporting the current entry would describe
+    /// something the original response never sent.
+    ///
+    /// `account_id` is still verified. A location is an opaque number to the layer above,
+    /// and one that arrived from the wrong place must not be able to read another
+    /// account's record.
+    ///
+    /// Returns null when the segment has been reclaimed, the record does not verify, it is
+    /// a tombstone, or it belongs to someone else. All four mean the same thing to the
+    /// caller: there is no outcome here to reproduce.
+    pub fn readAt(self: *Store, account_id: u32, loc: Location, buf: []u8) Error!?Got {
+        const len = self.segs.readRecord(loc, buf) catch |e| switch (e) {
+            // An expired entry's segment is unlinked wholesale, so this is the ordinary
+            // way a still-live idempotency record loses the write it was standing for.
+            error.SegmentNotFound, error.CorruptRecord, error.RecordTooLarge => return null,
+            else => return e,
+        };
+        var tags: [config.max_tags]record.Tag = undefined;
+        const rec = record.decode(buf[0..len], &tags) catch return null;
+        if (rec.account_id != account_id or rec.tombstone) return null;
+
+        var got: Got = .{
+            .seq = rec.seq,
+            .name = rec.name,
+            .body = rec.body,
+            .content_type = rec.content_type,
+            .created_at = rec.created_at,
+            .expires_at = rec.expires_at,
+            .tag_count = @intCast(rec.tags.len),
+        };
+        for (rec.tags, 0..) |t, i| got.tag_texts[i] = t.text;
+        return got;
     }
 
     pub fn list(
@@ -1958,4 +2009,146 @@ test "recovery does not publish to the feed" {
     // anyone reconnecting actually wants.
     try testing.expectEqual(@as(u64, 0), s.stats().feed.published);
     try testing.expectEqual(config.feed_ring_events, s.stats().feed.capacity);
+}
+
+
+// ---------------------------------------------------------------------------
+// readAt — reading a record by location, for replaying a recorded outcome (D61)
+// ---------------------------------------------------------------------------
+
+test "readAt recovers a record, including the name the caller never supplied" {
+    var h = try H.init(90);
+    defer h.deinit();
+    const s = try h.reopen();
+    defer s.close();
+
+    const put = try s.put(1, "ci/last-green-sha", "deadbeef", "text/plain", &.{ "ci", "main" }, 3600);
+
+    const buf = try testing.allocator.alloc(u8, read_buffer_bytes);
+    defer testing.allocator.free(buf);
+
+    const got = (try s.readAt(1, put.loc, buf)).?;
+    // The name is the point: a POST replay has to report a name the server assigned, and
+    // a location is all the idempotency record kept.
+    try testing.expectEqualStrings("ci/last-green-sha", got.name);
+    try testing.expectEqualStrings("deadbeef", got.body);
+    try testing.expectEqualStrings("text/plain", got.content_type);
+    try testing.expectEqual(@as(u8, 2), got.tag_count);
+    try testing.expectEqualStrings("ci", got.tags()[0]);
+    try testing.expectEqualStrings("main", got.tags()[1]);
+    try testing.expectEqual(put.expires_at, got.expires_at);
+    try testing.expectEqual(put.seq, got.seq);
+}
+
+test "readAt still returns a superseded record, which get no longer will" {
+    // The property D61 depends on. A replay must report what the original response
+    // reported, not what the entry has since become — so an overwrite in between must not
+    // change the answer.
+    var h = try H.init(91);
+    defer h.deinit();
+    const s = try h.reopen();
+    defer s.close();
+
+    const first = try s.put(1, "counter", "one", "text/plain", &.{"a"}, 3600);
+    _ = try s.put(1, "counter", "two-and-longer", "application/json", &.{"b"}, 7200);
+
+    const buf = try testing.allocator.alloc(u8, read_buffer_bytes);
+    defer testing.allocator.free(buf);
+
+    // `get` sees the current entry.
+    const current = (try s.get(1, "counter", buf)).?;
+    try testing.expectEqualStrings("two-and-longer", current.body);
+
+    // `readAt` still sees the original, at its own location.
+    const original = (try s.readAt(1, first.loc, buf)).?;
+    try testing.expectEqualStrings("one", original.body);
+    try testing.expectEqualStrings("text/plain", original.content_type);
+    try testing.expectEqualStrings("a", original.tags()[0]);
+    try testing.expectEqual(first.expires_at, original.expires_at);
+}
+
+test "readAt ignores expiry, because a replay is not a read" {
+    var h = try H.init(92);
+    defer h.deinit();
+    const s = try h.reopen();
+    defer s.close();
+
+    const put = try s.put(1, "short-lived", "value", "text/plain", &.{}, 60);
+    const buf = try testing.allocator.alloc(u8, read_buffer_bytes);
+    defer testing.allocator.free(buf);
+
+    h.mclock.advance(120);
+
+    // Gone as far as the API is concerned.
+    try testing.expect((try s.get(1, "short-lived", buf)) == null);
+    // But the bytes are still where they were, and an idempotency record within its own
+    // 24-hour window can still reproduce the outcome from them.
+    const replayed = (try s.readAt(1, put.loc, buf)).?;
+    try testing.expectEqualStrings("value", replayed.body);
+}
+
+test "readAt refuses another account's record" {
+    // A location is an opaque number to the service layer. One that arrived from the wrong
+    // place must not become a cross-account read.
+    var h = try H.init(93);
+    defer h.deinit();
+    const s = try h.reopen();
+    defer s.close();
+
+    const mine = try s.put(1, "shared-name", "mine", "text/plain", &.{}, 3600);
+    const theirs = try s.put(2, "shared-name", "theirs", "text/plain", &.{}, 3600);
+
+    const buf = try testing.allocator.alloc(u8, read_buffer_bytes);
+    defer testing.allocator.free(buf);
+
+    try testing.expect((try s.readAt(2, mine.loc, buf)) == null);
+    try testing.expect((try s.readAt(1, theirs.loc, buf)) == null);
+    // And each still reads its own.
+    try testing.expectEqualStrings("mine", (try s.readAt(1, mine.loc, buf)).?.body);
+    try testing.expectEqualStrings("theirs", (try s.readAt(2, theirs.loc, buf)).?.body);
+}
+
+test "readAt reports absence for a tombstone or a location that is not there" {
+    var h = try H.init(94);
+    defer h.deinit();
+    const s = try h.reopen();
+    defer s.close();
+
+    _ = try s.put(1, "doomed", "value", "text/plain", &.{}, 3600);
+    try testing.expect(try s.delete(1, "doomed"));
+
+    const buf = try testing.allocator.alloc(u8, read_buffer_bytes);
+    defer testing.allocator.free(buf);
+
+    // A segment that was never written to.
+    const absent = Location.init(0, config.max_segment_id, 0);
+    try testing.expect((try s.readAt(1, absent, buf)) == null);
+
+    // An offset past the end of a real segment.
+    const past_end = Location.init(0, 0, config.max_segment_bytes - 64);
+    try testing.expect((try s.readAt(1, past_end, buf)) == null);
+}
+
+test "readAt survives a reopen, because a location outlives the process" {
+    // An idempotency record does not survive a restart (D42), so nothing depends on this
+    // in production — but a location is a durable address, and a test that proves it is
+    // one is what makes the reasoning in D61 checkable rather than assumed.
+    var h = try H.init(95);
+    defer h.deinit();
+
+    var loc: Location = undefined;
+    {
+        const s = try h.reopen();
+        defer s.close();
+        loc = (try s.put(1, "durable", "value", "text/plain", &.{"t"}, 3600)).loc;
+    }
+    {
+        const s = try h.reopen();
+        defer s.close();
+        const buf = try testing.allocator.alloc(u8, read_buffer_bytes);
+        defer testing.allocator.free(buf);
+        const got = (try s.readAt(1, loc, buf)).?;
+        try testing.expectEqualStrings("durable", got.name);
+        try testing.expectEqualStrings("value", got.body);
+    }
 }

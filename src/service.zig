@@ -29,6 +29,7 @@ pub const router = @import("service/router.zig");
 pub const query = @import("service/query.zig");
 pub const json = @import("service/json.zig");
 pub const ids = @import("service/ids.zig");
+pub const idempotency = @import("service/idempotency.zig");
 
 const Incoming = server.handler.Incoming;
 const Reply = server.handler.Reply;
@@ -43,7 +44,12 @@ pub const Options = struct {
     cursor_secret: [32]u8,
     /// The engine's lifetime ceiling, which the paid plan's maximum derives from (D56).
     max_ttl_s: u32,
+    /// The idempotency table, owned by the caller so its ~56 MB is allocated once.
+    idempotency: *IdempotencyTable,
 };
+
+/// The production table size. 48 B a record at the cap `04-storage.md` records (D62).
+pub const IdempotencyTable = idempotency.Table(idempotency.default_records);
 
 pub const Service = struct {
     store: *storage.Store,
@@ -51,6 +57,9 @@ pub const Service = struct {
     clock: storage.clock.Clock,
     cursor_secret: [32]u8,
     max_ttl_s: u32,
+    /// Borrowed rather than embedded: the table is ~56 MB and a `Service` is passed by
+    /// value into a handler vtable.
+    idempotency: *IdempotencyTable,
 
     pub fn init(options: Options) Service {
         return .{
@@ -59,6 +68,7 @@ pub const Service = struct {
             .clock = options.clock,
             .cursor_secret = options.cursor_secret,
             .max_ttl_s = options.max_ttl_s,
+            .idempotency = options.idempotency,
         };
     }
 
@@ -104,6 +114,8 @@ pub const Service = struct {
             .list => self.beginList(in, out, auth),
             .read => |raw| self.beginEntry(out, auth, raw, .read),
             .remove => |raw| self.beginEntry(out, auth, raw, .remove),
+            .write => |raw| self.beginWrite(in, out, auth, raw),
+            .create => self.beginWrite(in, out, auth, null),
             .wrong_method => |allow| fail(out, .method_not_allowed, allow),
             .unrouted => failPlain(out, .not_found),
             // Answered above, before authentication.
@@ -328,6 +340,298 @@ pub const Service = struct {
     }
 
     // -----------------------------------------------------------------------
+    // PUT /v1/entries/{name} and POST /v1/entries
+    // -----------------------------------------------------------------------
+
+    /// Everything the write needs, validated on the loop and carried to the worker.
+    ///
+    /// It carries the *whole* write context even when a replay is expected, and that is
+    /// deliberate. A recorded outcome can turn out to be unreadable — an entry with a
+    /// lifetime under 24 hours can expire and be reclaimed while its record is still live —
+    /// and D61 settles that case as "the record is treated as absent and the request
+    /// executes normally". The worker can only do that if it still has everything the
+    /// write needs, so nothing is discarded on the way in.
+    const WriteWork = struct {
+        account_id: u32,
+        /// `POST`, so the reply carries `Location`.
+        assigned: bool,
+        ttl_s: u32,
+        name_len: u16,
+        name_buf: [storage.config.max_name_bytes]u8,
+        /// Borrowed from the request head, which outlives the write.
+        content_type: []const u8,
+        tags: api.parse.TagSet,
+        /// Null when no `Idempotency-Key` was presented.
+        key: ?idempotency.Hash,
+
+        /// A recorded outcome to try to replay before writing anything.
+        replay: ?idempotency.Replay,
+        /// Whether a credit has already been deducted. False on the replay path, because a
+        /// replay is free — and it is what tells the worker it must pay before falling back
+        /// to a real write.
+        credit_taken: bool,
+        /// For the header on a replay, where no deduction moves the balance.
+        credits_remaining: u32,
+
+        fn name(x: *const WriteWork) []const u8 {
+            return x.name_buf[0..x.name_len];
+        }
+    };
+
+    /// Validates a write and reserves everything it needs, in `03-data-model.md`'s order.
+    ///
+    /// Steps 1 and 2 — credentials and the rate limit — already ran. Step 3, the body
+    /// ceiling, was enforced by the transport from `Content-Length` before a byte was read.
+    /// This is steps 4 through 8: name, tags, lifetime, idempotency, credit. Step 9,
+    /// capacity, is the engine's own admission check and surfaces from `put` as a `503`.
+    ///
+    /// All of it is memory-only, which is why it belongs here and not on the worker (D57).
+    fn beginWrite(
+        self: *Service,
+        in: Incoming,
+        out: *Reply,
+        auth: control.Auth,
+        raw_name: ?[]const u8,
+    ) Disposition {
+        const work = out.workCtx(WriteWork);
+        work.* = .{
+            .account_id = auth.account_id,
+            .assigned = raw_name == null,
+            .ttl_s = 0,
+            .name_len = 0,
+            .name_buf = undefined,
+            .content_type = "application/octet-stream",
+            .tags = .{},
+            .key = null,
+            .replay = null,
+            .credit_taken = false,
+            .credits_remaining = auth.credits_remaining,
+        };
+
+        // 4. The name. Supplied and percent-decoded for a `PUT`; assigned for a `POST`,
+        //    where a ULID gives a caller with no natural name chronological ordering for
+        //    free (`03-data-model.md`).
+        if (raw_name) |raw| {
+            const decoded = api.parse.decodeName(raw, &work.name_buf) catch
+                return failPlain(out, .invalid_name);
+            work.name_len = @intCast(decoded.len);
+        } else {
+            // Milliseconds, because D47 specifies the ordering to that resolution and the
+            // injected clock only carries seconds (`storage.os.realtimeMillis`).
+            const ms: u48 = @truncate(storage.os.realtimeMillis());
+            const assigned = api.ulid.generate(ms) catch return failPlain(out, .internal_error);
+            @memcpy(work.name_buf[0..api.ulid.len], &assigned);
+            work.name_len = api.ulid.len;
+        }
+
+        // 5. Tags: split, trimmed, emptied elements dropped, lowercased, de-duplicated,
+        //    and only then counted — so six copies of one tag is one tag (D47).
+        if (in.header("x-doot-tags")) |raw| {
+            api.parse.tags(raw, &work.tags) catch |err| return failPlain(out, switch (err) {
+                error.TooManyTags => .too_many_tags,
+                else => .invalid_tag,
+            });
+        }
+
+        // 6. Lifetime. Unparseable and out-of-range are different answers, which keeps
+        //    "I typed it wrong" apart from "my plan will not allow it" (`02-api.md`).
+        const ceiling = control.plan.maxTtl(auth.plan, self.max_ttl_s);
+        if (in.header("x-doot-ttl")) |raw| {
+            work.ttl_s = api.parse.ttl(raw) catch return failPlain(out, .invalid_ttl);
+        } else {
+            work.ttl_s = storage.config.default_ttl_s;
+        }
+        if (work.ttl_s < storage.config.min_ttl_s) return failPlain(out, .ttl_too_short);
+        if (work.ttl_s > ceiling) return failPlain(out, .ttl_too_long);
+
+        // The content type is stored verbatim and echoed on read; the server never acts on
+        // it. Borrowed rather than copied, because the request head outlives the write.
+        if (in.header("content-type")) |ct| {
+            if (ct.len > storage.config.max_content_type_bytes)
+                return failPlain(out, .content_type_too_long);
+            if (ct.len > 0) work.content_type = ct;
+        }
+
+        // 7. Idempotency.
+        if (in.header("idempotency-key")) |raw| {
+            // "Any string, 1-255 bytes" (`02-api.md`). A header that cannot be used as a
+            // key is a malformed request rather than a validation failure on an entry
+            // field, which is what `invalid_request` is for.
+            if (raw.len == 0 or raw.len > 255) return failPlain(out, .invalid_request);
+
+            const key = idempotency.keyHash(auth.account_id, raw);
+            switch (self.idempotency.begin(key, idempotency.bodyHash(in.body), self.clock.now())) {
+                .proceed => work.key = key,
+                .conflict => return failPlain(out, .idempotency_key_reused),
+                .in_progress => return failPlain(out, .idempotency_in_progress),
+                // Free, and not merely uncharged: a misconfigured automation retrying in a
+                // loop must not generate a bill (D20). No credit is taken, and the worker
+                // pays only if the recorded outcome turns out to be unreadable.
+                .replay => |r| {
+                    work.key = key;
+                    work.replay = r;
+                    out.work = writeWork;
+                    return .deferred;
+                },
+            }
+        }
+
+        // 8. The credit, which is the last thing before the write itself. Deducted here and
+        //    refunded by the worker if the write fails, so a failed write costs nothing
+        //    (`03-data-model.md`).
+        switch (self.control.spendCredit(auth.account_id)) {
+            .spent => work.credit_taken = true,
+            .exhausted => {
+                // The reservation goes back: an in-progress marker with no request behind
+                // it would 409 for a full window (D62).
+                if (work.key) |k| self.idempotency.abandon(k);
+                return failPlain(out, .credits_exhausted);
+            },
+            .no_account => {
+                if (work.key) |k| self.idempotency.abandon(k);
+                return failPlain(out, .internal_error);
+            },
+        }
+
+        out.work = writeWork;
+        return .deferred;
+    }
+
+    fn writeWork(ctx: *anyopaque, in: Incoming, out: *Reply) void {
+        const self: *Service = @ptrCast(@alignCast(ctx));
+        const work = out.workCtx(WriteWork);
+
+        // The replay path first. It ends here when the recorded outcome can still be read,
+        // and falls through to a real write when it cannot.
+        if (work.replay) |r| {
+            if (self.replayInto(out, work, r)) return;
+
+            // Unreadable, so there is no outcome to reproduce and the record is treated as
+            // absent (D61). Executing normally means paying for it, which the replay path
+            // deliberately had not done.
+            switch (self.control.spendCredit(work.account_id)) {
+                .spent => work.credit_taken = true,
+                .exhausted => return out.fail(.credits_exhausted),
+                .no_account => return out.fail(.internal_error),
+            }
+        }
+
+        var tag_slices: [storage.config.max_tags][]const u8 = undefined;
+        const tags = work.tags.slices(&tag_slices);
+
+        const put = self.store.put(
+            work.account_id,
+            work.name(),
+            in.body,
+            work.content_type,
+            tags,
+            work.ttl_s,
+        ) catch |err| {
+            // A failed write costs nothing, and leaves no reservation behind to 409 against.
+            if (work.credit_taken) self.control.refundCredit(work.account_id);
+            if (work.key) |k| self.idempotency.abandon(k);
+            out.fail(api.errors.fromStore(err));
+            return;
+        };
+
+        // The outcome becomes replayable only now that it is durable — `put` returns after
+        // the record is flushed, so a replay can never describe a write that did not land.
+        const status: u16 = if (put.created) 201 else 200;
+        if (work.key) |k| self.idempotency.complete(k, put.loc, status);
+
+        self.finishWrite(out, .{
+            .assigned = work.assigned,
+            .status = status,
+            .name = work.name(),
+            .tags = tags,
+            .content_type = work.content_type,
+            .size = in.body.len,
+            .created_at = put.expires_at -| work.ttl_s,
+            .expires_at = put.expires_at,
+            .credits_remaining = self.control.creditsRemaining(work.account_id),
+            .replayed = false,
+        });
+    }
+
+    const Written = struct {
+        assigned: bool,
+        status: u16,
+        name: []const u8,
+        tags: []const []const u8,
+        content_type: []const u8,
+        size: u64,
+        created_at: u32,
+        expires_at: u32,
+        credits_remaining: u32,
+        replayed: bool,
+    };
+
+    /// The response shared by a write and a replay of one.
+    fn finishWrite(_: *Service, out: *Reply, w: Written) void {
+        var body = json.Writer.init(out.out);
+        writeMetadata(&body, .{
+            .name = w.name,
+            .tags = w.tags,
+            .content_type = w.content_type,
+            .size = w.size,
+            .created_at = w.created_at,
+            .expires_at = w.expires_at,
+        }) catch return out.fail(.internal_error);
+
+        out.ok(w.status, if (w.status == 201) "Created" else "OK");
+        out.header("Content-Type", "application/json");
+
+        if (w.assigned) {
+            // The assigned name, so a caller who did not choose one can find it without
+            // parsing the body.
+            var location: [16 + api.ulid.len]u8 = undefined;
+            const text = std.fmt.bufPrint(&location, "/v1/entries/{s}", .{w.name}) catch
+                return out.fail(.internal_error);
+            out.headerCopy("Location", text);
+        }
+        // Writes are the billable event, so the wall is never a surprise (`01-product.md`).
+        out.headerInt("X-Doot-Credits-Remaining", w.credits_remaining);
+        if (w.replayed) out.header("Idempotency-Replayed", "true");
+
+        out.body = body.done();
+    }
+
+    /// Fills `out` from a recorded outcome. Returns false when it can no longer be read.
+    ///
+    /// The metadata comes from the record the original write produced, read at the location
+    /// the idempotency table kept (D61) — so it is what the first response said, not what
+    /// the entry has since become.
+    fn replayInto(self: *Service, out: *Reply, work: *const WriteWork, r: idempotency.Replay) bool {
+        const buf = out.out;
+        if (buf.len < storage.store.read_buffer_bytes) return false;
+
+        const found = self.store.readAt(work.account_id, r.location, buf) catch return false;
+        const got = found orelse return false;
+
+        // Rendered into scratch rather than `out.out`, which is currently holding the record
+        // the metadata is being read out of.
+        var scratch: [1024]u8 = undefined;
+        var body = json.Writer.init(&scratch);
+        writeMetadataOf(&body, got) catch return false;
+        const rendered = out.dupe(body.done()) orelse return false;
+
+        out.ok(r.status, if (r.status == 201) "Created" else "OK");
+        out.header("Content-Type", "application/json");
+        if (work.assigned) {
+            // Whether to emit `Location` follows the request being made rather than the one
+            // recorded: a `POST` caller has no other way to learn the name.
+            var location: [16 + storage.config.max_name_bytes]u8 = undefined;
+            const text = std.fmt.bufPrint(&location, "/v1/entries/{s}", .{got.name}) catch
+                return false;
+            out.headerCopy("Location", text);
+        }
+        out.headerInt("X-Doot-Credits-Remaining", work.credits_remaining);
+        out.header("Idempotency-Replayed", "true");
+        out.body = rendered;
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
     // GET /v1/entries?tag=…
     // -----------------------------------------------------------------------
 
@@ -392,22 +696,16 @@ pub const Service = struct {
         }
 
         fn write(self: *Collector, rec: storage.record.Record) json.Error!void {
-            try self.w.beginObject();
-            try self.w.stringMember("name", rec.name);
-
-            try self.w.key("tags");
-            try self.w.beginArray();
-            for (rec.tags) |t| try self.w.string(t.text);
-            try self.w.endArray();
-
-            try self.w.stringMember("content_type", rec.content_type);
-            try self.w.numberMember("size", rec.body.len);
-
-            var created: [server.response.timestamp_len]u8 = undefined;
-            var expires: [server.response.timestamp_len]u8 = undefined;
-            try self.w.stringMember("created_at", server.response.timestamp(rec.created_at, &created));
-            try self.w.stringMember("expires_at", server.response.timestamp(rec.expires_at, &expires));
-            try self.w.endObject();
+            var tags: [storage.config.max_tags][]const u8 = undefined;
+            for (rec.tags, 0..) |t, i| tags[i] = t.text;
+            try writeMetadata(self.w, .{
+                .name = rec.name,
+                .tags = tags[0..rec.tags.len],
+                .content_type = rec.content_type,
+                .size = rec.body.len,
+                .created_at = rec.created_at,
+                .expires_at = rec.expires_at,
+            });
         }
     };
 
@@ -463,6 +761,53 @@ pub const Service = struct {
 };
 
 // ---------------------------------------------------------------------------
+// The metadata document (D60)
+// ---------------------------------------------------------------------------
+
+/// One entry, described. The body of a write and one element of a listing.
+pub const Metadata = struct {
+    name: []const u8,
+    tags: []const []const u8,
+    content_type: []const u8,
+    size: u64,
+    created_at: u32,
+    expires_at: u32,
+};
+
+/// The single renderer for `02-api.md`'s Metadata shape.
+///
+/// One function on purpose. D60's whole point is that a write and a listing describe an
+/// entry identically, and two renderers would be two places for that to stop being true.
+fn writeMetadata(w: *json.Writer, m: Metadata) json.Error!void {
+    var created: [server.response.timestamp_len]u8 = undefined;
+    var expires: [server.response.timestamp_len]u8 = undefined;
+
+    try w.beginObject();
+    try w.stringMember("name", m.name);
+    try w.key("tags");
+    try w.beginArray();
+    for (m.tags) |t| try w.string(t);
+    try w.endArray();
+    try w.stringMember("content_type", m.content_type);
+    try w.numberMember("size", m.size);
+    try w.stringMember("created_at", server.response.timestamp(m.created_at, &created));
+    try w.stringMember("expires_at", server.response.timestamp(m.expires_at, &expires));
+    try w.endObject();
+}
+
+/// The same document, from a record read back off disk.
+fn writeMetadataOf(w: *json.Writer, got: storage.store.Got) json.Error!void {
+    return writeMetadata(w, .{
+        .name = got.name,
+        .tags = got.tags(),
+        .content_type = got.content_type,
+        .size = got.body.len,
+        .created_at = got.created_at,
+        .expires_at = got.expires_at,
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -492,4 +837,5 @@ test {
     _ = query;
     _ = json;
     _ = ids;
+    _ = idempotency;
 }

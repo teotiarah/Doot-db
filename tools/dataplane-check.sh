@@ -65,6 +65,7 @@ fi
 TRIAL="$(sed -n 's/.*trial_key \(.*\)/\1/p' "$WORK/out.log" | head -1)"
 OTHER="$(sed -n 's/.*other_key \(.*\)/\1/p' "$WORK/out.log" | head -1)"
 RATE="$(sed -n 's/.*rate_key \(.*\)/\1/p' "$WORK/out.log" | head -1)"
+BROKE="$(sed -n 's/.*broke_key \(.*\)/\1/p' "$WORK/out.log" | head -1)"
 BASE="http://127.0.0.1:$PORT"
 CURL="curl -sS --max-time 10"
 AUTH=(-H "Authorization: Bearer $TRIAL")
@@ -274,19 +275,215 @@ lacks "and gone from listings" '"name":"doomed"' \
 
 # ---------------------------------------------------------------------------
 
-hdr "the write endpoints, which are the next slice"
+hdr "PUT /v1/entries/{name}"
 
-RESP="$($CURL -i -X PUT "${AUTH[@]}" --data-binary 'x' "$BASE/v1/entries/new-name")"
-has "PUT is 405 rather than a 500" "405 Method Not Allowed" "$RESP"
-has "and its Allow does not claim PUT works" "Allow: GET, DELETE" "$RESP"
-RESP="$($CURL -i -X POST "${AUTH[@]}" --data-binary '' "$BASE/v1/entries")"
-has "POST is 405" "405 Method Not Allowed" "$RESP"
-has "and its Allow is accurate too" "Allow: GET" "$RESP"
+# `curl` supplies its own Content-Type unless told otherwise, so it is set explicitly
+# wherever the stored value is asserted.
+JSON=(-H "Content-Type: application/json")
+
+RESP="$($CURL -i -X PUT "${AUTH[@]}" "${JSON[@]}" -H 'X-Doot-Tags: CI,Main,ci' -H 'X-Doot-TTL: 2h' \
+  --data-binary '{"v":1}' "$BASE/v1/entries/w/first")"
+has "a new entry is 201" "HTTP/1.1 201 Created" "$RESP"
+has "a write reports the balance" "X-Doot-Credits-Remaining:" "$RESP"
+has "the body is the metadata document" '"name":"w/first"' "$RESP"
+has "the content type is stored as supplied" '"content_type":"application/json"' "$RESP"
+has "the size is the body length" '"size":7' "$RESP"
+# Lowercased, de-duplicated, first-occurrence order — and counted after de-duplication.
+has "tags are normalised" '"tags":["ci","main"]' "$RESP"
+has "the document carries both timestamps" '"expires_at":"20' "$RESP"
+
+# Overwriting is a write, and it replaces everything including the lifetime (D19).
+RESP="$($CURL -i -X PUT "${AUTH[@]}" -H 'Content-Type: text/plain' --data-binary 'v2' \
+  "$BASE/v1/entries/w/first")"
+has "an overwrite is 200, not 201" "HTTP/1.1 200 OK" "$RESP"
+has "an overwrite replaces the content type" '"content_type":"text/plain"' "$RESP"
+lacks "an overwrite drops the previous tags" '"ci"' "$RESP"
+
+equals "the entry reads back as the overwrite left it" "v2" \
+  "$($CURL "${AUTH[@]}" "$BASE/v1/entries/w/first")"
+
+hdr "POST /v1/entries"
+
+RESP="$($CURL -i -X POST "${AUTH[@]}" "${JSON[@]}" -H 'X-Doot-Tags: webhook' \
+  --data-binary '{"hook":true}' "$BASE/v1/entries")"
+has "a server-assigned write is 201" "HTTP/1.1 201 Created" "$RESP"
+has "and carries Location" "Location: /v1/entries/" "$RESP"
+# 26 characters of Crockford base32, so it sorts by creation time.
+if printf '%s' "$RESP" | grep -qE 'Location: /v1/entries/[0-9A-HJKMNP-TV-Z]{26}'; then
+  pass "the assigned name is a 26-character ULID"
+else
+  fail "the assigned name is a 26-character ULID" "26 Crockford characters" \
+    "$(printf '%s' "$RESP" | grep -i '^location:')"
+fi
+ASSIGNED="$(printf '%s' "$RESP" | sed -n 's|^[Ll]ocation: /v1/entries/\([A-Z0-9]*\).*|\1|p' | tr -d '\r')"
+equals "the assigned entry reads back at its own name" '{"hook":true}' \
+  "$($CURL "${AUTH[@]}" "$BASE/v1/entries/$ASSIGNED")"
+
+hdr "credits"
+
+BEFORE="$($CURL "${AUTH[@]}" "$BASE/v1/whoami" | sed -n 's/.*"credits":{"remaining":\([0-9]*\).*/\1/p')"
+$CURL -X PUT "${AUTH[@]}" -o /dev/null --data-binary 'x' "$BASE/v1/entries/w/count-1"
+AFTER="$($CURL "${AUTH[@]}" "$BASE/v1/whoami" | sed -n 's/.*"credits":{"remaining":\([0-9]*\).*/\1/p')"
+equals "one write costs exactly one credit" "$((BEFORE - 1))" "$AFTER"
+
+# Reads, lists and deletes are free (01-product.md).
+$CURL "${AUTH[@]}" -o /dev/null "$BASE/v1/entries/w/count-1"
+$CURL "${AUTH[@]}" -o /dev/null "$BASE/v1/entries?tag=ci"
+$CURL -X DELETE "${AUTH[@]}" -o /dev/null "$BASE/v1/entries/w/count-1"
+FREE="$($CURL "${AUTH[@]}" "$BASE/v1/whoami" | sed -n 's/.*"credits":{"remaining":\([0-9]*\).*/\1/p')"
+equals "reads, lists and deletes cost nothing" "$AFTER" "$FREE"
+
+# A validation failure must not be charged either.
+$CURL -X PUT "${AUTH[@]}" -o /dev/null -H 'X-Doot-TTL: nonsense' --data-binary 'x' "$BASE/v1/entries/w/bad"
+REJECTED="$($CURL "${AUTH[@]}" "$BASE/v1/whoami" | sed -n 's/.*"credits":{"remaining":\([0-9]*\).*/\1/p')"
+equals "a rejected write costs nothing" "$FREE" "$REJECTED"
+
+BA=(-H "Authorization: Bearer $BROKE")
+RESP="$($CURL -i -X PUT "${BA[@]}" --data-binary 'x' "$BASE/v1/entries/nope")"
+has "a write with no credits is 402" "HTTP/1.1 402 Payment Required" "$RESP"
+has "and names the code" '"code":"credits_exhausted"' "$RESP"
+# The failure mode to avoid is a user believing they lost their data (01-product.md).
+equals "an exhausted account can still read" "404" \
+  "$($CURL "${BA[@]}" -o /dev/null -w '%{http_code}' "$BASE/v1/entries/anything")"
+equals "...and still list" "200" \
+  "$($CURL "${BA[@]}" -o /dev/null -w '%{http_code}' "$BASE/v1/entries?tag=ci")"
+
+hdr "idempotency"
+
+FIRST="$($CURL -i -X PUT "${AUTH[@]}" "${JSON[@]}" -H 'Idempotency-Key: check-1' \
+  --data-binary '{"n":1}' "$BASE/v1/entries/idem/one")"
+has "the first request with a key executes" "HTTP/1.1 201 Created" "$FIRST"
+lacks "and is not marked as a replay" "Idempotency-Replayed" "$FIRST"
+FIRST_BODY="$(printf '%s' "$FIRST" | sed -n 's/^\({.*\)$/\1/p')"
+BEFORE="$($CURL "${AUTH[@]}" "$BASE/v1/whoami" | sed -n 's/.*"credits":{"remaining":\([0-9]*\).*/\1/p')"
+
+REPLAY="$($CURL -i -X PUT "${AUTH[@]}" "${JSON[@]}" -H 'Idempotency-Key: check-1' \
+  --data-binary '{"n":1}' "$BASE/v1/entries/idem/one")"
+has "a repeat replays the recorded status" "HTTP/1.1 201 Created" "$REPLAY"
+has "and says so" "Idempotency-Replayed: true" "$REPLAY"
+REPLAY_BODY="$(printf '%s' "$REPLAY" | sed -n 's/^\({.*\)$/\1/p')"
+equals "and reproduces the original document exactly" "$FIRST_BODY" "$REPLAY_BODY"
+
+AFTER="$($CURL "${AUTH[@]}" "$BASE/v1/whoami" | sed -n 's/.*"credits":{"remaining":\([0-9]*\).*/\1/p')"
+# Free is a product decision, not an implementation detail: a retry storm must not bill.
+equals "a replay consumes no credit" "$BEFORE" "$AFTER"
+
+RESP="$($CURL -i -X PUT "${AUTH[@]}" "${JSON[@]}" -H 'Idempotency-Key: check-1' \
+  --data-binary '{"n":2}' "$BASE/v1/entries/idem/one")"
+has "the same key with a different body is 409" "HTTP/1.1 409 Conflict" "$RESP"
+has "and names the code" '"code":"idempotency_key_reused"' "$RESP"
+equals "and it overwrote nothing" '{"n":1}' \
+  "$($CURL "${AUTH[@]}" "$BASE/v1/entries/idem/one")"
+
+# A POST replay has to return the name the server assigned the first time, which is what
+# the recorded location is for (D61).
+ONE="$($CURL -i -X POST "${AUTH[@]}" -H 'Idempotency-Key: check-post' --data-binary 'p' "$BASE/v1/entries")"
+TWO="$($CURL -i -X POST "${AUTH[@]}" -H 'Idempotency-Key: check-post' --data-binary 'p' "$BASE/v1/entries")"
+LOC_ONE="$(printf '%s' "$ONE" | grep -i '^location:' | tr -d '\r')"
+LOC_TWO="$(printf '%s' "$TWO" | grep -i '^location:' | tr -d '\r')"
+equals "a POST replay returns the originally assigned name" "$LOC_ONE" "$LOC_TWO"
+has "and is marked as a replay" "Idempotency-Replayed: true" "$TWO"
+
+# A different key is a different request, however identical the body.
+RESP="$($CURL -i -X POST "${AUTH[@]}" -H 'Idempotency-Key: check-post-2' --data-binary 'p' "$BASE/v1/entries")"
+LOC_THREE="$(printf '%s' "$RESP" | grep -i '^location:' | tr -d '\r')"
+if [ "$LOC_ONE" != "$LOC_THREE" ]; then
+  pass "a different key writes a new entry"
+else
+  fail "a different key writes a new entry" "a different name" "$LOC_THREE"
+fi
+
+# "Any string, 1-255 bytes" (02-api.md). Over the ceiling is a malformed request rather
+# than a validation failure on an entry field.
+equals "an oversized Idempotency-Key is 400" "400" \
+  "$($CURL -X PUT "${AUTH[@]}" -H "Idempotency-Key: $(head -c 300 /dev/zero | tr '\0' 'k')" \
+     --data-binary 'x' -o /dev/null -w '%{http_code}' "$BASE/v1/entries/idem/bad")"
+
+# An *empty* value needs a raw socket: curl drops a header whose value is empty rather than
+# sending it, so through curl this request simply has no key — which is a 201, correctly.
+EMPTY_KEY="$(python3 - "$PORT" "$TRIAL" <<'PY'
+import socket, sys, time
+port, key = int(sys.argv[1]), sys.argv[2]
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.sendall(
+    b"PUT /v1/entries/idem/empty-key HTTP/1.1\r\nHost: d\r\n"
+    b"Authorization: Bearer " + key.encode() + b"\r\n"
+    b"Idempotency-Key: \r\nContent-Length: 1\r\n\r\nx"
+)
+time.sleep(0.4)
+print(s.recv(400).split(b"\r\n")[0].decode(errors="replace"))
+s.close()
+PY
+)"
+has "an empty Idempotency-Key is 400" "400 Bad Request" "$EMPTY_KEY"
+
+hdr "write validation, in the documented order"
+
+equals "a name that will not decode is 400" "400" \
+  "$($CURL -X PUT "${AUTH[@]}" --data-binary 'x' -o /dev/null -w '%{http_code}' "$BASE/v1/entries/bad%zz")"
+
+for case in "1:ttl_too_short" "59:ttl_too_short" "0:ttl_too_short" "999d:ttl_too_long" \
+            "abc:invalid_ttl" "1h30m:invalid_ttl" "-5:invalid_ttl" "1.5h:invalid_ttl"; do
+  ttl="${case%%:*}"
+  want="${case#*:}"
+  has "X-Doot-TTL '$ttl' is $want" "\"code\":\"$want\"" \
+    "$($CURL -i -X PUT "${AUTH[@]}" -H "X-Doot-TTL: $ttl" --data-binary 'x' "$BASE/v1/entries/w/ttl")"
+done
+# The trial's ceiling is 14 days, so 14d is legal and 15d is not (D56).
+equals "14d is within the trial ceiling" "201" \
+  "$($CURL -X PUT "${AUTH[@]}" -H 'X-Doot-TTL: 14d' --data-binary 'x' -o /dev/null -w '%{http_code}' "$BASE/v1/entries/w/ttl14")"
+has "15d exceeds it" '"code":"ttl_too_long"' \
+  "$($CURL -i -X PUT "${AUTH[@]}" -H 'X-Doot-TTL: 15d' --data-binary 'x' "$BASE/v1/entries/w/ttl15")"
+
+has "a tag outside the character set is invalid_tag" '"code":"invalid_tag"' \
+  "$($CURL -i -X PUT "${AUTH[@]}" -H 'X-Doot-Tags: not!valid' --data-binary 'x' "$BASE/v1/entries/w/tag")"
+has "more than five distinct tags is too_many_tags" '"code":"too_many_tags"' \
+  "$($CURL -i -X PUT "${AUTH[@]}" -H 'X-Doot-Tags: a,b,c,d,e,f' --data-binary 'x' "$BASE/v1/entries/w/tags")"
+# Counted after de-duplication, so six copies of one tag is one tag (D47).
+equals "six copies of one tag is one tag" "201" \
+  "$($CURL -X PUT "${AUTH[@]}" -H 'X-Doot-Tags: ci,ci,ci,ci,ci,ci' --data-binary 'x' \
+     -o /dev/null -w '%{http_code}' "$BASE/v1/entries/w/dedupe")"
+# A trailing comma is a shell artefact rather than a caller bug.
+equals "a trailing comma is tolerated" "201" \
+  "$($CURL -X PUT "${AUTH[@]}" -H 'X-Doot-Tags: ci,main,' --data-binary 'x' \
+     -o /dev/null -w '%{http_code}' "$BASE/v1/entries/w/trailing")"
+
+has "an oversized Content-Type is 400" '"code":"content_type_too_long"' \
+  "$($CURL -i -X PUT "${AUTH[@]}" -H "Content-Type: $(head -c 200 /dev/zero | tr '\0' 'x')" \
+     --data-binary 'x' "$BASE/v1/entries/w/ct")"
 
 # A write with no Content-Length never reaches routing: the transport refuses it first,
 # because that header is what lets an oversized upload be rejected before it is read.
 has "a write without Content-Length is 411 at the transport" '"code":"length_required"' \
-  "$($CURL -i -X PUT "${AUTH[@]}" "$BASE/v1/entries/new-name")"
+  "$($CURL -i -X PUT "${AUTH[@]}" "$BASE/v1/entries/w/nolen")"
+
+hdr "the whole round trip"
+
+# The published ceiling, byte for byte, through the API rather than seeded.
+head -c 262144 /dev/urandom > "$WORK/big.bin"
+$CURL -X PUT "${AUTH[@]}" -H 'Content-Type: application/octet-stream' \
+  --data-binary "@$WORK/big.bin" -o /dev/null "$BASE/v1/entries/w/big"
+$CURL "${AUTH[@]}" -o "$WORK/big.out" "$BASE/v1/entries/w/big"
+if [ "$(digest "$WORK/big.bin")" = "$(digest "$WORK/big.out")" ]; then
+  pass "a 256 KB entry written and read back is byte for byte identical"
+else
+  fail "a 256 KB entry written and read back is byte for byte identical" \
+    "identical" "$(wc -c <"$WORK/big.out" | tr -d ' ') bytes"
+fi
+
+# An empty body is a valid entry — a lock or a flag (03-data-model.md).
+equals "a zero-length write is 201" "201" \
+  "$($CURL -X PUT "${AUTH[@]}" --data-binary '' -o /dev/null -w '%{http_code}' "$BASE/v1/entries/w/empty")"
+equals "and reads back empty" "0" \
+  "$($CURL "${AUTH[@]}" -o /dev/null -w '%{size_download}' "$BASE/v1/entries/w/empty")"
+
+# A written entry appears in its tag's listing, in the same shape the write returned.
+$CURL -X PUT "${AUTH[@]}" -H 'Content-Type: text/plain' -H 'X-Doot-Tags: roundtrip' \
+  --data-binary 'listed' -o /dev/null "$BASE/v1/entries/w/listed"
+LIST="$($CURL "${AUTH[@]}" "$BASE/v1/entries?tag=roundtrip")"
+has "a written entry appears in its tag listing" '"name":"w/listed"' "$LIST"
+has "described the same way a write described it" '"content_type":"text/plain"' "$LIST"
+has "with the same size" '"size":6' "$LIST"
 
 # ---------------------------------------------------------------------------
 

@@ -31,11 +31,13 @@ pub const reply_scratch_bytes = 1024;
 
 /// Space for whatever a handler needs to carry from the loop to an I/O worker.
 ///
-/// Sized for the largest of those: a list needs a 40-byte traversal cursor plus a tag,
-/// and a read or delete needs a decoded name, which is up to 256 bytes
-/// (`03-data-model.md`). Cheap either way — it sits inside a pooled `Request` that is
-/// already 260 KiB.
-pub const work_ctx_bytes = 384;
+/// Sized for the largest of those, which is a write: a decoded name is up to 256 bytes and
+/// a *normalised* tag set is 326, because normalisation lowercases and de-duplicates into
+/// its own storage and so cannot borrow the request head the way a content type can. A read
+/// or a delete needs only the name; a list needs a 40-byte traversal cursor and a tag.
+///
+/// Cheap at any of those sizes — it sits inside a pooled `Request` that is already 260 KiB.
+pub const work_ctx_bytes = 768;
 
 /// Whether a reply is ready to send, or still needs work that must not run on the event
 /// loop.

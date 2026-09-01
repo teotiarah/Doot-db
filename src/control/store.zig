@@ -472,6 +472,19 @@ pub const Control = struct {
         return @intFromFloat(@ceil(wanted / per_second));
     }
 
+    /// The balance now, for the header every write response carries.
+    ///
+    /// Read after the deduction rather than derived from the `Auth` snapshot taken at
+    /// resolve time, because a concurrent write on another key of the same account moves it
+    /// — and `X-Doot-Credits-Remaining` is the number that stops the wall being a surprise
+    /// (`01-product.md`), so a stale one is worse than none.
+    pub fn creditsRemaining(self: *Control, account_id: u32) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const a = self.accounts.get(account_id) orelse return 0;
+        return a.credits_remaining;
+    }
+
     /// One key by id, for `GET /v1/whoami` to report which key was presented.
     ///
     /// Keyed by id rather than by hash, because the request path already resolved the
