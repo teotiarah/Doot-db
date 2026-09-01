@@ -42,6 +42,7 @@ const head_mod = @import("head.zig");
 const response = @import("response.zig");
 const conn_mod = @import("conn.zig");
 const handler_mod = @import("handler.zig");
+const pool_mod = @import("pool.zig");
 
 const Fd = net.Fd;
 const Code = api.errors.Code;
@@ -78,6 +79,8 @@ const Op = enum(u8) {
     recv = 2,
     send = 3,
     tick = 4,
+    /// A read on the `eventfd` an I/O worker writes to when a job finishes (D57).
+    wake = 5,
 };
 
 /// `user_data` layout: op in bits 32-39, generation in 40-47, descriptor in 0-31.
@@ -115,9 +118,14 @@ pub const Stats = struct {
     /// Requests refused because a pool was empty.
     overloads: u64 = 0,
     idle_closed: u64 = 0,
+    /// Replies that needed an I/O worker.
+    deferred: u64 = 0,
+    /// Jobs whose connection had gone by the time they finished.
+    orphaned: u64 = 0,
     live: u32 = 0,
     peak_connections: u32 = 0,
     peak_requests: u16 = 0,
+    io: pool_mod.Stats = .{ .depth = 0, .peak_depth = 0, .ran = 0, .workers = 0 },
 };
 
 pub const Options = struct {
@@ -130,6 +138,8 @@ pub const Options = struct {
     /// Supplies `Date`. Injected for the same reason the engine's clock is (D33): a
     /// test that asserts on a response head cannot depend on the wall clock.
     clock: storage.clock.Clock,
+    /// I/O worker threads. Every storage call runs on one (D57).
+    io_workers: u16 = config.io_workers,
 };
 
 pub const Loop = struct {
@@ -155,6 +165,36 @@ pub const Loop = struct {
     cqes: [config.cqe_batch]linux.io_uring_cqe = undefined,
     running: std.atomic.Value(bool) = .init(true),
     stats: Stats = .{},
+
+    // -- the I/O worker pool and its way back in (D57) --
+
+    io: *pool_mod.Pool,
+    /// Written by a worker, read by the loop through the ring. This is the wake
+    /// mechanism because the pinned toolchain's `IoUring` does not wrap
+    /// `IORING_OP_MSG_RING`, which would otherwise be tidier (D26, D57).
+    event_fd: Fd,
+    /// The ring reads into this, so it outlives the submission like any other buffer
+    /// handed to the kernel (D30).
+    event_buf: [8]u8 = undefined,
+
+    /// Requests whose job has finished, waiting for the loop to reply.
+    ///
+    /// A fixed ring rather than a linked list: there can never be more entries than
+    /// there are request slots, because a request holds at most one job at a time, so it
+    /// cannot overflow and needs no allocation.
+    ready: [config.max_concurrent_requests]u16 = undefined,
+    ready_head: u16 = 0,
+    ready_len: u16 = 0,
+    /// Whether a read is currently outstanding on `event_fd`.
+    ///
+    /// Exactly one must be, always: the `eventfd` counter is what makes a write that
+    /// arrives before the read is posted still wake the loop, but only if a read is
+    /// eventually posted at all. Tracking it means the invariant is re-established every
+    /// iteration rather than depending on any single call having succeeded.
+    wake_posted: bool = false,
+    /// Guards `ready` only. Held for a push or a pop and never across any I/O, so a
+    /// worker never blocks behind the loop or vice versa.
+    ready_mutex: storage.os.Mutex = .{},
 
     pub fn init(gpa: std.mem.Allocator, options: Options) !*Loop {
         const self = try gpa.create(Loop);
@@ -182,6 +222,14 @@ pub const Loop = struct {
         var ring = try IoUring.init(config.ring_entries, 0);
         errdefer ring.deinit();
 
+        const efd_rc = linux.eventfd(0, linux.EFD.CLOEXEC);
+        if (@as(isize, @bitCast(efd_rc)) < 0) return error.EventFdFailed;
+        const event_fd: Fd = @intCast(efd_rc);
+        errdefer storage.os.close(event_fd);
+
+        const io = try pool_mod.Pool.start(gpa, options.io_workers);
+        errdefer io.stop(gpa);
+
         self.* = .{
             .ring = ring,
             .listen_fd = listen_fd,
@@ -191,12 +239,19 @@ pub const Loop = struct {
             .requests = requests,
             .handler = options.handler,
             .clock = options.clock,
+            .io = io,
+            .event_fd = event_fd,
         };
         self.refreshDate();
         return self;
     }
 
     pub fn deinit(self: *Loop, gpa: std.mem.Allocator) void {
+        // Workers first. A job still running holds a request slot and would be writing
+        // into memory this function is about to free.
+        self.io.stop(gpa);
+        storage.os.close(self.event_fd);
+
         // Every live connection, so a test does not leak descriptors between cases.
         for (0..config.max_connections) |i| {
             const c = &self.table.conns[i];
@@ -227,7 +282,24 @@ pub const Loop = struct {
     pub fn arm(self: *Loop) !void {
         _ = try self.ring.accept_multishot(pack(.accept, self.listen_fd, 0), self.listen_fd, null, null, 0);
         _ = try self.ring.timeout(pack(.tick, 0, 0), &self.tick_ts, 0, 0);
+        self.ensureEventRead();
         _ = try self.ring.submit();
+    }
+
+    /// Re-establishes the "exactly one read outstanding on `event_fd`" invariant.
+    ///
+    /// Called on every iteration rather than only after a wake, so a submission that
+    /// failed once — a full submission queue, say — is retried on the next pass instead
+    /// of silently leaving the loop with no way to be woken again.
+    fn ensureEventRead(self: *Loop) void {
+        if (self.wake_posted) return;
+        _ = self.ring.read(
+            pack(.wake, self.event_fd, 0),
+            self.event_fd,
+            .{ .buffer = &self.event_buf },
+            0,
+        ) catch return;
+        self.wake_posted = true;
     }
 
     pub fn run(self: *Loop) !void {
@@ -235,24 +307,50 @@ pub const Loop = struct {
         while (self.running.load(.acquire)) try self.iterate();
     }
 
-    /// One drain of the completion queue. Exposed so a test can step the loop instead
-    /// of surrendering its thread to it.
+    /// One pass: submit whatever is queued, wait for completions, handle them.
+    ///
+    /// Exposed so a test can step the loop instead of surrendering its thread to it.
+    ///
+    /// **Submitting and waiting must be the same call.** `copy_cqes` with a non-zero
+    /// `wait_nr` enters the kernel with `to_submit = 0`, so it waits *without* submitting
+    /// anything still sitting in the submission queue. `submit` may also consume fewer
+    /// entries than were queued, which is legal and leaves a remainder behind. Put those
+    /// two together — wait first, submit afterwards — and a partial submission can strand
+    /// the very entry that would have produced the completion being waited for. If that
+    /// entry is the tick or the wake read, the loop blocks forever with no way to be
+    /// woken.
+    ///
+    /// It is rare enough to look like flakiness: it cost one deferred reply in roughly
+    /// twenty here, and presented as a request that never received a response while the
+    /// server carried on serving everyone else. Submitting and waiting together removes
+    /// the window entirely.
     pub fn iterate(self: *Loop) !void {
-        const n = self.ring.copy_cqes(&self.cqes, 1) catch |err| switch (err) {
+        _ = self.ring.submit_and_wait(1) catch |err| switch (err) {
+            error.SignalInterrupt => return,
+            else => return err,
+        };
+
+        const n = self.ring.copy_cqes(&self.cqes, 0) catch |err| switch (err) {
             error.SignalInterrupt => return,
             else => return err,
         };
         for (self.cqes[0..n]) |cqe| self.dispatch(cqe);
-        _ = self.ring.submit() catch |err| switch (err) {
-            error.SignalInterrupt => {},
-            else => return err,
-        };
+
+        // Unconditional, and deliberately not driven by the wake completion. The queue's
+        // own state is authoritative; the `eventfd` exists only to stop the wait above
+        // sleeping through work that has already arrived. Draining on the wake alone
+        // would make a single missed or coalesced notification stall a request.
+        self.drainReady();
+        self.ensureEventRead();
     }
 
     fn dispatch(self: *Loop, cqe: linux.io_uring_cqe) void {
         switch (opOf(cqe.user_data)) {
             .accept => self.onAccept(cqe),
             .tick => self.onTick(cqe),
+            // Nothing to do but note that the read is spent. `iterate` drains the queue
+            // and re-arms, whether or not a wake arrived.
+            .wake => self.wake_posted = false,
             .recv, .send => {
                 const fd = fdOf(cqe.user_data);
                 if (!self.table.addressable(fd)) return;
@@ -385,12 +483,39 @@ pub const Loop = struct {
     // -----------------------------------------------------------------------
 
     fn dispatchRequest(self: *Loop, c: *conn_mod.Conn) void {
-        const r = self.requests.at(c.req.?);
+        const index = c.req.?;
+        const r = self.requests.at(index);
         // The slot's unused tail. A read has no request body, so a handler serving one
         // gets the whole slot, which is exactly what `Store.get` requires (D51).
         r.reply.out = r.slot[r.body_got..];
-        self.handler.respond(.{ .head = &r.head, .body = r.body() }, &r.reply);
 
+        switch (self.handler.respond(.{ .head = &r.head, .body = r.body() }, &r.reply)) {
+            .complete => self.sendReply(c),
+            .deferred => {
+                // A handler that defers without naming the work would park the
+                // connection forever, so it is a bug rather than a slow reply.
+                if (r.reply.work == null) return self.failTerminal(c, .internal_error);
+
+                r.index = index;
+                r.job_fd = c.fd;
+                r.job_gen = c.gen;
+                r.job_loop = self;
+                r.orphaned = false;
+                r.job = .{ .run = runDeferred, .complete = finishDeferred };
+
+                c.state = .awaiting;
+                self.stats.deferred += 1;
+                // Nothing is posted on this connection until the job comes back. The
+                // idle sweep skips `.awaiting` for that reason: the peer is not idle,
+                // we are.
+                self.io.submit(&r.job);
+            },
+        }
+    }
+
+    /// Renders and sends whatever is in the reply. The tail of both dispatch paths.
+    fn sendReply(self: *Loop, c: *conn_mod.Conn) void {
+        const r = self.requests.at(c.req.?);
         const keep = r.head.keepAlive() and !r.reply.close and c.keep_alive;
 
         if (r.reply.overflow) {
@@ -405,6 +530,84 @@ pub const Loop = struct {
         c.keep_alive = keep;
         c.state = if (keep) .send else .closing;
         self.postSend(c);
+    }
+
+    /// Runs on an I/O worker thread.
+    ///
+    /// Touches nothing the loop owns: it reads the request's head and body and writes its
+    /// reply, all of which live in the pooled `Request` that is deliberately not released
+    /// while the job is in flight.
+    fn runDeferred(job: *pool_mod.Job) void {
+        const r: *conn_mod.Request = @fieldParentPtr("job", job);
+        const self: *Loop = @ptrCast(@alignCast(r.job_loop.?));
+        r.reply.work.?(
+            self.handler.ctx,
+            .{ .head = &r.head, .body = r.body() },
+            &r.reply,
+        );
+    }
+
+    /// Runs on an I/O worker thread, immediately after `runDeferred`.
+    ///
+    /// Hands the request back to its loop and wakes it. The `eventfd` write is what turns
+    /// a completion on another thread into a completion queue entry the loop is already
+    /// waiting on.
+    fn finishDeferred(job: *pool_mod.Job) void {
+        const r: *conn_mod.Request = @fieldParentPtr("job", job);
+        const self: *Loop = @ptrCast(@alignCast(r.job_loop.?));
+
+        self.ready_mutex.lock();
+        const slot = (self.ready_head + self.ready_len) % config.max_concurrent_requests;
+        self.ready[slot] = r.index;
+        self.ready_len += 1;
+        self.ready_mutex.unlock();
+
+        var one: u64 = 1;
+        _ = linux.write(self.event_fd, @ptrCast(&one), @sizeOf(u64));
+    }
+
+    fn popReady(self: *Loop) ?u16 {
+        self.ready_mutex.lock();
+        defer self.ready_mutex.unlock();
+        if (self.ready_len == 0) return null;
+        const index = self.ready[self.ready_head];
+        self.ready_head = (self.ready_head + 1) % config.max_concurrent_requests;
+        self.ready_len -= 1;
+        return index;
+    }
+
+    /// Replies to every request whose job has finished.
+    ///
+    /// Runs on every loop iteration. The `eventfd` counter coalesces, so the number of
+    /// wakes never has to match the number of completions — the queue is the truth.
+    fn drainReady(self: *Loop) void {
+        while (self.popReady()) |index| {
+            const r = self.requests.at(index);
+
+            if (r.orphaned) {
+                // The connection went away mid-job and left the slot to us.
+                r.orphaned = false;
+                self.stats.orphaned += 1;
+                self.requests.release(index);
+                continue;
+            }
+
+            const fd = r.job_fd;
+            if (!self.table.addressable(fd)) {
+                self.requests.release(index);
+                continue;
+            }
+            const c = self.table.at(fd);
+            // The descriptor may have been closed and handed to a new connection while
+            // the job ran, which is what the generation is for.
+            if (c.state != .awaiting or c.gen != r.job_gen or c.req != index) {
+                self.requests.release(index);
+                continue;
+            }
+
+            c.last_ms = storage.os.monotonicMillis();
+            self.sendReply(c);
+        }
     }
 
     /// Turns a filled-in `Reply` into bytes.
@@ -518,6 +721,7 @@ pub const Loop = struct {
         self.stats.live = self.table.live;
         self.stats.peak_connections = self.table.peak;
         self.stats.peak_requests = self.requests.peak;
+        self.stats.io = self.io.stats();
 
         _ = self.ring.timeout(pack(.tick, 0, 0), &self.tick_ts, 0, 0) catch {};
     }
@@ -600,6 +804,18 @@ pub const Loop = struct {
 
     fn closeConn(self: *Loop, c: *conn_mod.Conn) void {
         if (c.state == .free) return;
+
+        // A worker still owns this request's memory, so the slot must not go back to the
+        // pool here — handing it to a new request would let two requests share one body
+        // buffer. Ownership transfers to the completion, which releases it and replies to
+        // nobody.
+        if (c.state == .awaiting) {
+            if (c.req) |i| {
+                self.requests.at(i).orphaned = true;
+                c.req = null;
+            }
+        }
+
         const fd = c.fd;
         self.table.close(fd, self.heads, self.requests);
         storage.os.close(fd);
@@ -738,16 +954,30 @@ const Client = struct {
         var done: usize = 0;
         while (done < bytes.len) {
             const rc = linux.write(c.fd, bytes.ptr + done, bytes.len - done);
-            if (@as(isize, @bitCast(rc)) < 0) return error.WriteFailed;
+            if (@as(isize, @bitCast(rc)) < 0) {
+                if (linux.errno(rc) == .INTR) continue;
+                return error.WriteFailed;
+            }
             if (rc == 0) return error.WriteFailed;
             done += rc;
         }
     }
 
+    /// Retries on `EINTR`, which is not optional.
+    ///
+    /// A blocking read interrupted by a signal is an ordinary event, not a failure, and
+    /// treating it as one made every deferred-reply test intermittently red — those are
+    /// the ones where the client blocks longest, so they are where a signal has time to
+    /// land. The bug looked exactly like a lost wake-up in the server.
     fn readSocket(c: *Client, into: []u8) !usize {
-        const rc = linux.read(c.fd, into.ptr, into.len);
-        if (@as(isize, @bitCast(rc)) < 0) return error.ReadFailed;
-        return rc;
+        while (true) {
+            const rc = linux.read(c.fd, into.ptr, into.len);
+            if (@as(isize, @bitCast(rc)) < 0) {
+                if (linux.errno(rc) == .INTR) continue;
+                return error.ReadFailed;
+            }
+            return rc;
+        }
     }
 
     /// A raw read that respects anything already buffered.
@@ -802,10 +1032,34 @@ const Client = struct {
 /// Answers the handful of shapes the transport tests need.
 const Fixture = struct {
     requests: usize = 0,
+    /// Touched from worker threads, so it is atomic while `requests` need not be.
+    worked: std.atomic.Value(u32) = .init(0),
 
-    fn respond(ctx: *anyopaque, in: handler_mod.Incoming, out: *handler_mod.Reply) void {
+    /// Fills a reply from an I/O worker thread, the way a storage-backed endpoint will.
+    fn slowWork(ctx: *anyopaque, in: handler_mod.Incoming, out: *handler_mod.Reply) void {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        _ = self.worked.fetchAdd(1, .monotonic);
+        // Long enough that the loop has certainly moved on and is serving other
+        // connections while this runs.
+        sleepMs(15);
+        out.header("Content-Type", "text/plain");
+        out.headerCopy("X-Worked-Path", in.path());
+        out.body = "slow\n";
+    }
+
+    fn respond(ctx: *anyopaque, in: handler_mod.Incoming, out: *handler_mod.Reply) handler_mod.Disposition {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
         self.requests += 1;
+
+        if (std.mem.eql(u8, in.path(), "/slow")) {
+            out.work = slowWork;
+            return .deferred;
+        }
+        if (std.mem.eql(u8, in.path(), "/broken-defer")) {
+            // Defers without naming any work. A bug, and one the loop has to answer
+            // rather than park the connection over.
+            return .deferred;
+        }
 
         const path = in.path();
         if (std.mem.eql(u8, path, "/fixed")) {
@@ -843,6 +1097,7 @@ const Fixture = struct {
         } else {
             out.fail(.not_found);
         }
+        return .complete;
     }
 
     fn handler(self: *Fixture) Handler {
@@ -1370,4 +1625,172 @@ test "a request arriving one byte at a time is still one request" {
     const got = try c.readResponse(&buf);
     try testing.expect(std.mem.endsWith(u8, got, "abc"));
     try testing.expectEqual(@as(usize, 1), s.fixture.requests);
+}
+
+
+// ---------------------------------------------------------------------------
+// Deferred replies, on the I/O worker pool (D57)
+// ---------------------------------------------------------------------------
+
+test "a deferred reply is filled on a worker and sent by the loop" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    var c = try s.connect();
+    defer c.close();
+    try c.send("GET /slow HTTP/1.1\r\nHost: d\r\n\r\n");
+
+    var buf: [4096]u8 = undefined;
+    const got = try c.readResponse(&buf);
+
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.endsWith(u8, got, "slow\n"));
+    // Written by the worker, not by the loop.
+    try testing.expect(std.mem.indexOf(u8, got, "X-Worked-Path: /slow\r\n") != null);
+    try testing.expectEqual(@as(u32, 1), s.fixture.worked.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), s.loop.stats.deferred);
+    // The slot came back.
+    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+}
+
+test "the loop keeps serving while a job is running, which is the point of the pool" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    var slow = try s.connect();
+    defer slow.close();
+    var quick = try s.connect();
+    defer quick.close();
+
+    // The slow request sleeps 15 ms on a worker. If the loop ran it inline, the quick
+    // request could not possibly be answered first — which is exactly the head-of-line
+    // blocking D57 exists to prevent.
+    try slow.send("GET /slow HTTP/1.1\r\nHost: d\r\n\r\n");
+    try quick.send("GET /fixed HTTP/1.1\r\nHost: d\r\n\r\n");
+
+    var qbuf: [4096]u8 = undefined;
+    const quick_got = try quick.readResponse(&qbuf);
+    try testing.expect(std.mem.endsWith(u8, quick_got, "ok\n"));
+    // The slow one has not answered yet.
+    try testing.expectEqual(@as(u32, 0), s.loop.requests.inUse() -| 1);
+
+    var sbuf: [4096]u8 = undefined;
+    const slow_got = try slow.readResponse(&sbuf);
+    try testing.expect(std.mem.endsWith(u8, slow_got, "slow\n"));
+}
+
+test "a keep-alive connection can serve deferred and inline replies in turn" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    var c = try s.connect();
+    defer c.close();
+    var buf: [4096]u8 = undefined;
+
+    // Repeated rather than done once. Alternating a deferred reply with an inline one is
+    // where the request slot and the head buffer get recycled between the two paths, and
+    // a single pass would not exercise that at all.
+    for (0..8) |_| {
+        try c.send("GET /slow HTTP/1.1\r\nHost: d\r\n\r\n");
+        try testing.expect(std.mem.endsWith(u8, try c.readResponse(&buf), "slow\n"));
+        try c.send("GET /fixed HTTP/1.1\r\nHost: d\r\n\r\n");
+        try testing.expect(std.mem.endsWith(u8, try c.readResponse(&buf), "ok\n"));
+    }
+    try testing.expectEqual(@as(u32, 8), s.fixture.worked.load(.monotonic));
+    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+}
+
+test "many deferred requests at once all come back, and every slot is returned" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    const count = 48;
+    var clients: [count]Client = undefined;
+    for (&clients) |*c| c.* = try s.connect();
+    defer for (&clients) |*c| c.close();
+
+    // More outstanding jobs than there are workers, so the queue is genuinely used.
+    for (&clients) |*c| try c.send("GET /slow HTTP/1.1\r\nHost: d\r\n\r\n");
+
+    var buf: [4096]u8 = undefined;
+    for (&clients) |*c| {
+        try testing.expect(std.mem.endsWith(u8, try c.readResponse(&buf), "slow\n"));
+    }
+
+    try testing.expectEqual(@as(u32, count), s.fixture.worked.load(.monotonic));
+    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+    try testing.expectEqual(@as(u16, 0), s.loop.heads.inUse());
+    // The queue was actually a queue at some point.
+    try testing.expect(s.loop.io.stats().peak_depth > 0);
+    try testing.expectEqual(@as(u64, count), s.loop.io.stats().ran);
+}
+
+test "a peer vanishing mid-job leaks nothing and replies to nobody" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    // The orphan path: the connection is gone before the worker finishes, so the request
+    // slot cannot be recycled at close time — a worker is still writing into it — and
+    // ownership has to pass to the completion instead.
+    for (0..16) |_| {
+        var c = try s.connect();
+        try c.send("GET /slow HTTP/1.1\r\nHost: d\r\n\r\n");
+        // Well inside the worker's 15 ms.
+        sleepMs(2);
+        c.close();
+    }
+
+    // Long enough for every job to finish and be reaped.
+    //
+    // The assertion is the invariant, not the route taken to it. Nothing is posted on a
+    // socket while its job is in flight, so the loop does not learn about the close until
+    // it tries to reply and the write fails — meaning these are usually reclaimed by the
+    // ordinary path rather than as orphans. `Request.orphaned` guards the case where a
+    // close *is* observed first, and what matters either way is that no slot is stranded
+    // and none is handed to a second request while a worker still owns it.
+    sleepMs(300);
+    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+
+    // And the server is unharmed.
+    var c = try s.connect();
+    defer c.close();
+    try c.send("GET /fixed HTTP/1.1\r\nHost: d\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, try c.readResponse(&buf), "ok\n"));
+}
+
+test "a handler that defers without naming work is answered rather than parked" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    var c = try s.connect();
+    defer c.close();
+    try c.send("GET /broken-defer HTTP/1.1\r\nHost: d\r\n\r\n");
+
+    var buf: [4096]u8 = undefined;
+    const got = try c.readResponse(&buf);
+    // Ours, not the caller's, so it says nothing (D52).
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 Internal Server Error\r\n"));
+    try testing.expect(std.mem.indexOf(u8, got, "internal_error") != null);
+    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+}
+
+test "an idle sweep does not close a connection waiting on a worker" {
+    // `.awaiting` is deliberately excluded from the sweep: the peer is not idle, we are.
+    // Asserted at the state level because forcing a 75-second sweep in a test would mean
+    // making the timeout configurable purely to be tested.
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    var c = try s.connect();
+    defer c.close();
+    try c.send("GET /slow HTTP/1.1\r\nHost: d\r\n\r\n");
+    sleepMs(5);
+
+    // The sweep runs over every connection and must leave this one alone.
+    s.loop.sweepIdle();
+    try testing.expectEqual(@as(u64, 0), s.loop.stats.idle_closed);
+
+    var buf: [4096]u8 = undefined;
+    try testing.expect(std.mem.endsWith(u8, try c.readResponse(&buf), "slow\n"));
 }

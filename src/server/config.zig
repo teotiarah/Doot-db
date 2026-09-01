@@ -110,6 +110,19 @@ pub const cqe_batch: u32 = 512;
 /// `Store.maintain()` blocks on disk and belongs on its own thread (D45).
 pub const tick_interval_s: u32 = 1;
 
+/// I/O worker threads. Every `Store` call runs on one of these (D57).
+///
+/// Two forces set this. It must be **more than one**, because leader commit only
+/// amortises an `fsync` when a second writer is already waiting for one, and a
+/// single-threaded request path never has one — that is the ~200/s against ~41,000/s D48
+/// measured. And it should not be large, because writes serialise on the engine's single
+/// write lock (D35), so extra threads past a handful only queue against each other.
+///
+/// Eight is a typical core count and comfortably more concurrent writers than leader
+/// commit needs to start batching. Reads, which are the majority, are short and do not
+/// contend at all.
+pub const io_workers: u16 = 8;
+
 /// SSE heartbeat comment interval.
 ///
 /// A ceiling rather than a preference: Cloudflare's Free and Pro proxy read timeout is

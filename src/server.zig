@@ -21,6 +21,7 @@ pub const head = @import("server/head.zig");
 pub const response = @import("server/response.zig");
 pub const conn = @import("server/conn.zig");
 pub const handler = @import("server/handler.zig");
+pub const pool = @import("server/pool.zig");
 pub const loop = @import("server/loop.zig");
 
 pub const Method = head.Method;
@@ -31,6 +32,9 @@ pub const Request = conn.Request;
 pub const Handler = handler.Handler;
 pub const Incoming = handler.Incoming;
 pub const Reply = handler.Reply;
+pub const Disposition = handler.Disposition;
+pub const Pool = pool.Pool;
+pub const Job = pool.Job;
 pub const Loop = loop.Loop;
 pub const Options = loop.Options;
 pub const Stats = loop.Stats;
@@ -42,5 +46,6 @@ test {
     _ = response;
     _ = conn;
     _ = handler;
+    _ = pool;
     _ = loop;
 }

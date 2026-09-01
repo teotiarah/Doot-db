@@ -639,6 +639,28 @@ pub const Store = struct {
         self.last_snapshot_at = self.clock.now();
     }
 
+    /// The last sequence number handed out.
+    ///
+    /// Exists so the layer above does not have to reach through `self.com`, which is
+    /// public for the engine's own tests rather than as an interface (D58). `GET
+    /// /healthz` publishes this.
+    pub fn lastSeq(self: *Store) u64 {
+        return self.com.lastSeq();
+    }
+
+    /// Whether a *new* entry can currently be admitted.
+    ///
+    /// False when the index has reached its configured ceiling. Overwrites and deletes
+    /// continue to work in that state — they consume no additional slot, and deleting
+    /// is how an operator recovers — so this answers "would a new name be refused",
+    /// which is exactly what `GET /healthz` reports on.
+    ///
+    /// Takes all 64 shard locks in turn, so it belongs on an I/O worker like every
+    /// other engine call (D57), not on the event loop.
+    pub fn acceptingWrites(self: *Store) bool {
+        return !self.idx.admissionClosed();
+    }
+
     pub fn stats(self: *Store) Stats {
         return .{
             .index = self.idx.stats(),
