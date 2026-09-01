@@ -2078,6 +2078,88 @@ Rejected: **a configuration file.** D24 settled this and nothing here reopens it
 exactly the crash shape D41 already accepted and documented, so the worst case is one
 already reasoned about rather than a new one.
 
+**M2 amendment — the process layer is a module, `src/boot.zig`.** D63 requires that
+`main.zig` hold no logic, and that requirement needs somewhere for the logic to go. The two
+existing `config.zig` files are constant *mirrors* (working rule 2) and must stay that way —
+neither reads an environment nor makes a policy choice. So a new top-level module, a sibling
+of `service`, named for the layer it is: what turns an environment and a signal into a
+running, stoppable Doot. It owns environment parsing and validation, the maintenance thread,
+signal installation, and the shutdown order — and it is in `zig build test` like every other
+module, which is the whole point of it not being in `main.zig`.
+
+**M2 amendment — shutdown uses `sigaction` and `Loop.stop()`, not a `signalfd` on the
+ring.** D63 chose `signalfd` by analogy with D57's `eventfd`, and reading the transport
+afterwards showed the analogy was wrong. `Loop.stop()` already exists, is one atomic store,
+and is documented "safe from another thread or a signal handler"; `Loop.iterate()` already
+treats `error.SignalInterrupt` from `submit_and_wait` as benign and returns, so a signal
+breaks the wait immediately and `run()`'s next predicate check exits. A handler that calls
+`stop()` therefore needs no new mechanism and does the least a handler can do.
+
+`signalfd` would mean a new `Op` variant, a posted read, and a completion branch **inside
+the loop** — new logic in the transport, for a process-lifecycle concern the transport is
+specified not to know about (D58), to replace a path that already works. The `eventfd` in
+D57 earned its place because there was no other way for a worker thread to wake the ring.
+Here there is.
+
+**M2 amendment — `SIGTERM` and `SIGINT` are blocked in every thread but the one that runs
+the loop.** This is a durability point, not tidiness. Signal disposition is per-process but
+*delivery* is per-thread, so an unblocked `SIGTERM` can land on an I/O worker and return
+`EINTR` from the `fsync` it was in the middle of. The mask is therefore set before
+`Loop.init` starts the worker pool and before the maintenance thread is spawned — both
+inherit it — and unblocked in the main thread only once everything is running. Only the
+thread that can act on the signal can receive it.
+
+**M2 amendment — "drain what is in flight" was too strong, and is corrected.** There is no
+quiesce mode in the transport and this decision does not add one. What is actually
+guaranteed, and it is the part that matters: `Loop.deinit` stops the worker pool first, and a
+pool worker only exits once the queue is empty, so **every storage operation already handed
+to the pool runs to completion before anything is closed or freed.** No `fsync` is cut
+short, and the store is closed after the last one returns.
+
+What is *not* preserved is the reply on the socket: connections still open are force-closed.
+That is the "brief connection reset" `05-architecture.md` already accepts on a beta-labelled
+single-box service, and it is safe for a different reason worth stating — a write whose
+response was lost is still durable, and idempotency (D20) is exactly the mechanism that
+makes the client's retry free and unambiguous. Promising a drain we do not implement would
+be worse than documenting the reset we do.
+
+**M2 amendment — two environment formats, settled rather than left to the code.**
+`DOOT_MAX_TTL` takes the same grammar as `X-Doot-TTL` (D47) — digits with an optional
+single `s`/`m`/`h`/`d` suffix — parsed by the same `api.parse.ttl`. Two lifetime grammars in
+one product is a trap, and the operator-facing one should be the one already documented.
+D47 deliberately performs no range check, so `boot` applies the policy: below
+`storage.config.min_ttl_s` is refused at boot rather than at the first write. No upper bound
+is imposed, because the storage layout derives from this figure (D10) and `01-product.md` is
+explicit that the ceiling moves with observed usage.
+
+`DOOT_HMAC_SECRET` is **exactly 64 lowercase hex characters**, decoded to the 32 bytes
+`api.cursor` signs with. Fixed-length and one encoding, so a truncated paste is refused
+instead of silently becoming a shorter secret — the failure a variable-length or
+"whatever bytes you typed" reading would hide.
+
+**M2 amendment — a maintenance failure is logged and never fatal.** `Store.maintain()` and
+`Control.maintain()` both return errors, and the tempting reading is that a process which
+cannot maintain itself should die. It is the wrong reading. Expiry is authoritative at the
+index and evaluated lazily on every read (`03-data-model.md`), so a failed sweep is a
+deferred sweep and no caller can observe it. A failed snapshot lengthens the next recovery,
+which D38 already frames as a bounded and observable quantity rather than a correctness
+property. Exiting would convert a recoverable, invisible condition into a total outage. The
+thread logs each failure and counts it, and the count is what M5's `/admin/stats` surfaces.
+
+**M2 amendment — logging scope.** D63 ships boot and lifecycle diagnostics on stderr and
+nothing more. The structured per-request JSON log `05-architecture.md` describes stays with
+M5's observability work, because it carries a redaction contract — no bodies, names, API
+keys or codes — that deserves its own pass rather than riding along inside a lifecycle
+decision.
+
+**Accepted consequence: a freshly deployed Doot has no accounts, so it answers `401` to
+everything.** The binary deliberately gains no account-creation path: M3 owns signup, and
+inventing an operator subcommand here would be scaffolding built to be replaced. The
+consequence is real, though — M2's edge slice needs at least one account to point `curl` and
+`ops/sseprobe.py` at, so *how the first account comes into being* is an open question owned
+by whichever of the edge slice or M3 arrives first. It is recorded here rather than answered,
+because answering it now would mean guessing at M3's shape.
+
 ---
 
 ## Deferred

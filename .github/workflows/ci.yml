@@ -85,3 +85,15 @@ jobs:
       # write path is correct.
       - name: M2 data-plane checks
         run: tools/dataplane-check.sh
+
+      # The origin binary, run rather than merely compiled. `src/boot.zig` has unit tests
+      # for the parsing and the maintenance cadence; what they cannot cover is the
+      # composition, which is one function whose behaviour *is* the wiring. This asserts
+      # the three D63 claims that would otherwise rot silently: it refuses to start naming
+      # the variable at fault, SIGTERM exits zero with credits checkpointed, and the
+      # maintenance thread is what produces a snapshot.
+      #
+      # The slowest step in the tree, deliberately: the maintenance interval is a compiled
+      # constant (D45), so waiting for a pass is waiting in real time.
+      - name: M2 origin binary checks
+        run: tools/boot-check.sh
