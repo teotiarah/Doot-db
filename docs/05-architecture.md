@@ -21,6 +21,7 @@ container orchestration.
   │  router → data plane  /v1/*   (API key)       │
   │         → control plane /app/* (session)      │
   │         → dashboard assets (@embedFile)       │
+  │  I/O worker pool (every storage call — D57)   │
   │  storage engine (04-storage.md)               │
   │  control-plane log + in-RAM image (D40)       │
   │  change feed ring → SSE                       │
@@ -128,6 +129,14 @@ this toolchain (D26, D27).
 - **There is no staging buffer and no commit thread** (D34). Records are `pwrite`n on arrival
   and only the `fsync` is batched, by whichever writer needs durability first. Every other
   writer waiting at that moment is covered by the same flush.
+- **No storage call runs on the event loop** (D57). Every `Store` call is handed to a bounded
+  pool of I/O worker threads; the loop does sockets, parsing, routing and authentication,
+  all of which are memory-only. This is not only about latency: leader commit (D34) only
+  batches when there is a second writer waiting, and a single-threaded request path never
+  has one, so an inline `delete` would cap deletes at the ~200/s D48 measured *and* stall
+  every connection pinned to the loop. Completions return to the owning loop through an
+  `eventfd` it keeps a read posted on, because the pinned toolchain does not wrap
+  `IORING_OP_MSG_RING` (D26).
 - Background threads: **maintenance** (expiry sweep, segment reclamation, index shard
   rebuild, snapshot — D45), backup uploader, outbound mail. All off the request path.
 - The event loop's repeating `timeout` SQE fires at **1 s** and does only cheap work:
@@ -304,7 +313,9 @@ Minimal by necessity — no metrics stack means no dependency.
 - `GET /admin/stats` — `DOOT_ADMIN_TOKEN`-authenticated JSON: live entries, index
   utilisation, per-class segment counts, commit latency percentiles, tag traversal hop
   distribution, connection counts, credit and rate-limit rejection counters, backup lag,
-  corruption counter.
+  corruption counter, and **I/O worker queue depth** — the pool is a queue and a full one is
+  backpressure rather than a fault, so it has to be visible as a number instead of inferred
+  from latency (D57).
 
 Four numbers matter most day to day: **index utilisation, disk utilisation, backup lag,
 and recovery time at last restart.** Each has a threshold in `04-storage.md` and each

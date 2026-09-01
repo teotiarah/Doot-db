@@ -1612,7 +1612,171 @@ deployed link alongside the other figures M5 re-measures for the same reason (D4
 
 ---
 
-## Deferred
+## D55 — `Date` is sent on every response · locked
+
+The transport emits `Date` on every response. Neither `05-architecture.md`'s header list
+nor `02-api.md`'s per-endpoint tables enumerated it, which made it an undocumented header
+on a documented surface — worth settling rather than leaving as a diff nobody reviewed.
+
+RFC 9110 requires an origin server with a clock to send `Date` on 2xx, 3xx and 4xx
+responses. Doot has a clock. Omitting it is a spec deviation that costs nothing to fix now
+and is awkward to add later, once clients exist that were built against its absence.
+
+It is **not** part of Doot's own surface. Nothing in the product reads it, no endpoint
+depends on it, and it is deliberately absent from the per-endpoint header tables in
+`02-api.md` for that reason — those tables describe the product's headers. `Date` belongs
+to HTTP, and is documented once, under "Headers on every response".
+
+Cost is nil: the loop formats it once per tick and every response in between borrows the
+result, so no response formats a timestamp. That is what makes it free rather than a
+per-request `clock_gettime` plus a conversion.
+
+**One exception, and it is on the overload path.** The `503` returned when the request-slot
+pool is empty is rendered at compile time, because it is the one reply that must be
+sendable when there is nothing left to build one with. A static constant cannot carry a
+live `Date`. A connection-terminating overload reply is also the case where a missing
+`Date` changes no client and no cache behaviour, so the trade is the right way round.
+
+Rejected: **omitting `Date` everywhere for consistency with the static `503`.** Consistency
+with the degraded path is not a reason to make the normal path non-conforming.
+
+---
+
+## D56 — Plan limits are a table in code, and the paid ceiling stays configuration · locked
+
+`01-product.md` has specified per-tier limits since the beginning, and nothing in code has
+ever consulted them. `Plan` is persisted on the account and read back by `resolveKey`, but
+no code path uses it for policy: there is no rate limit by plan, no maximum lifetime by
+plan, and `storage.config.Options.max_ttl_s` is a single store-wide ceiling.
+
+Three things about to be built need it at once — the pooled rate limit needs a bucket size,
+`GET /v1/whoami` publishes a `limits` object, and `ttl_too_long`'s message promises "the
+maximum for this plan". So the table lands first, in one place.
+
+Resolution: **one table in `src/control/plan.zig`, keyed by `Plan`, mirroring the Tiers
+table in `01-product.md`.** It lives with the control plane because a plan is a property of
+an account, and accounts are the control plane's business. `01-product.md` remains the
+source of the numbers; this is a mirror, in the sense working rule 2 means.
+
+**The paid maximum lifetime is not in the table, deliberately.** `01-product.md` is explicit
+that the 30-day figure "is a starting point, not a commitment", that it "moves with observed
+usage", and that **nothing may hardcode it** — it is `DOOT_MAX_TTL`, and the storage layout
+derives from it. So the table carries the trial's 14 days, which *is* a product constant,
+and the paid ceiling resolves to whatever the store is configured for. There are therefore
+two ceilings, and the effective one is the lower:
+
+- the **engine** ceiling, `Options.max_ttl_s`, which class 3's bound derives from (D10)
+- the **plan** ceiling, from this table
+
+A plan ceiling above the engine's would be a limit the storage layout cannot honour, so it
+is asserted rather than silently clamped.
+
+Rejected: **putting the table in `server/config.zig` beside the transport constants.** Those
+are properties of the process; these are properties of a customer.
+
+Rejected: **deriving the rate limit from the plan at each call site.** That is how the same
+number ends up written three times and disagreeing after the first change.
+
+---
+
+## D57 — Storage calls never run on the event loop · locked
+
+The engine's public calls block, and the amount they block by is not small:
+
+- `Store.delete` takes the one global write lock, appends a tombstone, and then waits in
+  `awaitDurable` — an `fsync` wait.
+- `Store.list` performs up to `tag_hop_budget` record reads. That bound is 500.
+- `Store.get` performs one or two `pread`s per candidate.
+
+Running these on the event-loop thread is not merely a latency question. **It makes D34
+inert.** Leader commit's entire benefit is that the first writer needing durability performs
+the flush and every writer waiting at that moment is covered by it — and a single-threaded
+request path never has a second writer waiting. D48 measured exactly this from the other
+end: ~200 writes/s on a persistent volume against ~41,000/s on tmpfs, "because a
+single-threaded workload gives every write its own flush leader with nobody to piggyback".
+So an inline `delete` would cap deletes at roughly 200/s *and* stall every connection
+pinned to the loop for the duration of each one. A cold-cache `list` walking its full hop
+budget is tens of milliseconds of head-of-line blocking in front of unrelated requests.
+
+Resolution: **a bounded pool of I/O worker threads owns every `Store` call.** The event loop
+does sockets, parsing, routing and authentication — all of which are memory-only — and
+nothing that can touch a disk.
+
+The rule is deliberately **uniform**: every storage call goes to the pool, including `get`.
+A boundary drawn at "calls fast enough to run inline" requires a judgement about each one,
+and that judgement rots the first time a call gains a slow path nobody re-checked. The
+handoff costs microseconds against a request whose network round trip is measured in tens
+of milliseconds (`05-architecture.md`), so uniformity is nearly free.
+
+It also gives the pool a second job: it is what supplies leader commit with concurrent
+writers, so D34 starts working as designed rather than degrading to one flush per write.
+
+Rejected: **running storage inline on the loop.** Costed above.
+
+Rejected: **one event loop per core instead of a pool** — the `SO_REUSEPORT` item already in
+Deferred. It would give leader commit its writers, and it is the model `05-architecture.md`
+describes, but it multiplies the transport's fixed reservation by the core count: the
+107 MB in D28's amendment becomes roughly 856 MB at eight loops, because each loop needs its
+own connection table spanning the descriptor space and its own slot pool. It also leaves a
+blocking call stalling 1/N of connections rather than none, and ties storage concurrency to
+core count rather than to disk behaviour. Single-loop throughput is ~100× any plausible
+demand (D27), so there is no throughput reason to pay that. It stays deferred, on the
+grounds it was already deferred on.
+
+Rejected: **acknowledging a delete before it is durable.** `204` would become a claim a
+crash could contradict, and M1's first exit condition is that nothing acknowledged is lost
+and nothing deleted resurrects. Free at the till is not free of meaning.
+
+**Mechanism: a per-loop `eventfd`.** The loop keeps a `read` posted on it; a worker pushes a
+finished job onto that loop's completion queue and writes to the `eventfd`; the read
+completes and the loop drains the queue. `IORING_OP_MSG_RING` is the tidier mechanism and
+the deployment kernel has it, but the pinned toolchain's `IoUring` does not wrap it, and
+D26's standing rule is that the pin is not worked around casually. This is the same class of
+gap as D27's, handled the same way: use what the pin supports, and record why.
+
+Handing a request between threads is safe because of a property the transport already has
+for another reason: requests live in a pool addressed **by index, not by pointer** (D28
+amendment), so nothing a job refers to moves when the job crosses a thread boundary.
+
+**Accepted consequence: the pool is a queue, and a queue can fill.** When every worker is
+busy, storage-bound requests wait. That is correct behaviour — it is backpressure, and it is
+what stops a slow disk from being absorbed as unbounded memory — but queue depth becomes a
+number that must be visible in `/admin/stats` rather than inferred from latency.
+
+---
+
+## D58 — The service layer, and the engine surface it is allowed to touch · locked
+
+The router, API-key authentication, the pooled rate-limit bucket and the endpoint handlers
+need to know both what an entry is and what an HTTP path is. Nothing existing may hold both.
+
+- `src/api/` is specified as pure functions over request bytes — "no allocation, no clock,
+  no I/O, no sockets". Handlers need all four.
+- `src/server/` is specified as knowing nothing about entries, accounts or credits. The
+  `Handler` seam exists precisely to keep it that way, and putting routing behind it would
+  make the seam decorative.
+
+Resolution: **a new module, `src/service/`.** It is the composition layer, and the only place
+that imports `storage`, `control`, `api` and `server` together. The naming follows the
+existing modules, which are named for the layer they are rather than what they contain.
+
+**It may not reach into the engine's internals.** `GET /healthz` needs the current sequence
+number and whether writes are being admitted, and today both are reachable only as
+`store.com.lastSeq()` and `store.idx.admissionClosed()` — through fields that are public so
+the engine's own tests can drive them, not as an interface. Reaching through them from
+another module would make every future change to the engine's internals a change to the API
+surface. `Store` gains two accessors instead, and the service layer uses those.
+
+**The rate-limit bucket lives on the account, in `Control`.** Not in the service layer and
+not per connection: a bucket per worker or per connection multiplies the limit, which is the
+same failure D6 rejected per-key buckets for. `Control` already serialises every per-account
+mutation behind one mutex — `spendCredit` is the precedent — and a bucket is one more
+mutation of the same kind, so it needs no new lock and inherits the property that made
+credits safe.
+
+Rejected: **a `service` module that also owns the transport.** The split earned itself: the
+transport's 104 tests run without a store, a control log or an account existing, and folding
+the two together would cost that.
 
 | item | trigger to reopen |
 |---|---|
