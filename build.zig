@@ -43,6 +43,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ---- data plane (M2: router, authentication, rate limiting, the endpoints) ----
+    // The composition layer, and the only module that imports all four below it (D58).
+    const service = b.addModule("service", .{
+        .root_source_file = b.path("src/service.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "storage", .module = storage },
+            .{ .name = "control", .module = control },
+            .{ .name = "api", .module = api },
+            .{ .name = "server", .module = server },
+        },
+    });
+
     // ---- unit tests ----
     const test_step = b.step("test", "Run unit tests");
 
@@ -53,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .{ "control-tests", control },
         .{ "api-tests", api },
         .{ "server-tests", server },
+        .{ "service-tests", service },
     }) |t| {
         const unit_tests = b.addTest(.{ .name = t[0], .root_module = t[1] });
         const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -92,6 +107,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(transport);
+
+    // ---- M2 data-plane harness ----
+    // The real service over a real store, so curl can exercise the endpoints.
+    const dataplane = b.addExecutable(.{
+        .name = "dataplane",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/dataplane.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "storage", .module = storage },
+                .{ .name = "control", .module = control },
+                .{ .name = "server", .module = server },
+                .{ .name = "service", .module = service },
+            },
+        }),
+    });
+    b.installArtifact(dataplane);
 
     const verify_step = b.step("verify", "Build the exit-condition harnesses");
     verify_step.dependOn(b.getInstallStep());

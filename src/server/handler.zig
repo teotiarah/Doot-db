@@ -29,6 +29,14 @@ pub const max_reply_headers = 16;
 /// Scratch for header values the handler formats rather than borrows.
 pub const reply_scratch_bytes = 1024;
 
+/// Space for whatever a handler needs to carry from the loop to an I/O worker.
+///
+/// Sized for the largest of those: a list needs a 40-byte traversal cursor plus a tag,
+/// and a read or delete needs a decoded name, which is up to 256 bytes
+/// (`03-data-model.md`). Cheap either way — it sits inside a pooled `Request` that is
+/// already 260 KiB.
+pub const work_ctx_bytes = 384;
+
 /// Whether a reply is ready to send, or still needs work that must not run on the event
 /// loop.
 ///
@@ -104,6 +112,15 @@ pub const Reply = struct {
     /// connection state, no ring, no statistics.
     work: ?*const fn (ctx: *anyopaque, in: Incoming, out: *Reply) void = null,
 
+    /// Scratch the handler owns across a deferral. The transport never reads it.
+    ///
+    /// It exists so that everything cheap happens on the loop and only the disk happens
+    /// on the worker. Authenticating a key, decoding a name and validating a cursor are
+    /// all memory-only, so they run before deferring — and the results have to survive
+    /// the hop to the worker somehow. Re-deriving them there would mean the same request
+    /// being authenticated and validated twice, by two code paths that could drift.
+    work_ctx: [work_ctx_bytes]u8 align(8) = undefined,
+
     /// Set instead of a status to answer from the error catalogue. The transport
     /// renders the uniform JSON body and picks the status, so no handler restates
     /// either.
@@ -124,6 +141,17 @@ pub const Reply = struct {
     /// than sending a response that is quietly missing a header, because a missing
     /// `X-Doot-Credits-Remaining` is a billing question nobody can answer afterwards.
     overflow: bool = false,
+
+    /// Typed view of `work_ctx`.
+    ///
+    /// Deliberately not cleared by `reset`: it is only ever read by the same handler that
+    /// wrote it, in the same request, and zeroing 384 bytes per request to no purpose
+    /// would be a cost paid on every request for the benefit of none.
+    pub fn workCtx(r: *Reply, comptime T: type) *T {
+        comptime std.debug.assert(@sizeOf(T) <= work_ctx_bytes);
+        comptime std.debug.assert(@alignOf(T) <= 8);
+        return @ptrCast(@alignCast(&r.work_ctx));
+    }
 
     pub fn reset(r: *Reply) void {
         r.status = 200;

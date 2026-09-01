@@ -472,6 +472,24 @@ pub const Control = struct {
         return @intFromFloat(@ceil(wanted / per_second));
     }
 
+    /// One key by id, for `GET /v1/whoami` to report which key was presented.
+    ///
+    /// Keyed by id rather than by hash, because the request path already resolved the
+    /// hash and carries the id — looking it up by digest again would mean hashing the
+    /// caller's key a second time to answer a question we already know the answer to.
+    ///
+    /// `label` borrows the store's copy, owned for the key's lifetime, like `Account.email`.
+    pub fn key(self: *Control, key_id: u32) ?ApiKey {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var it = self.keys.valueIterator();
+        while (it.next()) |k| {
+            if (k.id == key_id) return k.*;
+        }
+        return null;
+    }
+
     /// Operator grant. Logged, because a purchase must survive a restart even
     /// though a deduction need not.
     pub fn grantCredits(self: *Control, account_id: u32, additional: u32) Error!u32 {

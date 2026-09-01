@@ -159,6 +159,12 @@ pub const Outbound = struct {
 // The error response
 // ---------------------------------------------------------------------------
 
+/// One response header, for the cases that pass a list rather than writing them in order.
+pub const Field = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const ErrorOptions = struct {
     code: Code,
     /// `null` uses the catalogue's default. Handlers that can name the offending
@@ -172,6 +178,13 @@ pub const ErrorOptions = struct {
     retry_after_s: ?u32 = null,
     /// `405` carries this (`02-api.md`).
     allow: ?[]const u8 = null,
+    /// Headers the handler set before failing.
+    ///
+    /// Error responses carry these too, which is not a detail: `02-api.md` puts the three
+    /// `RateLimit-*` headers on **every** `/v1` response, and the response a caller most
+    /// needs them on is the `429`. Dropping them on the error path would leave a throttled
+    /// client unable to see its own budget.
+    extra: []const Field = &.{},
 };
 
 /// Writes a complete error response — the uniform JSON body from `api.errors` plus its
@@ -186,6 +199,7 @@ pub fn writeError(o: ErrorOptions, head_buf: []u8, body_buf: []u8) Error!Outboun
     var w = Writer.init(head_buf);
     try w.statusOf(o.code);
     try w.header("Date", o.date);
+    for (o.extra) |f| try w.header(f.name, f.value);
     try w.header("Content-Type", "application/json");
     try w.headerInt("Content-Length", body.len);
     if (o.retry_after_s) |secs| try w.headerInt("Retry-After", secs);
@@ -234,6 +248,26 @@ pub fn httpDate(unix_seconds: u64, out: *[http_date_len]u8) []const u8 {
         secs_of_day / 3600,
         (secs_of_day % 3600) / 60,
         secs_of_day % 60,
+    }) catch unreachable;
+    return out;
+}
+
+/// Length of `2026-08-30T20:41:07Z`.
+pub const timestamp_len = 20;
+
+/// Formats unix seconds as the timestamp shape `02-api.md` publishes.
+///
+/// Distinct from `httpDate`, which is the protocol's format. This one is the *product's*:
+/// `X-Doot-Created-At`, `X-Doot-Expires-At` and the list and `whoami` bodies all use it.
+/// RFC 3339 with a `Z` offset, seconds precision, because entry lifetimes are stored to
+/// the second (`03-data-model.md`) and a fractional part would imply precision that is
+/// not there.
+pub fn timestamp(unix_seconds: u64, out: *[timestamp_len]u8) []const u8 {
+    const civil = civilFromDays(unix_seconds / 86_400);
+    const s = unix_seconds % 86_400;
+    _ = std.fmt.bufPrint(out, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        civil.year, civil.month, civil.day,
+        s / 3600,   (s % 3600) / 60, s % 60,
     }) catch unreachable;
     return out;
 }
@@ -465,6 +499,44 @@ test "an error response is the catalogue shape with its head" {
     // The declared length is the body's actual length, which is what a keep-alive
     // client uses to find the end of this response and the start of the next.
     try testing.expectEqual(@as(usize, 120), o.body.len);
+}
+
+test "an error response carries the handler's headers too" {
+    // Regression. These were dropped on the error path, which meant a `429` — the one
+    // response where a caller most needs to see its budget — arrived without the
+    // `RateLimit-*` trio that `02-api.md` puts on every `/v1` response.
+    var head_buf: [config.max_response_head_bytes]u8 = undefined;
+    var body_buf: [api.errors.max_body_bytes]u8 = undefined;
+
+    const o = try writeError(.{
+        .code = .rate_limited,
+        .date = "Mon, 31 Aug 2026 12:00:00 GMT",
+        .keep_alive = true,
+        .retry_after_s = 34,
+        .extra = &.{
+            .{ .name = "RateLimit-Limit", .value = "100" },
+            .{ .name = "RateLimit-Remaining", .value = "0" },
+            .{ .name = "RateLimit-Reset", .value = "60" },
+        },
+    }, &head_buf, &body_buf);
+
+    try testing.expect(std.mem.indexOf(u8, o.head, "RateLimit-Limit: 100\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, o.head, "RateLimit-Remaining: 0\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, o.head, "RateLimit-Reset: 60\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, o.head, "Retry-After: 34\r\n") != null);
+    // And the body is still the catalogue's.
+    try testing.expect(std.mem.indexOf(u8, o.body, "\"code\":\"rate_limited\"") != null);
+}
+
+test "an error response's extra headers cannot inject" {
+    var head_buf: [config.max_response_head_bytes]u8 = undefined;
+    var body_buf: [api.errors.max_body_bytes]u8 = undefined;
+    try testing.expectError(error.InvalidHeader, writeError(.{
+        .code = .not_found,
+        .date = "Mon, 31 Aug 2026 12:00:00 GMT",
+        .keep_alive = true,
+        .extra = &.{.{ .name = "X-Bad", .value = "a\r\nX-Injected: yes" }},
+    }, &head_buf, &body_buf));
 }
 
 test "429 carries Retry-After and 405 carries Allow" {

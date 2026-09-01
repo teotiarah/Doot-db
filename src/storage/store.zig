@@ -91,6 +91,21 @@ pub const Got = struct {
     created_at: u32,
     expires_at: u32,
     tag_count: u8,
+    /// The entry's tags, in the order they were written.
+    ///
+    /// A fixed array rather than a slice of one, deliberately. The decoder writes tags
+    /// into a caller-supplied array, and M1 lost time to `record.decode` leaving a tag
+    /// slice aimed at a stack frame that had already gone — so the texts borrow `buf`
+    /// like `body` does, and the array that holds them lives in the `Got` the caller
+    /// owns rather than anywhere that can go out of scope first.
+    ///
+    /// `02-api.md` puts these on a read as `X-Doot-Tags`, which is why a count alone is
+    /// not enough.
+    tag_texts: [config.max_tags][]const u8 = @splat(&.{}),
+
+    pub fn tags(g: *const Got) []const []const u8 {
+        return g.tag_texts[0..g.tag_count];
+    }
 };
 
 pub const Stats = struct {
@@ -531,7 +546,7 @@ pub const Store = struct {
             if (rec.account_id != account_id or !std.mem.eql(u8, rec.name, name)) continue;
             if (rec.tombstone or rec.expires_at <= now) return null;
 
-            return .{
+            var got: Got = .{
                 .seq = rec.seq,
                 .body = rec.body,
                 .content_type = rec.content_type,
@@ -539,6 +554,11 @@ pub const Store = struct {
                 .expires_at = rec.expires_at,
                 .tag_count = @intCast(rec.tags.len),
             };
+            // Copied out of `tags`, which is this function's stack array. The texts
+            // themselves point into `buf` and so outlive the return; the array holding
+            // them would not.
+            for (rec.tags, 0..) |t, i| got.tag_texts[i] = t.text;
+            return got;
         }
         return null;
     }

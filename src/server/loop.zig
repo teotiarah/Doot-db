@@ -617,6 +617,14 @@ pub const Loop = struct {
     /// framing it is responsible for.
     fn render(self: *Loop, r: *conn_mod.Request, keep_alive: bool) response.Error!response.Outbound {
         if (r.reply.error_code) |code| {
+            // The handler's headers travel with the error too. A `429` that omitted the
+            // `RateLimit-*` trio would be the one response where a caller most needs it
+            // (`02-api.md`). Local, because `writeError` copies the bytes it is given
+            // before this returns.
+            var fields: [handler_mod.max_reply_headers]response.Field = undefined;
+            for (0..r.reply.count) |i| {
+                fields[i] = .{ .name = r.reply.names[i], .value = r.reply.values[i] };
+            }
             return response.writeError(.{
                 .code = code,
                 .message = r.reply.error_message,
@@ -624,6 +632,7 @@ pub const Loop = struct {
                 .keep_alive = keep_alive,
                 .retry_after_s = r.reply.retry_after_s,
                 .allow = r.reply.allow,
+                .extra = fields[0..r.reply.count],
             }, &r.resp_head, &r.err_body);
         }
 
@@ -631,9 +640,12 @@ pub const Loop = struct {
         try w.status(r.reply.status, r.reply.reason);
         try w.header("Date", &self.date);
         for (0..r.reply.count) |i| try w.header(r.reply.names[i], r.reply.values[i]);
-        try w.headerInt("Content-Length", r.reply.body.len);
+        // A 204 cannot carry a body, so it does not describe one either. RFC 9110 ends it
+        // at the first empty line; announcing a length of zero is tolerated everywhere but
+        // says something about a body that is not there.
+        if (r.reply.status != 204) try w.headerInt("Content-Length", r.reply.body.len);
         try w.header("Connection", if (keep_alive) "keep-alive" else "close");
-        return .{ .head = try w.finish(), .body = r.reply.body };
+        return .{ .head = try w.finish(), .body = if (r.reply.status == 204) &.{} else r.reply.body };
     }
 
     /// Answers with a catalogue code and closes.
