@@ -374,6 +374,23 @@ pub fn monotonicMillis() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
 }
 
+/// Milliseconds since the unix epoch, for the timestamp embedded in a server-assigned
+/// name.
+///
+/// A third time source, and the carve-out is the same one `monotonicMillis` has: D33
+/// requires that every *expiry and reclamation* decision come from the injected clock, and
+/// this makes none. A ULID's leading 48 bits are part of a name — they exist so a caller
+/// listing dumped webhooks gets chronological order for free (`03-data-model.md`) — and
+/// D47 specifies that ordering to the millisecond, which a seconds-resolution clock cannot
+/// express.
+///
+/// Nothing may read this to decide whether an entry has expired.
+pub fn realtimeMillis() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(@divTrunc(ts.nsec, 1_000_000)));
+}
+
 // ---------------------------------------------------------------------------
 // Mutex
 // ---------------------------------------------------------------------------

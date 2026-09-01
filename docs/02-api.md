@@ -125,7 +125,7 @@ not an error. Note that the count is enforced **after** de-duplication, so
 - `401` bad key · `402` no credits · `413` body too large · `429` rate limited
 - `409` idempotency conflict · `503` origin at capacity
 
-Body is a JSON metadata document (see Metadata shape). Response headers include
+Body is the [metadata document](#metadata-shape). Response headers include
 `X-Doot-Credits-Remaining`.
 
 **Overwrite semantics.** `PUT` replaces the entry *completely* — body, content type,
@@ -159,6 +159,10 @@ header.
 
 - `201 Created`, `Location: /v1/entries/01JBQ2K9XW4V7N8M3PZR6TYAC5`
 
+Body is the [metadata document](#metadata-shape), carrying the assigned name. Always
+`201`: a server-assigned name cannot collide with an existing entry, so there is no
+overwrite case and no `200`.
+
 ```bash
 curl -X POST https://doot.run/v1/entries \
   -H "Authorization: Bearer $DOOT_KEY" \
@@ -169,6 +173,34 @@ curl -X POST https://doot.run/v1/entries \
 ```
 
 ---
+
+## Metadata shape
+
+One entry, described. Returned as the body of a write, and once per entry in a listing.
+
+```json
+{
+  "name": "ci/last-green-sha",
+  "tags": ["ci", "main"],
+  "content_type": "text/plain",
+  "size": 13,
+  "created_at": "2026-08-30T20:41:07Z",
+  "expires_at": "2026-09-06T20:41:07Z"
+}
+```
+
+| field | notes |
+|---|---|
+| `name` | the canonical name — percent-decoded, exactly as it is stored |
+| `tags` | normalised: lowercased, de-duplicated, in the order supplied. `[]` when there are none |
+| `content_type` | as supplied on write, verbatim. `application/octet-stream` when omitted |
+| `size` | body length in bytes |
+| `created_at` | RFC 3339, seconds precision, always `Z`. On an overwrite this is the **new** write's time, because `PUT` replaces the entry completely |
+| `expires_at` | RFC 3339. Always present; every entry has a lifetime |
+
+Timestamps are to the second because lifetimes are stored to the second
+(`03-data-model.md`). There is no `seq` field: sequence numbers are an internal ordering
+detail and appear only in `GET /healthz` (`07-decisions.md` D60).
 
 ## `GET /v1/entries/{name}`
 
@@ -212,6 +244,9 @@ List entry metadata for a tag, newest first. Free.
 **Metadata only. Bodies are never returned by this endpoint.** That bound is what
 makes a free, rate-limited list operation safe: one call can never return megabytes.
 To read bodies, follow up with `GET /v1/entries/{name}`.
+
+Each element of `entries` is the [metadata document](#metadata-shape) — the same shape a
+write returns, so an entry is described identically wherever it appears.
 
 Exactly one tag per request in v1. Multi-tag intersection is deliberately deferred —
 see `07-decisions.md`.

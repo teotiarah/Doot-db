@@ -17,8 +17,12 @@ pub const Route = union(enum) {
     whoami,
     /// `GET /v1/entries?tag=…`
     list,
+    /// `POST /v1/entries` — the server assigns the name.
+    create,
     /// `GET /v1/entries/{name}` — the name still percent-encoded.
     read: []const u8,
+    /// `PUT /v1/entries/{name}`
+    write: []const u8,
     /// `DELETE /v1/entries/{name}`
     remove: []const u8,
 
@@ -39,17 +43,10 @@ pub const Route = union(enum) {
 /// names may be namespaced at all.
 const entries_prefix = "/v1/entries/";
 
-/// `Allow` lists the methods that are **implemented**, not the ones `02-api.md` will
-/// eventually document.
-///
-/// `PUT /v1/entries/{name}` and `POST /v1/entries` are the write path, and the write path
-/// is the next slice — it needs credit accounting and idempotency, neither of which
-/// exists yet. Routing them now would mean answering a documented endpoint with a `500`,
-/// which tells a caller the server is broken rather than that the method is not there. A
-/// `405` with an accurate `Allow` is true at this commit and stays true; these two
-/// constants gain their methods when the handlers do.
-const collection_allow = "GET";
-const entry_allow = "GET, DELETE";
+/// `Allow` lists the methods that are implemented — which, as of the write path, is the
+/// whole published surface.
+const collection_allow = "GET, POST";
+const entry_allow = "GET, PUT, DELETE";
 
 pub fn route(method: Method, path: []const u8) Route {
     if (std.mem.eql(u8, path, "/healthz")) {
@@ -61,6 +58,7 @@ pub fn route(method: Method, path: []const u8) Route {
     if (std.mem.eql(u8, path, "/v1/entries")) {
         return switch (method) {
             .get => .list,
+            .post => .create,
             else => .{ .wrong_method = collection_allow },
         };
     }
@@ -71,6 +69,7 @@ pub fn route(method: Method, path: []const u8) Route {
         const name = path[entries_prefix.len..];
         return switch (method) {
             .get => .{ .read = name },
+            .put => .{ .write = name },
             .delete => .{ .remove = name },
             else => .{ .wrong_method = entry_allow },
         };
@@ -84,25 +83,30 @@ pub fn route(method: Method, path: []const u8) Route {
 
 const testing = std.testing;
 
-test "every implemented endpoint routes" {
+test "every endpoint in the surface table routes" {
     try testing.expectEqual(Route.healthz, route(.get, "/healthz"));
     try testing.expectEqual(Route.whoami, route(.get, "/v1/whoami"));
     try testing.expectEqual(Route.list, route(.get, "/v1/entries"));
+    try testing.expectEqual(Route.create, route(.post, "/v1/entries"));
 
     try testing.expectEqualStrings("a", route(.get, "/v1/entries/a").read);
+    try testing.expectEqualStrings("a", route(.put, "/v1/entries/a").write);
     try testing.expectEqualStrings("a", route(.delete, "/v1/entries/a").remove);
 }
 
-test "the write methods are a 405 with an Allow that does not mention them" {
-    // Honest at this commit rather than aspirational: answering a documented endpoint
-    // with a `500` would say the server is broken instead of that the method is absent.
-    try testing.expectEqualStrings("GET", route(.post, "/v1/entries").wrong_method);
-    try testing.expectEqualStrings("GET, DELETE", route(.put, "/v1/entries/a").wrong_method);
-
-    // And the Allow values never advertise something unroutable.
-    for ([_][]const u8{ "GET", "GET, DELETE" }) |allow| {
-        var it = std.mem.splitSequence(u8, allow, ", ");
-        while (it.next()) |m| try testing.expect(Method.fromToken(m) != .other);
+test "every method an Allow advertises is one that routes" {
+    // The property that keeps `Allow` honest: it may not name a method the router would
+    // answer with another `405`.
+    inline for (.{
+        .{ "/v1/entries", collection_allow },
+        .{ "/v1/entries/a", entry_allow },
+    }) |case| {
+        var it = std.mem.splitSequence(u8, case[1], ", ");
+        while (it.next()) |m| {
+            const method = Method.fromToken(m);
+            try testing.expect(method != .other);
+            try testing.expect(route(method, case[0]) != .wrong_method);
+        }
     }
 }
 
@@ -125,9 +129,9 @@ test "an empty name routes and is rejected later, not here" {
 test "a known path with an unsupported method carries its Allow" {
     try testing.expectEqualStrings("GET", route(.put, "/healthz").wrong_method);
     try testing.expectEqualStrings("GET", route(.delete, "/v1/whoami").wrong_method);
-    try testing.expectEqualStrings("GET", route(.delete, "/v1/entries").wrong_method);
+    try testing.expectEqualStrings("GET, POST", route(.delete, "/v1/entries").wrong_method);
     // An unknown method token routes to the same place.
-    try testing.expectEqualStrings("GET, DELETE", route(.other, "/v1/entries/a").wrong_method);
+    try testing.expectEqualStrings("GET, PUT, DELETE", route(.other, "/v1/entries/a").wrong_method);
 }
 
 test "anything else is unrouted" {
