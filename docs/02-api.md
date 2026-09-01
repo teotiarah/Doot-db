@@ -260,7 +260,7 @@ and for humans to sanity-check a key.
 
 ```json
 {
-  "account_id": "acct_7Q2M9XKV",
+  "account_id": "acct_0000001",
   "email": "someone@example.com",
   "plan": "trial",
   "credits": { "remaining": 9187, "granted": 10000 },
@@ -272,7 +272,7 @@ and for humans to sanity-check a key.
     "default_ttl_seconds": 604800,
     "max_ttl_seconds": 1209600
   },
-  "key": { "id": "key_3F8A", "created_at": "2026-08-30T19:02:44Z" }
+  "key": { "id": "key_0000003", "created_at": "2026-08-30T19:02:44Z" }
 }
 ```
 

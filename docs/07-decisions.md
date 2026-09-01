@@ -1778,6 +1778,42 @@ Rejected: **a `service` module that also owns the transport.** The split earned 
 transport's 104 tests run without a store, a control log or an account existing, and folding
 the two together would cost that.
 
+---
+
+## D59 — Account and key identifiers are Crockford base32, padded · locked
+
+`02-api.md` publishes `"account_id": "acct_7Q2M9XKV"` and `06-auth.md` shows `key_3F8A`,
+and neither says what those strings are. Illustrative was fine until something had to emit
+one: `GET /v1/whoami` returns both, and an identifier on a published response is a format
+callers store, log and compare.
+
+Underneath both are a `u32` — `Account.id` and `ApiKey.id`.
+
+Resolution: **`<prefix>_` followed by the id in uppercase Crockford base32, zero-padded to
+seven characters.** `acct_0000001` for account 1, `key_0000001` for key 1.
+
+Crockford because it is already in the tree — `api/ulid.zig` uses it for server-assigned
+names — and because it excludes `I`, `L`, `O` and `U`, so an identifier read off a screen
+into a support ticket does not arrive as a different one. Seven characters because that is
+what a `u32` needs, so the width never changes and no identifier is ever a prefix of a
+longer one.
+
+Zero-padded rather than variable-width, because unpadded identifiers sort wrongly as text
+and sorting a list of them is the first thing anyone does.
+
+Rejected: **decimal.** It invites arithmetic on an identifier, and `acct_42` reads like a
+row number, which is the one impression an opaque handle should not give.
+
+Rejected: **matching the illustrative examples exactly.** `acct_7Q2M9XKV` is eight
+characters and `key_3F8A` is four, which cannot both be the same encoding at the same
+width. The examples in `02-api.md` and `06-auth.md` are corrected to the real format
+instead, because a published example the implementation contradicts is worse than either
+choice.
+
+---
+
+## Deferred
+
 | item | trigger to reopen |
 |---|---|
 | Multi-tag intersection on list | users asking for it with concrete cases. Cheap to add — walk one chain, filter on the rest — but every query-shaped feature erodes D1 and it should cost a real conversation |
