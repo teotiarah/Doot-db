@@ -94,6 +94,12 @@ boundary is in `07-decisions.md`.
   compression at rest, no JSON validation even when `Content-Type` says JSON.
 - `Content-Type` is stored as supplied, up to 128 bytes, and echoed on read. The
   server never acts on it. The dashboard uses it purely to choose a renderer.
+- **Because it is echoed into a response header, it must be printable US-ASCII**
+  (`0x20`–`0x7E`); anything else is `400 invalid_content_type`. This is the one constraint
+  on an otherwise verbatim field, and it exists because the alternative is a value that can
+  be stored but never read back — a control byte here is refused by the response writer, so
+  without this rule a write could succeed and every later read of it fail (D64). A media
+  type cannot legitimately contain such a byte, so nothing real is excluded.
 
 Opacity is a contract. The moment Doot parses bodies, it acquires opinions about
 their shape, and every one of those opinions becomes a compatibility obligation.
@@ -159,12 +165,13 @@ or malformed request is never allowed to consume resources:
 | 4 | name well-formed | `400 invalid_name` |
 | 5 | tags well-formed, ≤ 5 | `400 invalid_tag` / `too_many_tags` |
 | 6 | `X-Doot-TTL` parseable and within plan bounds | `400 invalid_ttl` / `ttl_too_long` / `ttl_too_short` |
-| 7 | idempotency key checked | `409` or replay |
-| 8 | write credit available | `402` |
-| 9 | origin has capacity | `503` |
-| 10 | body read and appended | `200` / `201` |
+| 7 | `Content-Type` within 128 bytes and printable ASCII | `400 content_type_too_long` / `invalid_content_type` |
+| 8 | idempotency key checked | `409` or replay |
+| 9 | write credit available | `402` |
+| 10 | origin has capacity | `503` |
+| 11 | body read and appended | `200` / `201` |
 
-Credit is deducted at step 8 and refunded if step 10 fails, so a failed write never
+Credit is deducted at step 9 and refunded if step 11 fails, so a failed write never
 costs anything.
 
 The same guarantee holds across a crash, and in one direction only: **a deduction is never

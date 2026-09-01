@@ -217,15 +217,33 @@ decided here, not during M4.
 
 | condition | state |
 |---|---|
-| every error row reproducible by `curl` in CI | **19 of 24 codes.** Five are not asserted by code: `method_not_allowed` and `headers_too_large` are checked by status line only, and `idempotency_in_progress`, `capacity_exhausted` and `internal_error` are not exercised at all |
-| credits and rate limits exact under concurrent load | **not met.** `dataplane-check.sh` is single-threaded and asserts the burst as a bounded range (101 allowed of 140), which is "approximately right" by construction |
+| every error row reproducible by `curl` in CI | **met — all 25 codes.** D65 settled how each of the last five is reached; `invalid_content_type` is the twenty-fifth, added by D64 |
+| credits and rate limits exact under concurrent load | **met.** Exact partitions under real concurrency, with the rate limit asserted against a stopped clock so no token can refill mid-burst (D66) |
 | SSE probe passes through Cloudflare | **not met, and not yet possible.** Needs the live zone |
 
-The first two need no infrastructure — only a concurrent driver and three fault-injection
-paths. `idempotency_in_progress` needs two requests carrying one key in flight at once,
-which a sequential script cannot produce; `capacity_exhausted` needs a store held at its
-capacity ceiling; `internal_error` needs an injected fault. Being unreachable from `curl`
-alone is the reason they were missed, not a reason to leave them.
+The first two are closed by `tools/exactness-check.sh` (28 checks) plus strengthened
+assertions in the two existing scripts, and cost more than expected: reaching them turned up
+**two defects and a specification gap**.
+
+- **D64.** A `Content-Type` carrying a `NUL` or a `CR` was accepted, stored and charged for,
+  and then failed on every read — the entry appeared in its tag listing and no `GET` of it
+  could ever succeed. `03-data-model.md` promised the field was echoed into a header while
+  constraining nothing about its bytes, and the validation-order table did not mention it at
+  all. Now `400 invalid_content_type`, and the order table has the step it was missing.
+- **D67.** An idempotent replay re-read its record into the request slot's *tail*, which is
+  only big enough while the body is under 3,311 bytes. Above that every replay silently
+  re-executed, charged a credit and overwrote the entry — against the published promise that
+  replays are free. Measured at ten body sizes before and after.
+- **D66's amendment.** The intended way to test the rate limit's refill over the wire was a
+  harness handler wrapping the real one. It cannot work: a deferred job is handed the
+  *registered* handler's context, so a decorating handler breaks every deferred reply. The
+  seam is not composable, and now says so.
+
+One limit is stated rather than papered over: **`internal_error` has no client-reachable
+cause.** Every remaining `500` site is a defensive branch on a state a request cannot
+produce, and the one exception was D64. It is reproduced against the transport harness's
+deliberate fault path, which proves the `500`'s wire shape and deliberately not that any
+request can provoke one. A row whose cause is a bug cannot have a script that causes it.
 
 ---
 

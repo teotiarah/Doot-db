@@ -552,6 +552,7 @@ The number this design exists to control. At 10 million live entries on a 16 GB 
 | index | 29 B/entry | 286 MB |
 | tag chain heads | O(tags/account) | ~32 MB |
 | idempotency records | 48 B × 1M, plus an 8 MB index into them (D62) | ~56 MB |
+| replay read buffers | one record-sized buffer per I/O worker, 8 × 262,929 B (D67) | ~2 MB |
 | in-flight request buffers | 256 concurrent × 260 KiB | 65 MB |
 | control-plane image | O(accounts), ~200 B each plus keys and sessions | ~10 MB at 10k accounts |
 | connection state | pooled, 0.63 KB/conn at a 512 B idle read buffer (D28) | ~1.3 MB at 2,000 |
@@ -564,6 +565,13 @@ The in-flight buffer slot is **260 KiB, not 256 KB** (D51). A read has to hold a
 record, and `record.max_record_bytes` is 262,929 — a 256 KB slot is 785 bytes short, which
 would truncate exactly the largest entries the product permits. 266,240 B is the next page
 multiple, and 256 of them is precisely 65 MiB.
+
+**The replay buffers are separate from those slots, and cannot be borrowed from them** (D67).
+An idempotent replay re-reads the record it is reproducing, and the only space a handler has
+inside a slot is the tail left over after the request body — which is large enough for a
+whole record only while the body is under about 3 KB. Sharing the slot therefore made every
+larger replay silently re-execute, charge a credit and overwrite the entry, against a
+published promise that replays are free. Two megabytes buys the promise back.
 
 Roughly **97% of RAM is left to the kernel page cache**, which is exactly right —
 that is where hot bodies belong.

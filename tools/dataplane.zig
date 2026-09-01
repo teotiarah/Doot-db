@@ -36,10 +36,29 @@ const other_key = "doot_live_harness_other_0000000000";
 const rate_key = "doot_live_harness_rate_00000000000";
 /// A fourth with no credits at all, so `402` is reachable without spending ten thousand.
 const broke_key = "doot_live_harness_broke_0000000000";
+/// A fifth with a *small* balance, so the exhaustion boundary is reachable under concurrency
+/// without draining a ten-thousand-credit account one write at a time (D66).
+const scarce_key = "doot_live_harness_scarce_000000000";
+
+/// What `scarce_key` starts with. Small enough to exhaust concurrently, large enough that
+/// "exactly this many succeeded" is a real partition rather than a coin toss.
+const scarce_credits: u32 = 8;
 
 /// Deterministic, so a cursor issued by one run is rejected by the next only because of
 /// its account binding and age rather than because the secret moved.
 const cursor_secret: [32]u8 = @splat(0x5A);
+
+/// Where `--frozen-clock` stops time. A fixed instant, so `Date` and every timestamp the
+/// harness emits are reproducible run to run.
+///
+/// There is deliberately no way to *advance* it. The obvious design — wrapping
+/// `Service.handler()` with one that recognises an extra path — cannot work: the transport
+/// hands a deferred job the **registered** handler's context (`runDeferred` in
+/// `server/loop.zig`), so a decorating handler makes every deferred reply reinterpret the
+/// wrong pointer. See the amendment on D66. Refill over the wire is not worth a second
+/// listener in the harness to reach, and the refill arithmetic is already asserted
+/// deterministically against a manual clock in `control/store.zig`'s own tests.
+const frozen_instant: u32 = 1_788_134_400; // Mon, 31 Aug 2026 00:00:00 GMT
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -48,18 +67,46 @@ pub fn main(init: std.process.Init) !u8 {
     const addr = args.next() orelse "127.0.0.1:0";
     const workdir = args.next() orelse "/tmp/doot_dataplane";
 
+    // Three levers the exactness checks need (D65, D66). Flags rather than positional
+    // arguments, because they are rarely used and each one changes what the harness *is*.
+    var index_bytes: u64 = 0;
+    var frozen = false;
+    var seed_fixtures = true;
+    while (args.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--index-bytes=")) {
+            index_bytes = std.fmt.parseInt(u64, arg["--index-bytes=".len..], 10) catch {
+                std.debug.print("dataplane: --index-bytes needs a number\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--frozen-clock")) {
+            frozen = true;
+        } else if (std.mem.eql(u8, arg, "--no-seed")) {
+            seed_fixtures = false;
+        } else {
+            std.debug.print("dataplane: unknown argument '{s}'\n", .{arg});
+            return 2;
+        }
+    }
+
     var wd_buf: [512]u8 = undefined;
     const wd = try std.fmt.bufPrintZ(&wd_buf, "{s}", .{workdir});
     os.mkdir(os.cwd, wd) catch {};
     const dir_fd = try os.openDir(os.cwd, wd);
     defer os.close(dir_fd);
 
-    var clock = storage.clock.Real{};
+    // A stopped clock is what makes the rate limit exactly assertable: refill is
+    // `elapsed * rate` in whole seconds, so with `elapsed` pinned at zero no token can
+    // ever accrue and a full bucket admits exactly `burst` requests (D66). The instant is
+    // fixed so `Date` is reproducible too. `/frozen/advance?s=` moves it on demand, which
+    // is how the refill *rate* becomes assertable without sleeping.
+    var real = storage.clock.Real{};
+    var manual: storage.clock.Manual = .init(frozen_instant);
+    const clk = if (frozen) manual.clock() else real.clock();
 
-    const store = try storage.Store.open(gpa, dir_fd, clock.clock(), .{});
+    const store = try storage.Store.open(gpa, dir_fd, clk, .{ .max_index_bytes = index_bytes });
     defer store.close();
 
-    const ctl = try control.Control.open(gpa, dir_fd, clock.clock());
+    const ctl = try control.Control.open(gpa, dir_fd, clk);
     defer ctl.close();
 
     // Idempotent across runs: a reopened CONTROL already has these, and issuing a
@@ -88,27 +135,41 @@ pub fn main(init: std.process.Init) !u8 {
         const id = try ctl.createAccount("broke@example.com", .trial, .active, 0);
         _ = try ctl.issueKey(id, "harness-broke", broke_key);
     }
+    if (ctl.resolveKey(scarce_key) == null) {
+        const id = try ctl.createAccount("scarce@example.com", .trial, .active, scarce_credits);
+        _ = try ctl.issueKey(id, "harness-scarce", scarce_key);
+    }
 
-    try seed(store, trial.account_id, other.account_id);
+    // Skipped when the index budget is deliberately tiny: `seed` writes through
+    // `Store.put`, which is exactly what a closed admission window refuses, so seeding
+    // would fail before the harness could serve the `503` it was started to serve (D65).
+    if (seed_fixtures) try seed(store, trial.account_id, other.account_id);
 
     // ~56 MB, so it is allocated once and borrowed rather than embedded (D62).
     const idem = try gpa.create(service.IdempotencyTable);
     defer gpa.destroy(idem);
     idem.init();
 
+    // ~2 MB, one per I/O worker, so a replay of a large body has room to re-read its own
+    // record (D67).
+    const replays = try gpa.create(service.ReplayBuffers);
+    defer gpa.destroy(replays);
+    replays.init();
+
     var svc = service.Service.init(.{
         .store = store,
         .control = ctl,
-        .clock = clock.clock(),
+        .clock = clk,
         .cursor_secret = cursor_secret,
         .max_ttl_s = (storage.config.Options{}).max_ttl_s,
         .idempotency = idem,
+        .replays = replays,
     });
 
     const loop = server.Loop.init(gpa, .{
         .address = addr,
         .handler = svc.handler(),
-        .clock = clock.clock(),
+        .clock = clk,
     }) catch |err| {
         std.debug.print("dataplane: cannot listen on {s}: {s}\n", .{ addr, @errorName(err) });
         return 1;
@@ -121,6 +182,7 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("dataplane: other_key {s}\n", .{other_key});
     std.debug.print("dataplane: rate_key {s}\n", .{rate_key});
     std.debug.print("dataplane: broke_key {s}\n", .{broke_key});
+    std.debug.print("dataplane: scarce_key {s} ({d} credits)\n", .{ scarce_key, scarce_credits });
 
     try loop.run();
     return 0;

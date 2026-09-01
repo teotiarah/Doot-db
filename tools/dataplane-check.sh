@@ -7,11 +7,16 @@
 # Fixture entries are seeded through the engine by the harness, which keeps the read, list,
 # delete and isolation checks independent of whether the write path is correct.
 #
-# Not yet covered, and tracked as M2's outstanding exit conditions in `docs/08-roadmap.md`:
-# the `method_not_allowed` and `headers_too_large` codes (their statuses are checked, the
-# stable codes are not), `idempotency_in_progress`, `capacity_exhausted` and
-# `internal_error`; and credits and the rate limit under genuine concurrency — the burst
-# assertion below is a bounded range, which is "approximately right" by construction.
+# Covered elsewhere, so that each check lives with the harness configuration it needs:
+# `capacity_exhausted`, `idempotency_in_progress`, and credits and the rate limit under
+# genuine concurrency are in `tools/exactness-check.sh`, which drives harnesses started with
+# a tiny index budget and with a stopped clock. `headers_too_large` and `internal_error` are
+# in `tools/transport-check.sh`, where the cases that produce them already live.
+#
+# The rate-limit block near the end of this file asserts a *range*, on purpose: with a
+# running clock a burst that straddles a second boundary earns a refilled token and one that
+# does not, does not. The exact assertion is the frozen-clock one in `exactness-check.sh`
+# (D66); this one is here to prove the limit engages at all against a real clock.
 #
 # Usage: tools/dataplane-check.sh [path-to-dataplane-binary]
 set -uo pipefail
@@ -91,6 +96,20 @@ has "healthz is JSON" "Content-Type: application/json" "$RESP"
 RESP="$($CURL -i -X DELETE "$BASE/healthz")"
 has "healthz refuses other methods" "405 Method Not Allowed" "$RESP"
 has "healthz says which method it allows" "Allow: GET" "$RESP"
+# The code as well as the status (D65). Note this row needs no credentials at all: the
+# healthz method check happens before authentication.
+has "and names the code" '"code":"method_not_allowed"' "$RESP"
+
+# The other two Allow values, on the authenticated routes, so the whole 405 surface is
+# covered rather than just the one path that needs no key.
+RESP="$($CURL -i -X DELETE "${AUTH[@]}" "$BASE/v1/entries")"
+has "DELETE on the collection is 405" "405 Method Not Allowed" "$RESP"
+has "and lists the collection's methods" "Allow: GET, POST" "$RESP"
+has "and names the code" '"code":"method_not_allowed"' "$RESP"
+
+RESP="$($CURL -i -X POST "${AUTH[@]}" --data-binary 'x' "$BASE/v1/entries/ci/last-green-sha")"
+has "POST on an entry is 405" "405 Method Not Allowed" "$RESP"
+has "and lists the entry's methods" "Allow: GET, PUT, DELETE" "$RESP"
 
 # ---------------------------------------------------------------------------
 
@@ -455,6 +474,59 @@ equals "a trailing comma is tolerated" "201" \
 has "an oversized Content-Type is 400" '"code":"content_type_too_long"' \
   "$($CURL -i -X PUT "${AUTH[@]}" -H "Content-Type: $(head -c 200 /dev/zero | tr '\0' 'x')" \
      --data-binary 'x' "$BASE/v1/entries/w/ct")"
+
+# D64: a control byte in Content-Type used to be stored, charged for, and then fail on every
+# read — the entry showed up in its tag listing and no GET of it could ever succeed. It needs
+# a raw socket because curl will not put a NUL or a CR in a header value.
+#
+# The assertion is deliberately in two halves: the write is refused, *and* nothing was
+# stored. A check that only asserted the 400 would still pass if the value were rejected on
+# the way out instead of on the way in, which is the fix this is not.
+POISON="$(python3 - "$PORT" "$TRIAL" <<'PY'
+import socket, sys, time
+
+port, key = int(sys.argv[1]), sys.argv[2]
+
+
+def rt(name: bytes, ctype: bytes, method=b"PUT", body=b"x") -> str:
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    head = (
+        method + b" /v1/entries/" + name + b" HTTP/1.1\r\nHost: d\r\n"
+        b"Authorization: Bearer " + key.encode() + b"\r\n"
+        b"X-Doot-TTL: 1h\r\n"
+    )
+    if ctype is not None:
+        head += b"Content-Type: " + ctype + b"\r\n"
+    if method == b"PUT":
+        head += b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    else:
+        head += b"\r\n"
+    s.sendall(head)
+    time.sleep(0.4)
+    out = s.recv(700)
+    s.close()
+    return out.decode("latin1", "replace")
+
+
+# Written with a NUL, then a CR, then read back to prove neither landed.
+print("NUL_PUT", rt(b"poison/nul", b"text/plain\x00evil").split("\r\n")[0])
+print("NUL_BODY", "invalid_content_type" in rt(b"poison/nul", b"text/plain\x00evil"))
+print("NUL_GET", rt(b"poison/nul", None, method=b"GET").split("\r\n")[0])
+print("CR_PUT", rt(b"poison/cr", b"text/plain\revil").split("\r\n")[0])
+print("CR_GET", rt(b"poison/cr", None, method=b"GET").split("\r\n")[0])
+# A high byte is refused too: the rule is printable ASCII, not "not the three bad ones".
+print("HIGH_PUT", rt(b"poison/high", b"text/plain\xc3\xa9").split("\r\n")[0])
+# And an ordinary parameterised media type still works, so the rule is not overreaching.
+print("OK_PUT", rt(b"poison/fine", b"text/plain; charset=utf-8").split("\r\n")[0])
+PY
+)"
+has "a NUL in Content-Type is refused" "NUL_PUT HTTP/1.1 400 Bad Request" "$POISON"
+has "and names the new code" "NUL_BODY True" "$POISON"
+has "and the entry was never stored" "NUL_GET HTTP/1.1 404 Not Found" "$POISON"
+has "a CR in Content-Type is refused" "CR_PUT HTTP/1.1 400 Bad Request" "$POISON"
+has "and that entry was never stored either" "CR_GET HTTP/1.1 404 Not Found" "$POISON"
+has "a byte above ASCII is refused" "HIGH_PUT HTTP/1.1 400 Bad Request" "$POISON"
+has "a parameterised media type is still accepted" "OK_PUT HTTP/1.1 201 Created" "$POISON"
 
 # A write with no Content-Length never reaches routing: the transport refuses it first,
 # because that header is what lets an oversized upload be rejected before it is read.

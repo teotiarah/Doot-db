@@ -23,6 +23,32 @@ pub const Error = error{
 };
 
 // ---------------------------------------------------------------------------
+// Content-Type
+// ---------------------------------------------------------------------------
+
+/// Whether every byte is printable US-ASCII, `0x20`–`0x7E`.
+///
+/// Used on `Content-Type`, which `03-data-model.md` stores verbatim and echoes into a
+/// response header on read. That pair of promises is only keepable if the value is
+/// something a header can carry: `response.headerSafe` refuses `CR`, `LF` and `NUL`,
+/// so without this check a write succeeds, charges a credit, and produces an entry
+/// whose every subsequent read is a `500` (D64).
+///
+/// Deliberately stricter than the three bytes the response writer rejects. A media
+/// type is `token "/" token` under RFC 9110 and cannot legitimately hold a control
+/// byte, a `DEL`, or anything above `0x7F` — and a rule stated in terms of what the
+/// field *is* does not quietly reopen when the writer's prohibitions change.
+///
+/// An empty slice is printable by this definition. Absent and empty content types are
+/// the caller's business, not this predicate's.
+pub fn printableAscii(text: []const u8) bool {
+    for (text) |c| {
+        if (c < 0x20 or c > 0x7E) return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // X-Doot-TTL
 // ---------------------------------------------------------------------------
 
@@ -452,4 +478,58 @@ test "a bearer token is extracted, and anything else is not a credential" {
     // No other mechanism exists for the data plane.
     try testing.expectEqual(@as(?[]const u8, null), bearer("Basic dXNlcjpwYXNz"));
     try testing.expectEqual(@as(?[]const u8, null), bearer("doot_live_abc"));
+}
+
+
+// ---------------------------------------------------------------------------
+// Content-Type (D64)
+// ---------------------------------------------------------------------------
+
+test "ordinary media types are printable" {
+    for ([_][]const u8{
+        "text/plain",
+        "application/json",
+        "application/octet-stream",
+        "text/plain; charset=utf-8",
+        "multipart/form-data; boundary=----abc123",
+        "application/vnd.api+json",
+        "",
+    }) |ct| {
+        try std.testing.expect(printableAscii(ct));
+    }
+}
+
+test "the bytes that made an entry unreadable are refused" {
+    // The three the response writer rejects, which is the defect D64 closes: each of
+    // these was stored happily and then failed on every read.
+    try std.testing.expect(!printableAscii("text/plain\x00evil"));
+    try std.testing.expect(!printableAscii("text/plain\revil"));
+    try std.testing.expect(!printableAscii("text/plain\nevil"));
+    // Leading and embedded, not only trailing.
+    try std.testing.expect(!printableAscii("\x00text/plain"));
+    try std.testing.expect(!printableAscii("text/\x00plain"));
+}
+
+test "every control byte, DEL, and everything above ASCII is refused" {
+    var b: u16 = 0;
+    while (b <= 0xFF) : (b += 1) {
+        const c: u8 = @intCast(b);
+        const one = [_]u8{c};
+        const want = c >= 0x20 and c <= 0x7E;
+        try std.testing.expectEqual(want, printableAscii(&one));
+    }
+}
+
+test "the boundaries are inclusive" {
+    try std.testing.expect(printableAscii(" ")); // 0x20
+    try std.testing.expect(printableAscii("~")); // 0x7E
+    try std.testing.expect(!printableAscii("\x1F"));
+    try std.testing.expect(!printableAscii("\x7F"));
+    try std.testing.expect(!printableAscii("\x80"));
+}
+
+test "tab is refused, because a media type has no use for one" {
+    // Legal in an HTTP field value, but not in a media type — and accepting it would
+    // mean the stored value depends on which whitespace the caller happened to send.
+    try std.testing.expect(!printableAscii("text/plain\tx"));
 }
