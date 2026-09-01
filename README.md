@@ -52,11 +52,30 @@ Full reasoning in [`docs/00-vision.md`](docs/00-vision.md).
 
 ## Status
 
-**Storage engine built and verified. No HTTP yet.**
+**Storage engine and data plane both built and verified. Not yet deployable.**
 
-M0 retired the risky assumptions before any product code existed. M1 is the storage
-engine: records, lifetime-class segments, the index, on-disk tag chains, group commit,
-and snapshot-plus-tail recovery — with all five exit conditions measured.
+M0 retired the risky assumptions before any product code existed. M1 built the storage
+engine: records, lifetime-class segments, the index, on-disk tag chains, group commit, and
+snapshot-plus-tail recovery — with all five exit conditions measured. M2 has built the data
+plane on top of it: HTTP/1.1 on the io_uring ring, an I/O worker pool every storage call
+goes through, the append-only control-plane log, and **all seven endpoints, with credits,
+the pooled rate limit, idempotency and signed cursors** — all exercised by `curl` rather
+than only by a client of our own.
+
+What is left of M2 is the part that makes it run somewhere:
+
+| | state |
+|---|---|
+| M0 — retire the unknowns | complete, except the Cloudflare half of the SSE question, which needs a live zone |
+| M1 — storage engine | complete, five exit conditions measured |
+| M2 — data plane | endpoints, credits, rate limit, idempotency: **complete and verified over HTTP** |
+| M2 — origin binary | **outstanding.** `src/` is libraries and harnesses; there is no `doot` yet, so the maintenance thread D45 locked has nowhere to run (D63) |
+| M2 — SSE and the edge | **outstanding.** The change feed ring is built and published to; nothing consumes it. Origin TLS and the Cloudflare zone gate on infrastructure that does not exist yet |
+| M3–M6 | not started |
+
+Two of M2's exit conditions are not met yet and are the next thing after the binary: five
+rows of the error catalogue are not reproduced by a `curl` check in CI, and credits and the
+rate limit are verified single-threaded rather than exact under concurrent load.
 
 | | measured on one 8-core box |
 |---|---|
@@ -71,20 +90,34 @@ Recovery is a warm-page-cache figure and says so: it moves with the filesystem, 
 number the operational lever derives from gets re-measured on the deployed volume in M5
 (D48).
 
-111 unit tests plus an exit-condition harness, both run by CI on every push:
+**404 unit tests plus four harnesses, all run by CI on every push:**
 
 ```bash
-zig build test
-zig build verify && ./zig-out/bin/m1 all /dev/shm/doot-m1
+tools/vocab-check.sh                                    # D2 vocabulary rule
+zig build test                                          # 404 unit tests
+zig build verify && ./zig-out/bin/m1 all /dev/shm/doot-m1  # 5 M1 exit conditions
+tools/transport-check.sh                                # 44 curl checks
+tools/dataplane-check.sh                                # 145 curl checks
 ```
 
-Nine decisions were corrected or added by actually building the thing — including the
-discovery that the crash harness, in its first form, could not detect a missing `fsync`
-at all. See [`docs/07-decisions.md`](docs/07-decisions.md) D26–D39.
+`m1 all` runs the recovery check at its 300,000-record default, which measures the replay
+rate but is a tenth of the five-minute tail the exit condition names. The 3,000,000-record
+figure in the table above comes from asking for that scale explicitly:
 
-**M2's decisions are settled and its code is not written.** Twelve more (D40–D51) fix where
-control-plane state lives, whether idempotency survives a restart, and one silent data-loss
-path in how the index hash key was going to be configured.
+```bash
+./zig-out/bin/m1 recovery /dev/shm/doot-m1 3000000
+```
+
+Whether CI should run the full scale belongs with the other exit-condition work, and is
+recorded rather than quietly closed.
+
+**Decisions, and what building the thing changed.** Nine were corrected or added by M1 —
+including the discovery that the crash harness, in its first form, could not detect a
+missing `fsync` at all (D26–D39). M2 settled twelve before writing any data-plane code
+(D40–D51), one of which caught a silent, unrecoverable data-loss path while the index hash
+key was still a line in an environment-variable list. Building the data plane then forced
+twelve more (D52–D63), each settled in its own pass before the code it governs. See
+[`docs/07-decisions.md`](docs/07-decisions.md).
 
 Doot runs on a single machine and makes a best-effort durability promise, not a
 guarantee. Data is backed up off-box continuously with a recovery point of a few minutes.
@@ -119,7 +152,7 @@ Three directories outside `docs/` are permanent:
 | | |
 |---|---|
 | [`toolchain/`](toolchain/) | pinned Zig version, hash, and the stdlib patch it requires. `toolchain/setup.sh` builds the environment from scratch |
-| [`tools/`](tools/) | the M1 exit-condition harness, its crash subject, and the vocabulary check |
+| [`tools/`](tools/) | the M1 exit-condition harness and its crash subject, the transport and data-plane harnesses with the `curl` check scripts that drive them, and the vocabulary check |
 | [`ops/`](ops/) | deployment artifacts. The SSE verification probe today; the Cloudflare zone configuration in M2 |
 
 `spikes/` held the M0 validation code and was deleted at M1 as always intended. The findings

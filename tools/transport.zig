@@ -11,7 +11,9 @@
 //! and whether `Expect: 100-continue` was honoured — and it stalls a full second when
 //! it was not, which is a bug our own client would never notice.
 //!
-//! No storage, no accounts, no router. Those arrive in the next slice.
+//! No storage, no accounts, no router — and that is permanent, not a stage. They exist now
+//! in `src/service/` and are driven by `tools/dataplane.zig`; keeping them out of here is
+//! what lets the transport's framing be tested with nothing else able to explain a failure.
 //!
 //!   transport [listen-addr]        default 127.0.0.1:0
 //!
@@ -51,8 +53,8 @@ const Fixture = struct {
             out.body = "bye\n";
             out.close = true;
         } else if (std.mem.eql(u8, path, "/big")) {
-            // Filled into the transport-supplied buffer, which is what a record read
-            // will do in the next slice.
+            // Filled into the transport-supplied buffer, which is what a record read does
+            // in the data plane.
             const n = requested(in, out.out.len);
             for (out.out[0..n], 0..) |*b, i| b.* = @intCast('A' + (i % 26));
             out.header("Content-Type", "application/octet-stream");

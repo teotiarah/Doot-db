@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Data-plane checks against a client we did not write (M2 Pass 2, slice 2).
+# Data-plane checks against a client we did not write (M2 Pass 2).
 #
-# Covers the five free endpoints, authentication, the pooled rate limit, and account
-# isolation. The write endpoints are the next slice and are expected to answer `405` with
-# an `Allow` that does not mention them, which is asserted here rather than assumed.
+# Covers all seven endpoints, authentication, the pooled rate limit, account isolation,
+# credits, idempotency and the documented write-validation order.
 #
-# Fixture entries are seeded through the engine by the harness, because nothing can be
-# written over HTTP yet — which is the point: read, list and delete are verified in full
-# before the write path exists.
+# Fixture entries are seeded through the engine by the harness, which keeps the read, list,
+# delete and isolation checks independent of whether the write path is correct.
+#
+# Not yet covered, and tracked as M2's outstanding exit conditions in `docs/08-roadmap.md`:
+# the `method_not_allowed` and `headers_too_large` codes (their statuses are checked, the
+# stable codes are not), `idempotency_in_progress`, `capacity_exhausted` and
+# `internal_error`; and credits and the rate limit under genuine concurrency — the burst
+# assertion below is a bounded range, which is "approximately right" by construction.
 #
 # Usage: tools/dataplane-check.sh [path-to-dataplane-binary]
 set -uo pipefail

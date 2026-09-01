@@ -1,12 +1,16 @@
-//! Data-plane harness (M2 Pass 2, slice 2).
+//! Data-plane harness (M2 Pass 2).
 //!
 //! The real `Service` behind the real event loop, over a real `Store` and `Control`, so an
-//! HTTP client we did not write can exercise the five free endpoints end to end.
+//! HTTP client we did not write can exercise all seven endpoints end to end.
 //!
-//! It seeds its fixture entries through `Store.put` directly rather than over HTTP, because
-//! the write endpoints are the next slice. That is the point of seeding through the engine:
-//! the read, list and delete paths can be verified in full before a single byte can be
-//! written through the API.
+//! Fixtures are still seeded through `Store.put` rather than over HTTP, and now for a better
+//! reason than the write path not existing: it keeps the read, list, delete and isolation
+//! checks independent of whether the write path is correct. A write bug should fail the
+//! write checks, not make every read check fail for the wrong reason. It also places another
+//! account's entries without authenticating as that account.
+//!
+//! **This is a fixture, not a server.** It hardcodes its API keys and prints them to stdout.
+//! The deployable binary is `src/main.zig` (D63).
 //!
 //!   dataplane [listen-addr] [workdir]
 //!
@@ -122,8 +126,8 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
-/// Fixture entries, written through the engine because the write endpoints do not exist
-/// yet.
+/// Fixture entries, written through the engine so that the read, list, delete and isolation
+/// checks do not depend on the write path being correct.
 fn seed(store: *storage.Store, account_id: u32, other_id: u32) !void {
     const day = 24 * 60 * 60;
 

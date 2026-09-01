@@ -108,15 +108,24 @@ Zig **0.16.0**, pinned, with the stdlib patch from `toolchain/`. io_uring driven
 **directly** via `std.os.linux.IoUring` — not through `std.Io`, which cannot do it on
 this toolchain (D26, D27).
 
-- One event loop per worker thread, each with its own ring and its own `SO_REUSEPORT`
-  accept socket. No shared accept lock, no thundering herd.
+- **One event loop, with a bounded pool of I/O worker threads behind it** (D57). The loop
+  owns the ring and does only memory-only work — sockets, parsing, routing,
+  authentication; every storage call is handed to a worker. This document previously
+  described one loop per core, each with its own ring and its own `SO_REUSEPORT` accept
+  socket. **D57 rejected that** and it is in the Deferred table: it multiplies the
+  transport's fixed reservation by the core count (107 MB becomes ~856 MB at eight loops),
+  and single-loop throughput is already ~100× any plausible demand (D27). The listener
+  still sets `SO_REUSEPORT`, because it must be set before `bind` and doing so now is what
+  keeps the deferred model a configuration change rather than a rewrite.
 - `accept_multishot` for the listen socket, so the kernel re-arms accepts rather than
   us re-posting one per connection. Re-post only when `IORING_CQE_F_MORE` is clear.
 - **A repeating `timeout` SQE is mandatory.** An otherwise-idle ring blocks forever in
-  `copy_cqes` and no housekeeping runs. The same timer drives expiry sweeps, SSE
-  heartbeats and stats, so it is not overhead.
-- Connections are pinned to the worker that accepted them. Connection state is a plain
-  struct we size ourselves, from a pooled slab — not a fiber with a reserved stack.
+  `copy_cqes` and no housekeeping runs. It drives connection idle timeouts, the `Date`
+  refresh, and the signal that wakes the maintenance thread (D45), so it is not overhead.
+- Connection state is a plain struct we size ourselves, from a pooled slab — not a fiber
+  with a reserved stack. Requests are addressed by index rather than by pointer, which is
+  what lets one cross to an I/O worker and back without anything it refers to moving
+  (D28 amendment, D57).
 - **Accepted sockets are left blocking** (D54). Measured: one thread, and zero `io-wq`
   workers, at 10,000 idle connections, 2,000 half-sent request heads, and 320 responses
   parked mid-write. The ring uses its poll-based retry path rather than handing work to a
@@ -141,8 +150,8 @@ this toolchain (D26, D27).
   rebuild, snapshot — D45), backup uploader, outbound mail. All off the request path.
 - The event loop's repeating `timeout` SQE fires at **1 s** and does only cheap work:
   connection idle timeouts, stats, and signalling the maintenance thread. `Store.maintain()`
-  itself runs on that thread every **60 s**, because it blocks on disk and would otherwise
-  stall every connection pinned to the worker.
+  and `Control.maintain()` both run on that thread every **60 s**, because they block on
+  disk and would otherwise stall every connection the loop is serving (D45, D63).
 
 Driving the ring ourselves is more code than calling `std.Io`, and it is the right
 trade: it is the layer Doot most needs control over, and on Zig 0.16.0 the alternative
@@ -270,10 +279,20 @@ DOOT_ZEPTOMAIL_TOKEN        DOOT_SUPPORT_EMAIL
 DOOT_HMAC_SECRET            DOOT_ADMIN_TOKEN
 ```
 
-The binary refuses to start if any secret is missing or a path is unwritable. Failing
+The binary refuses to start if a secret it uses is missing or a path is unwritable. Failing
 loudly at boot beats discovering it during the first write. `DOOT_MAX_INDEX_BYTES` is
 included in that: without it the index has no ceiling and admission control never engages,
 so it is required rather than defaulted (D43).
+
+**"A secret it uses" is the operative phrase** (D63). The list above is the eventual set,
+and a variable becomes required in the milestone that gains the code reading it — otherwise
+the binary would refuse to start over R2, GitHub and mail credentials for subsystems that do
+not exist yet, which is failing loudly about the wrong thing. As of M2 the required set is
+`DOOT_LISTEN_ADDR`, `DOOT_DATA_DIR`, `DOOT_MAX_INDEX_BYTES` and `DOOT_HMAC_SECRET`; the
+storage-shape variables keep the defaults `04-storage.md` documents. Nothing is defaulted
+where a default would be a hazard: `DOOT_HMAC_SECRET` signs pagination cursors (D46), and a
+fallback value would be a signing secret no operator ever sets and anyone can read in our
+source.
 
 **Two variables were removed rather than left unimplemented.**
 
@@ -293,6 +312,11 @@ than a security one.
 - One `systemd` unit, one binary, one data directory.
 - Deploy is: copy binary, `systemctl restart`. Recovery is under 10 seconds
   (`04-storage.md`), which is the entire restart window.
+- **`SIGTERM` is a graceful shutdown, not a crash** (D63). It stops accepting, drains what
+  is in flight, joins the maintenance thread, then closes the store and the control log —
+  and closing the control log is what checkpoints credit balances (D41). Without it every
+  deploy would rewind every account to its last checkpoint, so the restart path is the
+  reason the shutdown path has to exist rather than a nicety on top of it.
 - Restarts are visible as a brief connection reset. Acceptable and documented on a
   beta-labelled single-box service; pretending otherwise would require a second
   machine.
