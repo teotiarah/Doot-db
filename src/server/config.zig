@@ -110,6 +110,17 @@ pub const cqe_batch: u32 = 512;
 /// `Store.maintain()` blocks on disk and belongs on its own thread (D45).
 pub const tick_interval_s: u32 = 1;
 
+/// How often the maintenance thread runs `Store.maintain()` and `Control.maintain()`.
+///
+/// Sixty seconds rather than every tick, because the sweep is **not** a correctness
+/// mechanism: expiry is authoritative at the index and checked lazily on every read
+/// (`03-data-model.md`), so sweeping only reclaims memory. At 10M entries a full sweep
+/// walks over 14M slots — worth doing once a minute, wasteful once a second (D45).
+///
+/// The thread is woken by the tick above rather than owning a timer, so this is a
+/// threshold the thread checks rather than a sleep it performs (D63).
+pub const maintenance_interval_s: u32 = 60;
+
 /// I/O worker threads. Every `Store` call runs on one of these (D57).
 ///
 /// Two forces set this. It must be **more than one**, because leader commit only

@@ -133,6 +133,26 @@ pub const Stats = struct {
     io: pool_mod.Stats = .{ .depth = 0, .peak_depth = 0, .ran = 0, .workers = 0 },
 };
 
+/// A callback the loop invokes on every tick, after its own housekeeping.
+///
+/// This is the seam D45 needs. `Store.maintain()` blocks on disk and must not run on this
+/// thread, so the maintenance thread parks on a futex and the tick is what wakes it —
+/// which is why `config.tick_interval_s` has always described "signalling the maintenance
+/// thread" as part of the tick's job. Until this existed, that sentence had nothing to be
+/// true through.
+///
+/// It runs on the loop thread, so it must not block and must not touch a disk. Waking a
+/// parked thread is the intended shape and the only use. The loop learns nothing about what
+/// is on the other side, exactly as with `Handler`.
+pub const Tick = struct {
+    ctx: *anyopaque,
+    tickFn: *const fn (ctx: *anyopaque) void,
+
+    pub fn call(self: Tick) void {
+        self.tickFn(self.ctx);
+    }
+};
+
 pub const Options = struct {
     /// Where to listen. Ignored when `listen_fd` is supplied.
     address: []const u8 = "127.0.0.1:0",
@@ -145,6 +165,9 @@ pub const Options = struct {
     clock: storage.clock.Clock,
     /// I/O worker threads. Every storage call runs on one (D57).
     io_workers: u16 = config.io_workers,
+    /// Invoked on every tick. Absent in every harness and in every test that does not
+    /// specifically exercise it, which is why it is optional rather than a required seam.
+    tick: ?Tick = null,
 };
 
 pub const Loop = struct {
@@ -158,6 +181,8 @@ pub const Loop = struct {
 
     handler: Handler,
     clock: storage.clock.Clock,
+    /// Woken once per tick, if a caller asked for it (D45).
+    tick_cb: ?Tick = null,
 
     /// Formatted once per tick, borrowed by every response in between. A response
     /// never formats a timestamp.
@@ -244,6 +269,7 @@ pub const Loop = struct {
             .requests = requests,
             .handler = options.handler,
             .clock = options.clock,
+            .tick_cb = options.tick,
             .io = io,
             .event_fd = event_fd,
         };
@@ -739,6 +765,11 @@ pub const Loop = struct {
         self.stats.peak_connections = self.table.peak;
         self.stats.peak_requests = self.requests.peak;
         self.stats.io = self.io.stats();
+
+        // Last, and after the timer is re-armed below only in the sense that it cannot
+        // fail: waking the maintenance thread is a futex write, so it cannot throw and
+        // cannot block. If it ever grows past that it belongs on its own thread instead.
+        if (self.tick_cb) |t| t.call();
 
         _ = self.ring.timeout(pack(.tick, 0, 0), &self.tick_ts, 0, 0) catch {};
     }
@@ -1810,4 +1841,89 @@ test "an idle sweep does not close a connection waiting on a worker" {
 
     var buf: [4096]u8 = undefined;
     try testing.expect(std.mem.endsWith(u8, try c.readResponse(&buf), "slow\n"));
+}
+
+
+// ---------------------------------------------------------------------------
+// The tick seam (D45, D63)
+// ---------------------------------------------------------------------------
+
+const TickCounter = struct {
+    calls: u32 = 0,
+
+    fn bump(ctx: *anyopaque) void {
+        const self: *TickCounter = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+    }
+
+    fn seam(self: *TickCounter) Tick {
+        return .{ .ctx = self, .tickFn = bump };
+    }
+};
+
+// `onTick` is driven directly rather than by waiting for the timeout SQE, because a test
+// that waits for a real tick costs a second and proves the same thing.
+test "the tick invokes the seam it was given, every time" {
+    const gpa = testing.allocator;
+
+    var fixture: Fixture = .{};
+    var clock: storage.clock.Manual = .init(1_788_134_400);
+    var counter: TickCounter = .{};
+
+    const loop = try Loop.init(gpa, .{
+        .handler = fixture.handler(),
+        .clock = clock.clock(),
+        .tick = counter.seam(),
+    });
+    defer loop.deinit(gpa);
+
+    const cqe = std.mem.zeroes(linux.io_uring_cqe);
+    loop.onTick(cqe);
+    try testing.expectEqual(@as(u32, 1), counter.calls);
+
+    // Every tick, not only the first: the maintenance thread is woken once a second and
+    // decides for itself whether a pass is due (D45).
+    loop.onTick(cqe);
+    loop.onTick(cqe);
+    try testing.expectEqual(@as(u32, 3), counter.calls);
+}
+
+test "a loop without a seam ticks perfectly happily" {
+    const gpa = testing.allocator;
+
+    var fixture: Fixture = .{};
+    var clock: storage.clock.Manual = .init(1_788_134_400);
+
+    // Every harness and every other test in this file is this case, so it is the one that
+    // must not regress.
+    const loop = try Loop.init(gpa, .{
+        .handler = fixture.handler(),
+        .clock = clock.clock(),
+    });
+    defer loop.deinit(gpa);
+
+    try testing.expect(loop.tick_cb == null);
+    loop.onTick(std.mem.zeroes(linux.io_uring_cqe));
+}
+
+test "the tick still does its own housekeeping when a seam is attached" {
+    const gpa = testing.allocator;
+
+    var fixture: Fixture = .{};
+    var clock: storage.clock.Manual = .init(1_788_134_400);
+    var counter: TickCounter = .{};
+
+    const loop = try Loop.init(gpa, .{
+        .handler = fixture.handler(),
+        .clock = clock.clock(),
+        .tick = counter.seam(),
+    });
+    defer loop.deinit(gpa);
+
+    // The `Date` refresh is the observable part, and it must not have been displaced by
+    // the seam call.
+    clock.advance(60);
+    loop.onTick(std.mem.zeroes(linux.io_uring_cqe));
+    try testing.expectEqual(clock.clock().now(), loop.date_second);
+    try testing.expectEqual(@as(u32, 1), counter.calls);
 }

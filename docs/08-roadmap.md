@@ -159,10 +159,12 @@ all in CI.
 - Credit accounting: deduct, refund on failure, `402` on exhaustion
 - Error catalogue with stable codes; HMAC-signed pagination cursors (D46)
 
-### Pass 2 — the origin binary
+### Pass 2 — the origin binary · **COMPLETE**
 
-Decided in D63. Nothing here is new design; it is the missing caller for decisions already
+Decided in D63. Nothing here was new design; it was the missing caller for decisions already
 locked, and it is what turns a set of libraries into something that can be deployed.
+Verified by 23 unit tests over the process layer and 30 `curl`-and-signal checks against the
+running binary (`tools/boot-check.sh`), both in CI.
 
 - `src/main.zig` as a composition root: configuration, `Control`, `Store`, the idempotency
   table, `Service`, the maintenance thread, the `Loop`. No logic that is not already a
@@ -179,6 +181,14 @@ locked, and it is what turns a set of libraries into something that can be deplo
 - Graceful shutdown on `SIGTERM` via `Loop.stop()`, so `Control.close()` checkpoints credits
   instead of every deploy rewinding them (D41). Signals are blocked in every thread but the
   one running the loop, so a `SIGTERM` cannot land on a worker mid-`fsync`
+- `server.Tick`, the seam the loop's tick wakes the maintenance thread through. D45 and
+  `server/config.zig` both described the tick as doing this; until now there was nothing for
+  that to be true through
+
+**Measured on the running binary rather than asserted:** a `SIGTERM` restart preserves a
+credit balance exactly, a `SIGKILL` restart rewinds it to the last checkpoint — which is
+D41's accepted crash shape, and the contrast is what shows the shutdown path is load-bearing
+rather than decorative.
 
 ### Pass 2 — the edge
 
