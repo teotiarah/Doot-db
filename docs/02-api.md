@@ -416,6 +416,7 @@ Uniform JSON body on every non-2xx response:
 | 400 | `ttl_too_short` | below 60 seconds |
 | 400 | `invalid_cursor` | malformed, expired, or issued to another account |
 | 400 | `content_type_too_long` | `Content-Type` over 128 bytes |
+| 400 | `invalid_content_type` | `Content-Type` has bytes outside printable ASCII |
 | 400 | `invalid_request` | malformed request line or headers |
 | 400 | `invalid_limit` | outside 1–100 |
 | 400 | `missing_tag` | list called without `tag` |

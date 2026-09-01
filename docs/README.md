@@ -30,7 +30,7 @@ anywhere durable.
 | **M0 findings** | D26–D31 | what the validation spikes measured, including three places where a spike contradicted an earlier decision |
 | **M1 findings** | D32–D39 | what building the storage engine forced, four of which corrected the specification |
 | **M2 decisions** | D40–D51 | settled before any data-plane code, per the two-pass rule below |
-| **M2 findings** | D52–D63 | what building the data plane forced, each settled in its own pass before the code it governs |
+| **M2 findings** | D52–D66 | what building the data plane forced, each settled in its own pass before the code it governs |
 
 Earlier decisions carry **amendments pointing forward** rather than being silently
 rewritten — D11, D18, D20 and D38 each gained one during M2's decision pass, and D28

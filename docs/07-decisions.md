@@ -2162,6 +2162,198 @@ because answering it now would mean guessing at M3's shape.
 
 ---
 
+## D64 — `Content-Type` is validated, because the specification says it is echoed · locked
+
+Found while closing M2's error-catalogue exit condition, by asking how a client could cause
+a `500`. One can, and the answer is a defect with a receipt:
+
+```
+PUT /v1/entries/poison   Content-Type: text/plain<NUL>evil
+  -> 201 Created, X-Doot-Credits-Remaining: 9999
+
+GET /v1/entries/poison
+  -> 500 internal_error, Connection: close
+```
+
+The write succeeds, **charges a credit**, and the entry is then unreadable for the whole of
+its lifetime. It still appears in its tag listing, because the listing renders the value
+into JSON where `\u0000` is perfectly legal — so the entry is visible, paid for, and
+permanently un-gettable. `CR` behaves identically. `LF` is the only one that fails early,
+and only because it terminates the header line at the parser and never reaches us.
+
+**Two locked statements could not both be true.** `03-data-model.md` says `Content-Type` is
+"stored as supplied, up to 128 bytes, and **echoed on read**", and the response writer
+refuses a header value containing `CR`, `LF` or `NUL` — correctly, because emitting one
+would be response splitting. A field that is echoed into a header must therefore be
+constrained to what a header can carry, and nothing constrained it. The specification's
+validation-order table does not mention content type at all, so this is a gap in the
+specification and not only a missing check.
+
+It is also a hole with a fence already built around it. **Names and tags are validated** and
+reject control bytes today (`invalid_name`, `invalid_tag`) — including a percent-encoded
+`%00` in a name, which is the same smuggling route. Content type was simply the one echoed
+field where only the *length* was ever checked.
+
+Resolution: **`Content-Type` must be printable US-ASCII, `0x20`–`0x7E`.** Anything else is
+`400 invalid_content_type`, checked in the service beside the existing length check.
+
+Printable ASCII rather than merely "not `CR`, `LF` or `NUL`", which is the minimum that
+would fix the symptom. A media type is `token "/" token` with optional parameters under
+RFC 9110 and cannot legitimately contain a control byte, a `DEL`, or a byte above `0x7F`.
+Matching the response writer's exact prohibitions would leave the write path safe only by
+coincidence — safe because of what `headerSafe` happens to reject today, so that tightening
+one and not the other reopens the hole. A rule stated in terms of what a media type *is*
+survives that.
+
+**A new code, `invalid_content_type`, rather than reusing one.** The catalogue already has
+one code per malformed field — `invalid_name`, `invalid_tag`, `invalid_ttl`, `invalid_limit`,
+`invalid_cursor` — and `content_type_too_long` is already the *length* failure for this very
+header. `invalid_request` would be a lie: the request parsed fine. D52 established that
+adding a missing code is the right move rather than overloading a near neighbour.
+
+**Where: the service, at its own step in the documented order.** Not the transport, which
+cannot know the value will be stored and echoed later, and whose job ends at framing. Not
+the engine, which has no concept of a header and correctly treats the field as bytes with a
+length bound — that check stays where it is, as the storage-layer invariant it always was.
+The service is the only layer that knows both that this is HTTP and that this value will
+come back out in a header. `03-data-model.md`'s order table gains the step it never had.
+
+Rejected: **sanitising on the way out** — stripping or replacing the offending bytes when
+rendering the read. It makes `GET` return a content type the caller never sent, which
+contradicts "stored as supplied", and it leaves the bad bytes on disk forever so that every
+future reader has to remember to sanitise too. Validate once at the boundary, not at every
+egress.
+
+Rejected: **returning the entry with a substituted content type** such as
+`application/octet-stream`. Same objection, plus it misrepresents the entry to the
+dashboard, which chooses a renderer from this field.
+
+Rejected: **leaving the read path to `500`.** That is what it does now, and it is the
+behaviour being fixed. A caller must not be able to write something that later fails.
+
+**Accepted consequence: a caller sending a non-ASCII `Content-Type` now gets a `400` where
+it previously got a `201`.** No caller exists — nothing is deployed, there are no accounts
+outside a test fixture — so this is the only moment in the product's life when tightening
+this is free. Waiting would make it a breaking change to a published surface.
+
+**Accepted consequence: entries already written with a poisoned content type stay
+unreadable.** Nothing in the wild holds any, and manufacturing a migration for data that
+exists only in a probe would be ceremony. Stated rather than glossed.
+
+---
+
+## D65 — The five error rows nothing reproduced, and how each one now is · locked
+
+M2's exit condition is "every row of the error table reproducible by a `curl` invocation,
+held in a script that runs in CI". Nineteen of twenty-four codes were. These five were not,
+and they were not for four different reasons, so they get four different answers rather than
+one mechanism stretched over all of them.
+
+**`method_not_allowed` and `headers_too_large` were always reachable.** The checks simply
+asserted the status line and stopped. Every error the transport renders goes through one
+writer, and that writer always emits the JSON body — so the stable code was on the wire the
+whole time and nothing looked at it. `POST /healthz` is a `405` needing no credentials at
+all, and the sixty-fifth header is a `431` however small the head is. The fix is to assert
+the code, not to build anything.
+
+That is worth naming as its own class of gap: **a check that asserts a status without its
+code cannot tell `405 method_not_allowed` from any other `405`**, which is exactly the
+confusion a stable code exists to prevent.
+
+**`capacity_exhausted` needed a harness that can run out of room.** Admission control is
+driven entirely by the index budget: with `max_index_bytes` at zero every shard is unbounded
+and `admissionClosed()` can never return true at any volume. `tools/dataplane.zig` opened
+its store with default options, so the row was unreachable through it by construction — the
+same hazard D43 named, seen from the other side, and the reason `DOOT_MAX_INDEX_BYTES` is
+mandatory in D63.
+
+So the harness gains an index budget it can be told, and the arithmetic makes the trigger
+exact rather than probabilistic: 64 shards, a 20-byte slot and a 7/10 load ceiling mean a
+budget of 1,280 bytes is one slot per shard, and one slot per shard is *already* over the
+ceiling. Admission is closed at boot with zero entries, so `GET /healthz` is a `503` and
+every new-name write is a `503` — with no race and no volume to generate. Overwrites and
+deletes keep working, which is the operator's recovery path and is worth asserting in the
+same breath.
+
+**`idempotency_in_progress` is a race by construction and cannot be anything else.** It
+exists precisely for the window between the loop admitting a write and the worker finishing
+it, so a single sequential request can never see it. D53 already settled how this project
+treats such a claim: assert correctness unconditionally, and observe a scheduling outcome by
+bounded retry.
+
+Applied here that means, on every attempt, an exact partition of the responses: **exactly
+one `201`**, zero `409 idempotency_key_reused`, and every other response either a replay or
+an `in_progress` — all of which must hold whatever the scheduler does. The appearance of
+`in_progress` is the timing-dependent half, so it is retried with a bounded budget and fails
+only if no attempt in the budget ever produces one.
+
+**`internal_error` has no client-reachable cause, and D64 is why.** Every other `500` site
+is a defensive branch on a state the request path cannot produce — an account row vanishing
+mid-request, a writer overflowing a buffer proven to fit. The one exception was the
+poisoned-header bug, and closing it is not negotiable, so the honest position is that a
+client can no longer cause a `500`.
+
+Resolution: **the `500` is reproduced against the transport harness's deliberate fault path,
+not the data plane.** `tools/transport.zig` already exists to answer synthetic requests —
+`/goodbye`, `/big`, `/missing`, `/limited` are all fixtures with no counterpart in the
+product — so a path that fails on purpose is in keeping with what that harness is, and it
+lives in `tools/`, where nothing can reach it in production.
+
+This is stated as a limit rather than a pass: what the check proves is that the `500`'s wire
+shape is correct — status, stable code, `Connection: close` — and **not** that any request
+can provoke one. A row whose cause is "a bug" cannot have a script that causes it, and
+pretending otherwise would mean keeping a production code path whose only purpose is to
+fail.
+
+---
+
+## D66 — "Exact under concurrent load" needs a frozen clock for one half and nothing for the other · locked
+
+The second exit condition is that credits and rate limits are "verified to be exact under
+concurrent load, not approximately right". The existing check is sequential and asserts the
+burst as a range — 101 allowed of 140, against a bound of 100 to 125 — which is
+"approximately right" written down. The two halves are not equally hard, and conflating them
+is why one number was fudged.
+
+**Credits are exact with no help at all.** A balance is spent under one mutex and nothing
+about it depends on time: fire N concurrent writes at an account holding M credits, and
+exactly M return `201`, exactly N − M return `402`, and the final balance is zero. No
+tolerance, no retry, no clock. That is a genuine concurrency assertion and it is available
+today.
+
+**The rate limit is not exact while the clock moves.** The bucket refills by
+`elapsed × rate`, and `elapsed` is in whole seconds, so a burst of requests that happens to
+straddle a second boundary earns a token and a burst that does not, does not. That is the
+entire origin of the range in the existing check. Two ways out:
+
+- compute the tolerance from the measured elapsed time, which is arithmetic in the test
+  reproducing arithmetic in the code, and passes when both are wrong the same way
+- **stop the clock**
+
+Resolution: **the harness gains a frozen clock**, and the rate-limit assertion becomes
+exact: with `elapsed` pinned at zero no token can refill, so spending a full bucket of
+`burst` admits exactly `burst` requests and refuses every one after it. This is D33 applied
+to the transport's clock for the reason D33 gave for the engine's — a property that is
+deterministic should be asserted deterministically, not sampled.
+
+It also makes the *refill* half testable for the first time, by advancing the frozen clock a
+known number of seconds and asserting the exact number of tokens that returns, rather than
+sleeping and hoping.
+
+**Where these live: a separate script.** Each of these checks needs a harness configured
+differently from the one `dataplane-check.sh` drives — a frozen clock, or an index budget of
+1,280 bytes and no fixtures — and a check script that restarts its subject three times with
+three configurations is a script doing two jobs. The two code assertions that need no new
+harness stay where their cases already are, in `dataplane-check.sh` and
+`transport-check.sh`.
+
+Rejected: **`curl --parallel`.** It is the obvious tool and it cannot report the partition
+these assertions need — how many `201`s against how many `402`s, and which response carried
+which code. Counting outcomes is the entire point, so the driver has to be something that
+can count.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
