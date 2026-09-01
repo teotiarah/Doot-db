@@ -922,6 +922,31 @@ test "the interim response is exactly what a waiting client needs" {
 // it. They are in `zig build test` rather than only in a shell script so CI covers
 // them on every push.
 
+/// Waits for the loop to hand every pooled slot back, then asserts that it did.
+///
+/// Reading a response proves the bytes reached the client. It does **not** prove the loop
+/// has reaped the send completion that releases the request slot, because the release
+/// happens after the write is handed to the kernel — so "every slot came back" is true
+/// shortly after the last response rather than at the instant of it.
+///
+/// D53's rule, applied to a pool instead of a flush: the leak is a real property and is
+/// still asserted unconditionally below, but *observing* it needs a bounded wait rather
+/// than one look. Asserted at the instant of the last response it fails roughly one run in
+/// eight when the loop is competing for two cores — which is what CI has, and it did fail
+/// there. An intermittently red suite teaches people to press re-run, which is how a real
+/// regression gets waved through.
+///
+/// Two seconds is far longer than a reap needs and far shorter than a leak takes to
+/// disprove, so the bound distinguishes "slow to release" from "never released".
+fn expectDrained(s: Server) !void {
+    for (0..400) |_| {
+        if (s.loop.requests.inUse() == 0 and s.loop.heads.inUse() == 0) break;
+        sleepMs(5);
+    }
+    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+    try testing.expectEqual(@as(u16, 0), s.loop.heads.inUse());
+}
+
 /// `std.Thread.sleep` no longer exists in Zig 0.16, and the transport goes straight to
 /// the kernel for everything else anyway.
 fn sleepMs(ms: u64) void {
@@ -1560,7 +1585,7 @@ test "a head that outgrows the inline buffer still works, having escalated" {
     try testing.expect(std.mem.endsWith(u8, got, "ok\n"));
     try testing.expect(s.loop.stats.escalations > 0);
     // The tier-2 buffer went back to the pool when the request finished.
-    try testing.expectEqual(@as(u16, 0), s.loop.heads.inUse());
+    try expectDrained(s);
 }
 
 test "Connection: close is honoured, from either side" {
@@ -1631,8 +1656,7 @@ test "many concurrent connections are all served, and all released" {
     try testing.expectEqual(@as(usize, count), s.fixture.requests);
     try testing.expect(s.loop.table.peak >= count);
     // Nothing leaked: every request handed its slot back.
-    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
-    try testing.expectEqual(@as(u16, 0), s.loop.heads.inUse());
+    try expectDrained(s);
 }
 
 test "a peer that vanishes mid-request costs nothing" {
@@ -1655,8 +1679,7 @@ test "a peer that vanishes mid-request costs nothing" {
     var buf: [4096]u8 = undefined;
     try testing.expect(std.mem.endsWith(u8, try c.readResponse(&buf), "ok\n"));
 
-    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
-    try testing.expectEqual(@as(u16, 0), s.loop.heads.inUse());
+    try expectDrained(s);
 }
 
 test "a request arriving one byte at a time is still one request" {
@@ -1698,7 +1721,7 @@ test "a deferred reply is filled on a worker and sent by the loop" {
     try testing.expectEqual(@as(u32, 1), s.fixture.worked.load(.monotonic));
     try testing.expectEqual(@as(u64, 1), s.loop.stats.deferred);
     // The slot came back.
-    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+    try expectDrained(s);
 }
 
 test "the loop keeps serving while a job is running, which is the point of the pool" {
@@ -1719,8 +1742,21 @@ test "the loop keeps serving while a job is running, which is the point of the p
     var qbuf: [4096]u8 = undefined;
     const quick_got = try quick.readResponse(&qbuf);
     try testing.expect(std.mem.endsWith(u8, quick_got, "ok\n"));
-    // The slow one has not answered yet.
-    try testing.expectEqual(@as(u32, 0), s.loop.requests.inUse() -| 1);
+
+    // At most one slot is still held — the slow request's.
+    //
+    // The bounded wait is for the *quick* reply's slot, which is released when the loop
+    // reaps its send completion rather than when the bytes reach the client above. Without
+    // it this reads 2 whenever the loop is behind, which on two cores is often enough to
+    // redden CI. Note the original form, `inUse() -| 1 == 0`, is exactly "at most one" and
+    // was already satisfied by zero, so waiting weakens nothing: the head-of-line property
+    // this test exists for is proved by `quick` being answered at all while `slow` is still
+    // in a worker's hands.
+    for (0..200) |_| {
+        if (s.loop.requests.inUse() <= 1) break;
+        sleepMs(5);
+    }
+    try testing.expect(s.loop.requests.inUse() <= 1);
 
     var sbuf: [4096]u8 = undefined;
     const slow_got = try slow.readResponse(&sbuf);
@@ -1745,7 +1781,7 @@ test "a keep-alive connection can serve deferred and inline replies in turn" {
         try testing.expect(std.mem.endsWith(u8, try c.readResponse(&buf), "ok\n"));
     }
     try testing.expectEqual(@as(u32, 8), s.fixture.worked.load(.monotonic));
-    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+    try expectDrained(s);
 }
 
 test "many deferred requests at once all come back, and every slot is returned" {
@@ -1766,8 +1802,7 @@ test "many deferred requests at once all come back, and every slot is returned" 
     }
 
     try testing.expectEqual(@as(u32, count), s.fixture.worked.load(.monotonic));
-    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
-    try testing.expectEqual(@as(u16, 0), s.loop.heads.inUse());
+    try expectDrained(s);
     // The queue was actually a queue at some point.
     try testing.expect(s.loop.io.stats().peak_depth > 0);
     try testing.expectEqual(@as(u64, count), s.loop.io.stats().ran);
@@ -1796,8 +1831,7 @@ test "a peer vanishing mid-job leaks nothing and replies to nobody" {
     // ordinary path rather than as orphans. `Request.orphaned` guards the case where a
     // close *is* observed first, and what matters either way is that no slot is stranded
     // and none is handed to a second request while a worker still owns it.
-    sleepMs(300);
-    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+    try expectDrained(s);
 
     // And the server is unharmed.
     var c = try s.connect();
@@ -1820,7 +1854,7 @@ test "a handler that defers without naming work is answered rather than parked" 
     // Ours, not the caller's, so it says nothing (D52).
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 Internal Server Error\r\n"));
     try testing.expect(std.mem.indexOf(u8, got, "internal_error") != null);
-    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+    try expectDrained(s);
 }
 
 test "an idle sweep does not close a connection waiting on a worker" {
