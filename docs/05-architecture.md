@@ -21,6 +21,7 @@ container orchestration.
   │  router → data plane  /v1/*   (API key)       │
   │         → control plane /app/* (session)      │
   │         → dashboard assets (@embedFile)       │
+  │  I/O worker pool (every storage call — D57)   │
   │  storage engine (04-storage.md)               │
   │  control-plane log + in-RAM image (D40)       │
   │  change feed ring → SSE                       │
@@ -116,12 +117,26 @@ this toolchain (D26, D27).
   heartbeats and stats, so it is not overhead.
 - Connections are pinned to the worker that accepted them. Connection state is a plain
   struct we size ourselves, from a pooled slab — not a fiber with a reserved stack.
+- **Accepted sockets are left blocking** (D54). Measured: one thread, and zero `io-wq`
+  workers, at 10,000 idle connections, 2,000 half-sent request heads, and 320 responses
+  parked mid-write. The ring uses its poll-based retry path rather than handing work to a
+  kernel worker, so a slow client costs no thread and D27's `std.Io.Threaded` failure —
+  every connection owning a thread — does not recur. `O_NONBLOCK` would buy nothing and
+  would add an `-EAGAIN` re-arm path to the two hottest paths in the process.
 - Index shards (64) are lock-protected, so any worker can serve any read. **Writes take one
   global lock and reads take none** (D35); shard locks protect structure only and are never
   held across disk I/O.
 - **There is no staging buffer and no commit thread** (D34). Records are `pwrite`n on arrival
   and only the `fsync` is batched, by whichever writer needs durability first. Every other
   writer waiting at that moment is covered by the same flush.
+- **No storage call runs on the event loop** (D57). Every `Store` call is handed to a bounded
+  pool of I/O worker threads; the loop does sockets, parsing, routing and authentication,
+  all of which are memory-only. This is not only about latency: leader commit (D34) only
+  batches when there is a second writer waiting, and a single-threaded request path never
+  has one, so an inline `delete` would cap deletes at the ~200/s D48 measured *and* stall
+  every connection pinned to the loop. Completions return to the owning loop through an
+  `eventfd` it keeps a read posted on, because the pinned toolchain does not wrap
+  `IORING_OP_MSG_RING` (D26).
 - Background threads: **maintenance** (expiry sweep, segment reclamation, index shard
   rebuild, snapshot — D45), backup uploader, outbound mail. All off the request path.
 - The event loop's repeating `timeout` SQE fires at **1 s** and does only cheap work:
@@ -163,12 +178,17 @@ Each of these is worth more than any storage micro-optimisation.
   and not 256 KB because a read must hold a whole record, which tops out at 262,929 bytes —
   785 more than a 256 KB slot, and 266,240 is the next page multiple (D51). At around 5M
   entries idle connections would otherwise outweigh the index (`04-storage.md`).
-  Measured at 10,000 idle keep-alive connections (D28): naive allocation costs
-  **8.11 KB/conn (79 MB)**; pooling connection structs into a static array and read
-  buffers into one arena drops that to **2.14 KB/conn (21 MB)** at a 2 KB buffer, and
-  **0.63 KB/conn (6.3 MB)** at 512 B. Resident cost is pages *touched*, not bytes
-  allocated, so the idle read buffer should be small — a request head is capped at 8 KB,
-  but an idle connection needs only enough to notice one starting.
+- **Memory is reserved at startup, so a connection costs nothing to accept.** Three tiers:
+  a descriptor-indexed `Conn` slab carrying a 512-byte inline read buffer, a pooled 8 KB
+  buffer for the occasional head that outgrows it, and the 260 KiB request slots above.
+  Total reservation **107 MB virtual** — 38 MB table, 66 MB slots, 2 MB head buffers — of
+  which **39 MB is resident at boot**, rising to about **93 MB** once traffic has touched
+  every slot. Measured marginal cost at 10,000 idle keep-alive connections: **0 bytes**,
+  with RSS not moving by a single page (D28 amendment). A fixed ceiling known at startup is
+  the point — a per-connection slope is what turns a connection spike into an
+  out-of-memory kill. The idle read buffer is still deliberately small, because resident
+  cost is pages *touched*: a request head is capped at 8 KB, but an idle connection needs
+  only enough to notice one starting.
 - **Bounded request line and header sizes** (8 KB total), rejected early.
 - **No chunked request bodies in v1.** `Content-Length` required on writes; that is
   what lets us reject oversized uploads before reading and keeps buffer sizing static.
@@ -293,7 +313,9 @@ Minimal by necessity — no metrics stack means no dependency.
 - `GET /admin/stats` — `DOOT_ADMIN_TOKEN`-authenticated JSON: live entries, index
   utilisation, per-class segment counts, commit latency percentiles, tag traversal hop
   distribution, connection counts, credit and rate-limit rejection counters, backup lag,
-  corruption counter.
+  corruption counter, and **I/O worker queue depth** — the pool is a queue and a full one is
+  backpressure rather than a fault, so it has to be visible as a number instead of inferred
+  from latency (D57).
 
 Four numbers matter most day to day: **index utilisation, disk utilisation, backup lag,
 and recovery time at last restart.** Each has a threshold in `04-storage.md` and each

@@ -122,7 +122,13 @@ Small, and they come first because they change a file format and a threading con
 ### Pass 2 — the data plane
 
 - HTTP/1.1 with keep-alive, `TCP_NODELAY`, single-`writev` responses,
-  `Expect: 100-continue`, early `413`, bounded header sizes
+  `Expect: 100-continue`, early `413`, bounded header sizes · **done**, and verified against
+  `curl` as well as against our own client
+- The I/O worker pool every storage call goes through, and the `eventfd` its completions
+  come back on (D57). It comes before the endpoints because it is the thing they are built
+  on, and because it is what makes leader commit batch at all
+- Plan limits as a table, so the rate limit, `whoami` and `ttl_too_long` all read the same
+  numbers (D56)
 - Router, API key authentication, per-account pooled token bucket
 - The `CONTROL` log and its in-RAM image (D40, D41)
 - All seven endpoints per `02-api.md`
@@ -215,6 +221,13 @@ written down. Recovery point measured against the claim published in `01-product
 M1's 332 MiB/s was measured on tmpfs, replaying bytes that were already resident, so it is
 an optimistic bound rather than the operational one — and D38 turns that figure into an
 operator-facing lever. This is where the honest number gets established.
+
+**Also on the deployed link: whether to cap `SO_SNDBUF`** (D54). A response parked against
+a slow reader sits in kernel socket memory — up to 260 KiB per connection, outside both the
+65 MB body budget and anything `/admin/stats` can see. Capping bounds it, and disables send
+buffer autotuning in exchange; whether that is free or a throughput ceiling depends on the
+edge-to-origin bandwidth-delay product, which loopback cannot tell us. Same reason as D48:
+the measurement has to happen on the real path.
 
 ---
 

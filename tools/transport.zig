@@ -27,7 +27,7 @@ const Reply = server.handler.Reply;
 
 /// Answers the shapes `transport-check.sh` exercises.
 const Fixture = struct {
-    fn respond(_: *anyopaque, in: Incoming, out: *Reply) void {
+    fn respond(_: *anyopaque, in: Incoming, out: *Reply) server.handler.Disposition {
         const path = in.path();
 
         if (std.mem.eql(u8, path, "/fixed")) {
@@ -68,6 +68,9 @@ const Fixture = struct {
         } else {
             out.fail(.not_found);
         }
+        // Nothing here touches storage, so nothing here needs an I/O worker (D57). The
+        // service harness is where deferred replies get exercised externally.
+        return .complete;
     }
 
     /// `?n=` from the query, clamped to what the reply buffer can hold.

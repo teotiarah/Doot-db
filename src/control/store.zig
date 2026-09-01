@@ -46,6 +46,7 @@
 const std = @import("std");
 const storage = @import("storage");
 const event = @import("event.zig");
+const plan_mod = @import("plan.zig");
 
 const os = storage.os;
 const clock_mod = storage.clock;
@@ -86,6 +87,17 @@ pub const Account = struct {
     state: AccountState,
     /// Owned by the store.
     email: []const u8,
+
+    /// Rate-limit bucket, in tokens. Bookkeeping rather than user-facing state —
+    /// callers read a `RateDecision` from `takeToken` and never touch this.
+    ///
+    /// Starts at zero with `tokens_at` at zero, so the first request sees an elapsed
+    /// time of the whole unix epoch and fills the bucket. That is deliberate: it means
+    /// there is no initialisation to forget at either of the two places an account is
+    /// built, and a replayed account behaves exactly like a fresh one.
+    tokens: f64 = 0,
+    /// When `tokens` was last brought up to date.
+    tokens_at: u32 = 0,
 };
 
 pub const ApiKey = struct {
@@ -388,6 +400,94 @@ pub const Control = struct {
 
         const a = self.accounts.getPtr(account_id) orelse return;
         if (a.credits_remaining < a.credits_granted) a.credits_remaining += 1;
+    }
+
+    /// What the caller learns from asking for a token.
+    ///
+    /// Every field maps onto a header `02-api.md` puts on every `/v1` response, so a
+    /// handler never computes any of this itself.
+    pub const RateDecision = struct {
+        allowed: bool,
+        /// Sustained operations per minute — `RateLimit-Limit`.
+        limit: u32,
+        /// Whole tokens left after this call — `RateLimit-Remaining`.
+        remaining: u32,
+        /// Seconds until the bucket is full again — `RateLimit-Reset`.
+        reset_s: u32,
+        /// Seconds until one token exists. Zero when allowed — `Retry-After` on a `429`.
+        retry_after_s: u32,
+    };
+
+    /// Takes one token from the account's pooled bucket.
+    ///
+    /// **One bucket per account, covering reads, writes, lists and deletes** (D6). Not
+    /// per key: five keys sharing one bucket is the whole point, because a bucket per
+    /// key would let anyone multiply their limit fivefold. Not per connection or per
+    /// worker either, for the same reason (D58).
+    ///
+    /// The dashboard draws on a separate bucket and does not come through here
+    /// (`06-auth.md`); that arrives with the control-plane surface in M3.
+    ///
+    /// Returns `null` only when the account is gone, which a resolved key makes
+    /// impossible in practice.
+    ///
+    /// Time comes from the injected clock, in seconds, for the same reason the engine's
+    /// expiry does (D33): a rate limit whose tests need real elapsed time is a rate
+    /// limit nobody tests. One-second granularity is the right resolution for a
+    /// per-minute quota, and both directions of clock movement are safe — a backwards
+    /// step saturates to no refill, and a forwards jump only ever refills a bucket,
+    /// which errs toward letting the caller through.
+    pub fn takeToken(self: *Control, account_id: u32) ?RateDecision {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const a = self.accounts.getPtr(account_id) orelse return null;
+        const lim = plan_mod.limits(a.plan);
+        const burst: f64 = @floatFromInt(lim.burst);
+        const per_second = lim.refillPerSecond();
+        const now = self.clock.now();
+
+        const elapsed: f64 = @floatFromInt(now -| a.tokens_at);
+        a.tokens = @min(burst, a.tokens + elapsed * per_second);
+        a.tokens_at = now;
+
+        const allowed = a.tokens >= 1.0;
+        if (allowed) a.tokens -= 1.0;
+
+        return .{
+            .allowed = allowed,
+            .limit = lim.rate_per_min,
+            .remaining = @intFromFloat(@floor(a.tokens)),
+            .reset_s = secondsToAccrue(burst - a.tokens, per_second),
+            .retry_after_s = if (allowed) 0 else secondsToAccrue(1.0 - a.tokens, per_second),
+        };
+    }
+
+    /// Whole seconds until `wanted` tokens have accrued, rounded up.
+    ///
+    /// Rounded up because rounding down would advertise a retry that is still too
+    /// early, and a client honouring `Retry-After` would earn a second `429`.
+    fn secondsToAccrue(wanted: f64, per_second: f64) u32 {
+        if (wanted <= 0) return 0;
+        return @intFromFloat(@ceil(wanted / per_second));
+    }
+
+    /// One key by id, for `GET /v1/whoami` to report which key was presented.
+    ///
+    /// Keyed by id rather than by hash, because the request path already resolved the
+    /// hash and carries the id — looking it up by digest again would mean hashing the
+    /// caller's key a second time to answer a question we already know the answer to.
+    ///
+    /// `label` borrows the store's copy, owned for the key's lifetime, like `Account.email`.
+    pub fn key(self: *Control, key_id: u32) ?ApiKey {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var it = self.keys.valueIterator();
+        while (it.next()) |k| {
+            if (k.id == key_id) return k.*;
+        }
+        return null;
     }
 
     /// Operator grant. Logged, because a purchase must survive a restart even
@@ -697,7 +797,7 @@ const H = struct {
     dir_fd: os.Fd = -1,
     mclock: clock_mod.Manual = undefined,
 
-    const start_time: u32 = 1_700_000_000;
+    pub const start_time: u32 = 1_700_000_000;
 
     fn init(seed: u64) !H {
         var h: H = .{};
@@ -1145,4 +1245,221 @@ test "the log lives beside the segments without confusing them" {
     const c = try h.reopen();
     defer c.close();
     try testing.expectEqual(@as(u64, 1), c.stats().accounts);
+}
+
+
+// ---------------------------------------------------------------------------
+// The pooled rate-limit bucket (D6, D58)
+// ---------------------------------------------------------------------------
+
+test "a fresh account starts with a full bucket" {
+    var h = try H.init(40);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    const lim = plan_mod.limits(.trial);
+
+    // The very first request must not be rate limited by an empty bucket — the
+    // zero-initialised state has to read as "full", not as "nothing accrued yet".
+    const first = c.takeToken(id).?;
+    try testing.expect(first.allowed);
+    try testing.expectEqual(lim.rate_per_min, first.limit);
+    try testing.expectEqual(lim.burst - 1, first.remaining);
+    try testing.expectEqual(@as(u32, 0), first.retry_after_s);
+}
+
+test "the burst is spendable at once, and then the bucket is empty" {
+    var h = try H.init(41);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    const burst = plan_mod.limits(.trial).burst;
+
+    // No clock movement at all, so nothing refills: exactly `burst` succeed.
+    for (0..burst) |i| {
+        const d = c.takeToken(id).?;
+        try testing.expect(d.allowed);
+        try testing.expectEqual(burst - 1 - @as(u32, @intCast(i)), d.remaining);
+    }
+
+    const refused = c.takeToken(id).?;
+    try testing.expect(!refused.allowed);
+    try testing.expectEqual(@as(u32, 0), refused.remaining);
+    // A client honouring this must not come back too early, so it rounds up.
+    try testing.expect(refused.retry_after_s >= 1);
+}
+
+test "an empty bucket refills at the sustained rate" {
+    var h = try H.init(42);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    const lim = plan_mod.limits(.trial);
+    for (0..lim.burst) |_| _ = c.takeToken(id);
+    try testing.expect(!c.takeToken(id).?.allowed);
+
+    // Trial refills at 100/60 ≈ 1.667 tokens a second, so one second is enough for one.
+    h.mclock.advance(1);
+    try testing.expect(c.takeToken(id).?.allowed);
+
+    // Six seconds accrues ten tokens; nine of them survive the one taken here.
+    for (0..lim.burst) |_| _ = c.takeToken(id);
+    h.mclock.advance(6);
+    const d = c.takeToken(id).?;
+    try testing.expect(d.allowed);
+    try testing.expectEqual(@as(u32, 9), d.remaining);
+}
+
+test "a full bucket takes exactly the quoted window to refill" {
+    var h = try H.init(43);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    const burst = plan_mod.limits(.trial).burst;
+    for (0..burst) |_| _ = c.takeToken(id);
+
+    // Drained, so reset is the whole window: this is what RateLimit-Reset publishes.
+    const drained = c.takeToken(id).?;
+    try testing.expectEqual(@as(u32, 60), drained.reset_s);
+
+    h.mclock.advance(60);
+    const refilled = c.takeToken(id).?;
+    try testing.expect(refilled.allowed);
+    try testing.expectEqual(burst - 1, refilled.remaining);
+}
+
+test "the bucket never accrues past its burst, however long it idles" {
+    var h = try H.init(44);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    const burst = plan_mod.limits(.trial).burst;
+
+    // A week of idleness must not bank a week of requests.
+    h.mclock.advance(7 * 24 * 60 * 60);
+    const d = c.takeToken(id).?;
+    try testing.expectEqual(burst - 1, d.remaining);
+
+    var allowed: u32 = 1;
+    while (c.takeToken(id).?.allowed) allowed += 1;
+    try testing.expectEqual(burst, allowed);
+}
+
+test "a paid account gets the larger bucket" {
+    var h = try H.init(45);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const trial = try c.createAccount("t@b.co", .trial, .active, 10);
+    const paid = try c.createAccount("p@b.co", .paid, .active, 10);
+
+    try testing.expectEqual(@as(u32, 100), c.takeToken(trial).?.limit);
+    try testing.expectEqual(@as(u32, 500), c.takeToken(paid).?.limit);
+
+    var trial_allowed: u32 = 1;
+    while (c.takeToken(trial).?.allowed) trial_allowed += 1;
+    var paid_allowed: u32 = 1;
+    while (c.takeToken(paid).?.allowed) paid_allowed += 1;
+
+    try testing.expectEqual(@as(u32, 100), trial_allowed);
+    try testing.expectEqual(@as(u32, 500), paid_allowed);
+}
+
+test "all of an account's keys draw on one bucket" {
+    var h = try H.init(46);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    _ = try c.issueKey(id, "one", "doot_live_one");
+    _ = try c.issueKey(id, "two", "doot_live_two");
+
+    // D6's whole point: five keys must not be five times the limit. The bucket is keyed
+    // on the account, so which key resolved is irrelevant.
+    const first = c.resolveKey("doot_live_one").?;
+    const second = c.resolveKey("doot_live_two").?;
+    try testing.expectEqual(first.account_id, second.account_id);
+
+    const burst = plan_mod.limits(.trial).burst;
+    var allowed: u32 = 0;
+    while (c.takeToken(second.account_id).?.allowed) allowed += 1;
+    try testing.expectEqual(burst, allowed);
+}
+
+test "two accounts do not share a bucket" {
+    var h = try H.init(47);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const a = try c.createAccount("a@b.co", .trial, .active, 10);
+    const b = try c.createAccount("b@b.co", .trial, .active, 10);
+
+    while (c.takeToken(a).?.allowed) {}
+    try testing.expect(!c.takeToken(a).?.allowed);
+    // b is untouched.
+    try testing.expect(c.takeToken(b).?.allowed);
+}
+
+test "a clock that steps backwards neither grants tokens nor trips an overflow" {
+    var h = try H.init(48);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    h.mclock.advance(1000);
+    while (c.takeToken(id).?.allowed) {}
+
+    // Wall clock corrections happen. Saturating subtraction makes this no refill rather
+    // than a negative elapsed time, and erring toward refusing is the safe direction.
+    h.mclock.set(H.start_time);
+    try testing.expect(!c.takeToken(id).?.allowed);
+
+    // And the bucket still works once time moves forward again.
+    h.mclock.advance(60);
+    try testing.expect(c.takeToken(id).?.allowed);
+}
+
+test "an unknown account has no bucket" {
+    var h = try H.init(49);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+    try testing.expectEqual(@as(?Control.RateDecision, null), c.takeToken(999));
+}
+
+test "a replayed account's bucket behaves like a fresh one" {
+    var h = try H.init(50);
+    defer h.deinit();
+
+    var id: u32 = 0;
+    {
+        const c = try h.reopen();
+        defer c.close();
+        id = try c.createAccount("a@b.co", .trial, .active, 10);
+        while (c.takeToken(id).?.allowed) {}
+    }
+    {
+        // Bucket state is RAM-only and is not in the log, so a restart hands back a full
+        // bucket. That is the same posture as idempotency state (D42) and errs in the
+        // caller's favour, which is the only direction a rate limit may err on restart.
+        const c = try h.reopen();
+        defer c.close();
+        const d = c.takeToken(id).?;
+        try testing.expect(d.allowed);
+        try testing.expectEqual(plan_mod.limits(.trial).burst - 1, d.remaining);
+    }
 }

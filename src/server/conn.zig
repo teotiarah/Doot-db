@@ -29,6 +29,7 @@ const config = @import("config.zig");
 const head_mod = @import("head.zig");
 const response = @import("response.zig");
 const handler = @import("handler.zig");
+const pool_mod = @import("pool.zig");
 const net = @import("net.zig");
 
 const Fd = net.Fd;
@@ -111,6 +112,30 @@ pub const Request = struct {
     /// arrived alongside it. Anything past this is a pipelined follower.
     consumed: u32 = 0,
 
+    // -- deferred work (D57) --
+
+    /// Storage for the job when this request's reply needs an I/O worker. Embedded, so
+    /// deferring allocates nothing.
+    job: pool_mod.Job = undefined,
+    /// This request's own index in the pool, so a completion arriving on the loop can
+    /// name it without searching.
+    index: u16 = 0,
+    /// The connection the job belongs to, and which incarnation of it. Checked on
+    /// completion, because the descriptor may have been closed and reused while the job
+    /// was running.
+    job_fd: Fd = -1,
+    job_gen: u8 = 0,
+    /// The owning loop, opaque only to keep `conn` from importing `loop`.
+    job_loop: ?*anyopaque = null,
+
+    /// Set when the connection went away while a worker still held this request.
+    ///
+    /// The slot cannot be returned to the pool at that moment: a worker is still writing
+    /// into it, and handing it to a new request would let two requests share a body
+    /// buffer. So ownership transfers to the completion, which releases it and sends
+    /// nothing.
+    orphaned: bool = false,
+
     pub fn body(r: *const Request) []const u8 {
         return r.slot[0..r.body_got];
     }
@@ -134,6 +159,10 @@ pub const State = enum {
     body,
     /// Waiting for the interim `100 Continue` to go out before reading the body.
     continue_sent,
+    /// Handed to an I/O worker; nothing is posted on the socket until it comes back
+    /// (D57). Deliberately not swept for idleness — the connection is not idle, it is
+    /// waiting on us.
+    awaiting,
     /// Writing a response.
     send,
     /// Response written; the connection closes when the send completes.

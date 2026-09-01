@@ -539,6 +539,36 @@ connection", and it argues for keeping the idle read buffer small — a request 
 bounded at 8 KB (`05-architecture.md`) but an *idle* connection needs only enough to
 detect the start of one.
 
+**M2 amendment — the shipped transport's marginal cost is zero, and the table above no
+longer describes it.** Both columns measured a spike that allocated *per connection*, so
+both were per-connection numbers; the question was only which one was smaller. The
+implementation reserves everything at startup instead — a descriptor-indexed `Conn` slab
+plus two pools — so accepting a connection allocates nothing at all. Re-measured against
+`tools/transport` in `ReleaseFast`:
+
+| idle keep-alive connections | RSS | marginal cost |
+|---|---|---|
+| 0 | 39,984 kB | — |
+| 1,000 | 39,984 kB | **0 B/conn** |
+| 2,500 | 39,984 kB | **0 B/conn** |
+| 5,000 | 39,984 kB | **0 B/conn** |
+| 10,000 | 39,984 kB | **0 B/conn** |
+
+Each of those connections had completed a real request and was sitting idle with a
+pending read, which is the state D28 was about. RSS did not move by a single page.
+
+The cost moved rather than vanished, and it is now a **fixed reservation**: 107 MB
+virtual — a 38 MB `Conn` table (65,536 × 616 B), a 66 MB request-slot pool
+(256 × 272,560 B) and a 2 MB head-buffer pool — of which **39 MB is resident at boot**
+because `Table.init` touches every entry, rising to about **93 MB** once traffic has
+touched all 256 slots. Virtual stays at 110 MB throughout.
+
+That trade is the right way round for a single box: a fixed ceiling known at startup
+beats a per-connection slope, because the slope is what turns a connection spike into an
+out-of-memory kill. The 0.63 KB/conn figure keeps its point — the *idle read buffer
+should still be small*, and `idle_read_bytes` is 512 because of it — but it is no longer
+the cost of a connection.
+
 ---
 
 ## D29 — tls.zig pinned at `fe60069`, driven over raw sockets · locked
@@ -1506,6 +1536,282 @@ budget.** Never assert a timing outcome once and call it a property.
 
 ---
 
+## D54 — Accepted sockets stay blocking · locked
+
+Building the transport raised a question the M0 spikes never had to answer, because they
+never wrote a response large enough to stall: **should accepted sockets be `O_NONBLOCK`?**
+
+It is not a stylistic question. io_uring attempts an operation inline, and when it cannot
+complete it either arms an internal poll and retries — cheap — or hands the work to an
+`io-wq` kernel worker thread, which performs it with blocking semantics. If the second
+path is what happens, then a slow client owns a kernel thread for as long as it is slow,
+and that is a milder version of the exact failure D27 rejected `std.Io.Threaded` for:
+"every idle connection permanently owns a pool thread". Reasoning cannot settle which
+path the kernel takes. Measurement can.
+
+Measured against `tools/transport` on the deployment kernel (6.1.180, 8 cores), counting
+threads in `/proc/<pid>/task` and `io-wq` workers by their `iou-` name prefix:
+
+| situation | threads | `io-wq` workers | still serving? |
+|---|---|---|---|
+| idle | 1 | 0 | — |
+| 10,000 idle keep-alive connections | **1** | **0** | yes |
+| 2,000 half-sent request heads (slow loris) | **1** | **0** | yes |
+| 256 stalled 200 KB writes | **1** | **0** | yes, 6 ms |
+| 320 stalled 200 KB writes | **1** | **0** | yes |
+
+**Zero worker threads, in every case.** The ring uses its poll-based retry path
+throughout, so a blocking socket costs nothing and D27's failure does not recur. A new
+request was served in 6 ms while 256 responses were parked mid-write.
+
+Resolution: **leave accepted sockets blocking.** `O_NONBLOCK` has nothing to buy — there
+are no threads to save — and it would cost real complexity: with the flag set, io_uring
+declines to arm poll and returns `-EAGAIN` to us instead, so every read and every write
+would need a re-arm path, on the two hottest paths in the process. Adding failure modes
+to buy nothing is the wrong direction.
+
+Rejected: **`O_NONBLOCK` for the sake of textbook io_uring style.** The textbook advice
+exists to avoid worker-thread punting. Measurement says we are not punting.
+
+Rejected: **`IOSQE_ASYNC` to force the async path.** That asks for the behaviour the
+question was worried about.
+
+**Why a single `writev` almost always finishes, and why the resumption logic stays.** A
+stalled write is genuinely stalled — with a 2 KB client receive window, only 2,048 bytes
+were readable while the response was parked, and all 200,144 arrived once the client
+drained. Yet the completion reports the full count and the request slot is released
+immediately: 320 slow readers never exhausted a 256-slot pool, and no `503` was ever
+produced. The reason is that the socket send buffer autotunes up to `tcp_wmem`'s maximum,
+4 MB here, which is an order of magnitude beyond the 260 KiB ceiling on a Doot response.
+The kernel accepts the whole thing and drip-feeds it to the receiver.
+
+So `stats.partial_writes` is normally **zero**, and the cursor in `response.zig` is not
+reachable by any traffic pattern we can construct from outside. It stays regardless, for
+two reasons: it is not *guaranteed* — an operator lowering `net.core.wmem_max`, or memory
+pressure capping `sk_wmem`, restores short writes — and correctness that depends on a
+tunable staying generous is not correctness. It is proved deterministically by unit tests
+over the cursor, including byte-at-a-time reassembly, rather than by hoping an
+integration test triggers it. This is D53's rule applied to a buffer instead of a clock:
+assert the property directly where it is deterministic, and do not assert kernel
+behaviour you do not control.
+
+**Accepted consequence, and it is a real one: a slow reader's response is buffered in
+kernel socket memory, which none of our accounting sees.** `05-architecture.md` budgets
+65 MB of body buffers and D28 now adds a 107 MB fixed reservation, but a parked response
+also occupies up to 260 KiB of `sk_wmem` per connection — roughly 83 MB across the 320
+stalled writes above, invisible to `VmRSS` and to `/admin/stats`. Capping `SO_SNDBUF` on
+accepted sockets would bound it, and would have the tidy side effect of making the
+partial-write path ordinary rather than theoretical.
+
+It is deliberately **not** decided here, because the cost is not measurable on loopback.
+Fixing `SO_SNDBUF` disables send-buffer autotuning, and the edge-to-origin hop is a real
+WAN path whose bandwidth-delay product decides whether a 64 KiB buffer is generous or a
+throughput ceiling. Deciding that from a measurement taken over `127.0.0.1` would be
+guessing with a number attached. It is in the Deferred table, to be answered on the
+deployed link alongside the other figures M5 re-measures for the same reason (D48).
+
+---
+
+## D55 — `Date` is sent on every response · locked
+
+The transport emits `Date` on every response. Neither `05-architecture.md`'s header list
+nor `02-api.md`'s per-endpoint tables enumerated it, which made it an undocumented header
+on a documented surface — worth settling rather than leaving as a diff nobody reviewed.
+
+RFC 9110 requires an origin server with a clock to send `Date` on 2xx, 3xx and 4xx
+responses. Doot has a clock. Omitting it is a spec deviation that costs nothing to fix now
+and is awkward to add later, once clients exist that were built against its absence.
+
+It is **not** part of Doot's own surface. Nothing in the product reads it, no endpoint
+depends on it, and it is deliberately absent from the per-endpoint header tables in
+`02-api.md` for that reason — those tables describe the product's headers. `Date` belongs
+to HTTP, and is documented once, under "Headers on every response".
+
+Cost is nil: the loop formats it once per tick and every response in between borrows the
+result, so no response formats a timestamp. That is what makes it free rather than a
+per-request `clock_gettime` plus a conversion.
+
+**One exception, and it is on the overload path.** The `503` returned when the request-slot
+pool is empty is rendered at compile time, because it is the one reply that must be
+sendable when there is nothing left to build one with. A static constant cannot carry a
+live `Date`. A connection-terminating overload reply is also the case where a missing
+`Date` changes no client and no cache behaviour, so the trade is the right way round.
+
+Rejected: **omitting `Date` everywhere for consistency with the static `503`.** Consistency
+with the degraded path is not a reason to make the normal path non-conforming.
+
+---
+
+## D56 — Plan limits are a table in code, and the paid ceiling stays configuration · locked
+
+`01-product.md` has specified per-tier limits since the beginning, and nothing in code has
+ever consulted them. `Plan` is persisted on the account and read back by `resolveKey`, but
+no code path uses it for policy: there is no rate limit by plan, no maximum lifetime by
+plan, and `storage.config.Options.max_ttl_s` is a single store-wide ceiling.
+
+Three things about to be built need it at once — the pooled rate limit needs a bucket size,
+`GET /v1/whoami` publishes a `limits` object, and `ttl_too_long`'s message promises "the
+maximum for this plan". So the table lands first, in one place.
+
+Resolution: **one table in `src/control/plan.zig`, keyed by `Plan`, mirroring the Tiers
+table in `01-product.md`.** It lives with the control plane because a plan is a property of
+an account, and accounts are the control plane's business. `01-product.md` remains the
+source of the numbers; this is a mirror, in the sense working rule 2 means.
+
+**The paid maximum lifetime is not in the table, deliberately.** `01-product.md` is explicit
+that the 30-day figure "is a starting point, not a commitment", that it "moves with observed
+usage", and that **nothing may hardcode it** — it is `DOOT_MAX_TTL`, and the storage layout
+derives from it. So the table carries the trial's 14 days, which *is* a product constant,
+and the paid ceiling resolves to whatever the store is configured for. There are therefore
+two ceilings, and the effective one is the lower:
+
+- the **engine** ceiling, `Options.max_ttl_s`, which class 3's bound derives from (D10)
+- the **plan** ceiling, from this table
+
+A plan ceiling above the engine's would be a limit the storage layout cannot honour, so it
+is asserted rather than silently clamped.
+
+Rejected: **putting the table in `server/config.zig` beside the transport constants.** Those
+are properties of the process; these are properties of a customer.
+
+Rejected: **deriving the rate limit from the plan at each call site.** That is how the same
+number ends up written three times and disagreeing after the first change.
+
+---
+
+## D57 — Storage calls never run on the event loop · locked
+
+The engine's public calls block, and the amount they block by is not small:
+
+- `Store.delete` takes the one global write lock, appends a tombstone, and then waits in
+  `awaitDurable` — an `fsync` wait.
+- `Store.list` performs up to `tag_hop_budget` record reads. That bound is 500.
+- `Store.get` performs one or two `pread`s per candidate.
+
+Running these on the event-loop thread is not merely a latency question. **It makes D34
+inert.** Leader commit's entire benefit is that the first writer needing durability performs
+the flush and every writer waiting at that moment is covered by it — and a single-threaded
+request path never has a second writer waiting. D48 measured exactly this from the other
+end: ~200 writes/s on a persistent volume against ~41,000/s on tmpfs, "because a
+single-threaded workload gives every write its own flush leader with nobody to piggyback".
+So an inline `delete` would cap deletes at roughly 200/s *and* stall every connection
+pinned to the loop for the duration of each one. A cold-cache `list` walking its full hop
+budget is tens of milliseconds of head-of-line blocking in front of unrelated requests.
+
+Resolution: **a bounded pool of I/O worker threads owns every `Store` call.** The event loop
+does sockets, parsing, routing and authentication — all of which are memory-only — and
+nothing that can touch a disk.
+
+The rule is deliberately **uniform**: every storage call goes to the pool, including `get`.
+A boundary drawn at "calls fast enough to run inline" requires a judgement about each one,
+and that judgement rots the first time a call gains a slow path nobody re-checked. The
+handoff costs microseconds against a request whose network round trip is measured in tens
+of milliseconds (`05-architecture.md`), so uniformity is nearly free.
+
+It also gives the pool a second job: it is what supplies leader commit with concurrent
+writers, so D34 starts working as designed rather than degrading to one flush per write.
+
+Rejected: **running storage inline on the loop.** Costed above.
+
+Rejected: **one event loop per core instead of a pool** — the `SO_REUSEPORT` item already in
+Deferred. It would give leader commit its writers, and it is the model `05-architecture.md`
+describes, but it multiplies the transport's fixed reservation by the core count: the
+107 MB in D28's amendment becomes roughly 856 MB at eight loops, because each loop needs its
+own connection table spanning the descriptor space and its own slot pool. It also leaves a
+blocking call stalling 1/N of connections rather than none, and ties storage concurrency to
+core count rather than to disk behaviour. Single-loop throughput is ~100× any plausible
+demand (D27), so there is no throughput reason to pay that. It stays deferred, on the
+grounds it was already deferred on.
+
+Rejected: **acknowledging a delete before it is durable.** `204` would become a claim a
+crash could contradict, and M1's first exit condition is that nothing acknowledged is lost
+and nothing deleted resurrects. Free at the till is not free of meaning.
+
+**Mechanism: a per-loop `eventfd`.** The loop keeps a `read` posted on it; a worker pushes a
+finished job onto that loop's completion queue and writes to the `eventfd`; the read
+completes and the loop drains the queue. `IORING_OP_MSG_RING` is the tidier mechanism and
+the deployment kernel has it, but the pinned toolchain's `IoUring` does not wrap it, and
+D26's standing rule is that the pin is not worked around casually. This is the same class of
+gap as D27's, handled the same way: use what the pin supports, and record why.
+
+Handing a request between threads is safe because of a property the transport already has
+for another reason: requests live in a pool addressed **by index, not by pointer** (D28
+amendment), so nothing a job refers to moves when the job crosses a thread boundary.
+
+**Accepted consequence: the pool is a queue, and a queue can fill.** When every worker is
+busy, storage-bound requests wait. That is correct behaviour — it is backpressure, and it is
+what stops a slow disk from being absorbed as unbounded memory — but queue depth becomes a
+number that must be visible in `/admin/stats` rather than inferred from latency.
+
+---
+
+## D58 — The service layer, and the engine surface it is allowed to touch · locked
+
+The router, API-key authentication, the pooled rate-limit bucket and the endpoint handlers
+need to know both what an entry is and what an HTTP path is. Nothing existing may hold both.
+
+- `src/api/` is specified as pure functions over request bytes — "no allocation, no clock,
+  no I/O, no sockets". Handlers need all four.
+- `src/server/` is specified as knowing nothing about entries, accounts or credits. The
+  `Handler` seam exists precisely to keep it that way, and putting routing behind it would
+  make the seam decorative.
+
+Resolution: **a new module, `src/service/`.** It is the composition layer, and the only place
+that imports `storage`, `control`, `api` and `server` together. The naming follows the
+existing modules, which are named for the layer they are rather than what they contain.
+
+**It may not reach into the engine's internals.** `GET /healthz` needs the current sequence
+number and whether writes are being admitted, and today both are reachable only as
+`store.com.lastSeq()` and `store.idx.admissionClosed()` — through fields that are public so
+the engine's own tests can drive them, not as an interface. Reaching through them from
+another module would make every future change to the engine's internals a change to the API
+surface. `Store` gains two accessors instead, and the service layer uses those.
+
+**The rate-limit bucket lives on the account, in `Control`.** Not in the service layer and
+not per connection: a bucket per worker or per connection multiplies the limit, which is the
+same failure D6 rejected per-key buckets for. `Control` already serialises every per-account
+mutation behind one mutex — `spendCredit` is the precedent — and a bucket is one more
+mutation of the same kind, so it needs no new lock and inherits the property that made
+credits safe.
+
+Rejected: **a `service` module that also owns the transport.** The split earned itself: the
+transport's 104 tests run without a store, a control log or an account existing, and folding
+the two together would cost that.
+
+---
+
+## D59 — Account and key identifiers are Crockford base32, padded · locked
+
+`02-api.md` publishes `"account_id": "acct_7Q2M9XKV"` and `06-auth.md` shows `key_3F8A`,
+and neither says what those strings are. Illustrative was fine until something had to emit
+one: `GET /v1/whoami` returns both, and an identifier on a published response is a format
+callers store, log and compare.
+
+Underneath both are a `u32` — `Account.id` and `ApiKey.id`.
+
+Resolution: **`<prefix>_` followed by the id in uppercase Crockford base32, zero-padded to
+seven characters.** `acct_0000001` for account 1, `key_0000001` for key 1.
+
+Crockford because it is already in the tree — `api/ulid.zig` uses it for server-assigned
+names — and because it excludes `I`, `L`, `O` and `U`, so an identifier read off a screen
+into a support ticket does not arrive as a different one. Seven characters because that is
+what a `u32` needs, so the width never changes and no identifier is ever a prefix of a
+longer one.
+
+Zero-padded rather than variable-width, because unpadded identifiers sort wrongly as text
+and sorting a list of them is the first thing anyone does.
+
+Rejected: **decimal.** It invites arithmetic on an identifier, and `acct_42` reads like a
+row number, which is the one impression an opaque handle should not give.
+
+Rejected: **matching the illustrative examples exactly.** `acct_7Q2M9XKV` is eight
+characters and `key_3F8A` is four, which cannot both be the same encoding at the same
+width. The examples in `02-api.md` and `06-auth.md` are corrected to the real format
+instead, because a published example the implementation contradicts is worse than either
+choice.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
@@ -1530,6 +1836,7 @@ budget.** Never assert a timing outcome once and call it a property.
 | Chunked request bodies | a real caller unable to send `Content-Length` |
 | 90-day retention | usage behaviour justifying it, **and** a proven restore drill (D16). Retention is a config value, not a code change |
 | Read-side soft caps | the pooled rate limit (D6) proving insufficient against a heavy read pattern |
+| Capping `SO_SNDBUF` on accepted sockets | **M5, on the deployed link.** A parked response holds up to 260 KiB of kernel socket memory that no accounting of ours sees (D54). Capping bounds it and makes the partial-write path ordinary, but it disables send-buffer autotuning, and whether that is free or a throughput ceiling depends on the edge-to-origin bandwidth-delay product. Not answerable over loopback |
 | Flushing credit deductions on the entry's own group commit | credits becoming a real revenue mechanism rather than a beta trial grant. Would make the balance exact across a crash, at the cost of a fifth append stream through measured M1 code (D41) |
 | Durable idempotency state | evidence that retries straddling a restart actually happen. Costs an `fsync` on the common write path and reintroduces orphaned in-progress keys (D42) |
 | Monotonic ULIDs | a caller depending on the ordering of two entries created in the same millisecond. Nothing in the product observes it today (D47) |

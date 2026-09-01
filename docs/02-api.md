@@ -260,7 +260,7 @@ and for humans to sanity-check a key.
 
 ```json
 {
-  "account_id": "acct_7Q2M9XKV",
+  "account_id": "acct_0000001",
   "email": "someone@example.com",
   "plan": "trial",
   "credits": { "remaining": 9187, "granted": 10000 },
@@ -272,7 +272,7 @@ and for humans to sanity-check a key.
     "default_ttl_seconds": 604800,
     "max_ttl_seconds": 1209600
   },
-  "key": { "id": "key_3F8A", "created_at": "2026-08-30T19:02:44Z" }
+  "key": { "id": "key_0000003", "created_at": "2026-08-30T19:02:44Z" }
 }
 ```
 
@@ -323,6 +323,17 @@ published 24-hour guarantee with quiet exceptions is worse than a smaller honest
 
 Restarts are brief and infrequent — a connection reset plus under ten seconds of recovery —
 so the exposed window is narrow. Reasoning in `07-decisions.md` D42.
+
+## Headers on every response
+
+`Date`, as an IMF-fixdate. RFC 9110 requires it of an origin server with a clock, and it
+is documented here rather than in the per-endpoint tables above because it is not part of
+Doot's surface — nothing in the product reads it or depends on it. It belongs to HTTP.
+
+The one exception is the `503 capacity_exhausted` returned when the origin is shedding
+load, which is served from a pre-rendered constant and carries no `Date`. That response
+exists for the moment when nothing can be allocated to build one, which is exactly when a
+formatted timestamp is unavailable (`07-decisions.md` D55).
 
 ## Rate limit headers
 

@@ -29,6 +29,28 @@ pub const max_reply_headers = 16;
 /// Scratch for header values the handler formats rather than borrows.
 pub const reply_scratch_bytes = 1024;
 
+/// Space for whatever a handler needs to carry from the loop to an I/O worker.
+///
+/// Sized for the largest of those: a list needs a 40-byte traversal cursor plus a tag,
+/// and a read or delete needs a decoded name, which is up to 256 bytes
+/// (`03-data-model.md`). Cheap either way — it sits inside a pooled `Request` that is
+/// already 260 KiB.
+pub const work_ctx_bytes = 384;
+
+/// Whether a reply is ready to send, or still needs work that must not run on the event
+/// loop.
+///
+/// Exists because no storage call may run on the loop (D57), and only the handler knows
+/// which requests need one. The loop stays ignorant of *what* the work is: a deferred
+/// reply simply names a function to run on an I/O worker, and the loop sends whatever
+/// that function leaves in the `Reply`.
+pub const Disposition = enum {
+    /// The `Reply` is complete. Send it.
+    complete,
+    /// `Reply.work` is set and must run on an I/O worker first.
+    deferred,
+};
+
 /// One request, as the handler sees it.
 pub const Incoming = struct {
     head: *const head_mod.Head,
@@ -78,6 +100,27 @@ pub const Reply = struct {
     /// `scratch`.
     out: []u8 = &.{},
 
+    /// Set alongside returning `.deferred`. Runs on an I/O worker thread and fills in
+    /// the rest of this same `Reply`; the loop sends whatever it leaves.
+    ///
+    /// It receives the handler's own context back, so it can reach a `Store` without the
+    /// transport ever holding one. Everything it is handed outlives it: the head and body
+    /// live in the pooled `Request`, which is deliberately not released while a job is in
+    /// flight.
+    ///
+    /// It runs on another thread, so it must not touch anything the loop owns — no
+    /// connection state, no ring, no statistics.
+    work: ?*const fn (ctx: *anyopaque, in: Incoming, out: *Reply) void = null,
+
+    /// Scratch the handler owns across a deferral. The transport never reads it.
+    ///
+    /// It exists so that everything cheap happens on the loop and only the disk happens
+    /// on the worker. Authenticating a key, decoding a name and validating a cursor are
+    /// all memory-only, so they run before deferring — and the results have to survive
+    /// the hop to the worker somehow. Re-deriving them there would mean the same request
+    /// being authenticated and validated twice, by two code paths that could drift.
+    work_ctx: [work_ctx_bytes]u8 align(8) = undefined,
+
     /// Set instead of a status to answer from the error catalogue. The transport
     /// renders the uniform JSON body and picks the status, so no handler restates
     /// either.
@@ -99,12 +142,24 @@ pub const Reply = struct {
     /// `X-Doot-Credits-Remaining` is a billing question nobody can answer afterwards.
     overflow: bool = false,
 
+    /// Typed view of `work_ctx`.
+    ///
+    /// Deliberately not cleared by `reset`: it is only ever read by the same handler that
+    /// wrote it, in the same request, and zeroing 384 bytes per request to no purpose
+    /// would be a cost paid on every request for the benefit of none.
+    pub fn workCtx(r: *Reply, comptime T: type) *T {
+        comptime std.debug.assert(@sizeOf(T) <= work_ctx_bytes);
+        comptime std.debug.assert(@alignOf(T) <= 8);
+        return @ptrCast(@alignCast(&r.work_ctx));
+    }
+
     pub fn reset(r: *Reply) void {
         r.status = 200;
         r.reason = "OK";
         r.body = &.{};
         r.close = false;
         r.out = &.{};
+        r.work = null;
         r.error_code = null;
         r.error_message = null;
         r.retry_after_s = null;
@@ -177,9 +232,9 @@ pub const Reply = struct {
 /// The transport's one outward call.
 pub const Handler = struct {
     ctx: *anyopaque,
-    respondFn: *const fn (ctx: *anyopaque, in: Incoming, out: *Reply) void,
+    respondFn: *const fn (ctx: *anyopaque, in: Incoming, out: *Reply) Disposition,
 
-    pub fn respond(h: Handler, in: Incoming, out: *Reply) void {
+    pub fn respond(h: Handler, in: Incoming, out: *Reply) Disposition {
         return h.respondFn(h.ctx, in, out);
     }
 };
@@ -297,12 +352,13 @@ test "reset clears everything a previous request set" {
 test "a handler is reachable through the vtable" {
     const Fixture = struct {
         calls: usize = 0,
-        fn respond(ctx: *anyopaque, in: Incoming, out: *Reply) void {
+        fn respond(ctx: *anyopaque, in: Incoming, out: *Reply) Disposition {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.calls += 1;
             out.ok(200, "OK");
             out.header("X-Seen-Path", in.path());
             out.body = in.body;
+            return .complete;
         }
         fn handler(self: *@This()) Handler {
             return .{ .ctx = self, .respondFn = respond };
@@ -319,7 +375,7 @@ test "a handler is reachable through the vtable" {
     var reply: Reply = .{};
     reply.reset();
 
-    h.respond(.{ .head = &parsed, .body = "hi" }, &reply);
+    try testing.expectEqual(Disposition.complete, h.respond(.{ .head = &parsed, .body = "hi" }, &reply));
 
     try testing.expectEqual(@as(usize, 1), fixture.calls);
     try testing.expectEqualStrings("/v1/entries/a", reply.values[0]);

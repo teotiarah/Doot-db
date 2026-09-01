@@ -77,3 +77,10 @@ jobs:
       # framing, connection reuse and `Expect: 100-continue` handling are correct.
       - name: M2 transport checks
         run: tools/transport-check.sh
+
+      # The five free endpoints over a real store and a real control log, driven by `curl`
+      # rather than by a client of our own. Fixture entries are seeded through the engine,
+      # because the write endpoints are the next slice — which is what lets read, list and
+      # delete be verified in full before anything can be written over HTTP.
+      - name: M2 data-plane checks
+        run: tools/dataplane-check.sh

@@ -16,6 +16,7 @@
 const std = @import("std");
 
 pub const event = @import("control/event.zig");
+pub const plan = @import("control/plan.zig");
 pub const store = @import("control/store.zig");
 
 pub const Control = store.Control;
@@ -25,9 +26,12 @@ pub const Auth = store.Auth;
 pub const Plan = store.Plan;
 pub const AccountState = store.AccountState;
 pub const Spend = store.Spend;
+pub const RateDecision = store.Control.RateDecision;
+pub const Limits = plan.Limits;
 pub const hashKey = store.hashKey;
 
 test {
     _ = event;
+    _ = plan;
     _ = store;
 }

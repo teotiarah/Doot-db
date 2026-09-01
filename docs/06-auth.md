@@ -127,7 +127,7 @@ Argon2id; keys are neither.
 | revocation | immediate and irreversible |
 | rotation | create the new key, deploy, revoke the old |
 | label | optional user-supplied, ≤ 64 chars, e.g. "ci-runner" |
-| shown in dashboard | label, `key_<id>`, first 4 chars after prefix, created-at, last-used-at |
+| shown in dashboard | label, `key_<id>` (Crockford base32, D59), first 4 chars after the key prefix, created-at, last-used-at |
 
 `last_used_at` is updated at most once per minute per key, to avoid a write on every
 request.

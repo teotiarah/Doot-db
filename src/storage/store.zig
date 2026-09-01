@@ -91,6 +91,21 @@ pub const Got = struct {
     created_at: u32,
     expires_at: u32,
     tag_count: u8,
+    /// The entry's tags, in the order they were written.
+    ///
+    /// A fixed array rather than a slice of one, deliberately. The decoder writes tags
+    /// into a caller-supplied array, and M1 lost time to `record.decode` leaving a tag
+    /// slice aimed at a stack frame that had already gone — so the texts borrow `buf`
+    /// like `body` does, and the array that holds them lives in the `Got` the caller
+    /// owns rather than anywhere that can go out of scope first.
+    ///
+    /// `02-api.md` puts these on a read as `X-Doot-Tags`, which is why a count alone is
+    /// not enough.
+    tag_texts: [config.max_tags][]const u8 = @splat(&.{}),
+
+    pub fn tags(g: *const Got) []const []const u8 {
+        return g.tag_texts[0..g.tag_count];
+    }
 };
 
 pub const Stats = struct {
@@ -531,7 +546,7 @@ pub const Store = struct {
             if (rec.account_id != account_id or !std.mem.eql(u8, rec.name, name)) continue;
             if (rec.tombstone or rec.expires_at <= now) return null;
 
-            return .{
+            var got: Got = .{
                 .seq = rec.seq,
                 .body = rec.body,
                 .content_type = rec.content_type,
@@ -539,6 +554,11 @@ pub const Store = struct {
                 .expires_at = rec.expires_at,
                 .tag_count = @intCast(rec.tags.len),
             };
+            // Copied out of `tags`, which is this function's stack array. The texts
+            // themselves point into `buf` and so outlive the return; the array holding
+            // them would not.
+            for (rec.tags, 0..) |t, i| got.tag_texts[i] = t.text;
+            return got;
         }
         return null;
     }
@@ -637,6 +657,28 @@ pub const Store = struct {
 
         try snapshot_mod.write(self.gpa, self.dir_fd, &self.idx, &self.heads, watermark, states);
         self.last_snapshot_at = self.clock.now();
+    }
+
+    /// The last sequence number handed out.
+    ///
+    /// Exists so the layer above does not have to reach through `self.com`, which is
+    /// public for the engine's own tests rather than as an interface (D58). `GET
+    /// /healthz` publishes this.
+    pub fn lastSeq(self: *Store) u64 {
+        return self.com.lastSeq();
+    }
+
+    /// Whether a *new* entry can currently be admitted.
+    ///
+    /// False when the index has reached its configured ceiling. Overwrites and deletes
+    /// continue to work in that state — they consume no additional slot, and deleting
+    /// is how an operator recovers — so this answers "would a new name be refused",
+    /// which is exactly what `GET /healthz` reports on.
+    ///
+    /// Takes all 64 shard locks in turn, so it belongs on an I/O worker like every
+    /// other engine call (D57), not on the event loop.
+    pub fn acceptingWrites(self: *Store) bool {
+        return !self.idx.admissionClosed();
     }
 
     pub fn stats(self: *Store) Stats {
