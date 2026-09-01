@@ -67,6 +67,17 @@ const Fixture = struct {
         } else if (std.mem.eql(u8, path, "/created")) {
             out.ok(201, "Created");
             out.header("Location", "/v1/entries/01JBQ2K9XW4V7N8M3PZR6TYAC5");
+        } else if (std.mem.eql(u8, path, "/fault")) {
+            // The `internal_error` row of the catalogue, and the only way to reach it from
+            // a client (D65). Every `500` site in the real service is a defensive branch on
+            // a state a request cannot produce — the one exception was the poisoned
+            // `Content-Type` D64 closed. So what this proves is the `500`'s wire shape:
+            // status, stable code, and a closed connection. It cannot prove a request can
+            // provoke one, because after D64 none can.
+            //
+            // It lives here rather than in the data plane precisely so that no production
+            // code path exists whose only purpose is to fail.
+            out.fail(.internal_error);
         } else {
             out.fail(.not_found);
         }

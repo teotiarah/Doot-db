@@ -2352,6 +2352,99 @@ these assertions need — how many `201`s against how many `402`s, and which res
 which code. Counting outcomes is the entire point, so the driver has to be something that
 can count.
 
+**M2 amendment — the refill half is not asserted over the wire, and the reason is a
+constraint in the transport worth writing down.** The intended lever was a harness handler
+that wrapped `Service.handler()`, recognised one extra path to advance the stopped clock,
+and delegated everything else. It cannot work, and it fails in a way that took a hundred
+failing checks to see: `runDeferred` hands a deferred job **the context of the handler
+registered with the `Loop`**, not the context of whoever set `Reply.work`. A decorating
+handler therefore makes every deferred reply reinterpret the outer handler's pointer as the
+inner one's. Reads, lists, writes and even `/healthz` all hang, because every one of them
+defers (D57).
+
+The seam is not composable, and that is now stated where it is used rather than discovered
+again. Making it composable means turning `Reply.work` into a `{ ctx, fn }` pair — a small
+change, and the right one *if* something ever needs to decorate a handler. Nothing does:
+the only candidate was this test affordance, and production code should not gain a seam to
+serve a harness.
+
+So the burst keeps the frozen clock and stays exact, and **refill is not re-asserted over
+HTTP**. It is already asserted deterministically against a manual clock by
+`control/store.zig`'s own tests — "refill rate", "the exact window", "no accrual past
+burst" — which is the same property measured where it is cheap and reproducible. Asserting
+it a second time through a socket would have added a second listener to the harness to prove
+something already proven.
+
+---
+
+## D67 — A replay needs a buffer of its own, because the slot's tail is not one · locked
+
+Found by building D65's concurrency check, which retries a 200 KB write and expects a
+replay. It does not get one:
+
+| body | second request with the same key and body | credit |
+|---|---|---|
+| 5 B | `201`, `Idempotency-Replayed: true` | free |
+| 1,000 B | `201`, `Idempotency-Replayed: true` | free |
+| 50,000 B | **`200`, no replay header** | **charged** |
+| 200,000 B | **`200`, no replay header** | **charged** |
+
+`replayInto` re-reads the recorded record (D61) into `Reply.out`, which is the unused
+**tail** of the request's 260 KiB slot, and guards it with
+`if (buf.len < read_buffer_bytes) return false`. `read_buffer_bytes` is the largest record
+that can exist — 262,929 — so the guard passes only while the tail is at least that big,
+which means only while the request body is at most **3,311 bytes**. Above that the replay
+gives up, and the write re-executes.
+
+Re-executing is not harmless. It charges a credit, and it performs a real overwrite — so the
+entry gets a new `created_at` and a new expiry (D19), which is precisely the state a retry
+was supposed not to produce. `01-product.md` and D20 both publish that replays are free, and
+for every body above 3.3 KB neither statement was true.
+
+**This is not the degradation D61 accepted.** That one is "a replay whose location no longer
+reads re-executes", for an entry that expired and had its segment reclaimed — a rare race
+with nothing left to read. Here the record is present and perfectly readable; there is simply
+nowhere to put it. A published guarantee failing on a buffer-size arithmetic is a different
+thing from a guarantee failing on a genuine race, and only the second was ever accepted.
+
+Resolution: **the service owns one replay buffer per I/O worker**, sized
+`read_buffer_bytes`, claimed for the duration of the re-read.
+
+`server.config.io_workers` is 8, so that is 8 × 262,929 ≈ **2.0 MB**, and a worker holds at
+most one job at a time, so a claim can never fail. Against the 286 MB index, the 65 MB of
+body buffers and D28's 107 MB reservation, two megabytes to make a published promise true is
+not a trade that needs deliberating.
+
+Rejected: **reading into the whole slot rather than its tail.** It is free and it very nearly
+works: the slot is 266,240 bytes, always enough. But `readRecord` fills the buffer as it
+reads, so it would destroy the request body — and the body is still needed on the one path
+that matters, the fall-back to executing normally when the record turns out to be unreadable.
+Clobbering the input before knowing whether the alternative is required is how a rare race
+becomes data loss.
+
+Rejected: **sizing the guard to the actual record instead of the maximum.** More honest
+arithmetic on the same broken shape. The body hash proves the stored record's body equals the
+request's body, so the record needs roughly `body + 1 KB` and the tail offers
+`slot − body` — which still fails for every body over about 132 KB. It moves the cliff
+instead of removing it, and leaves the failure mode intact but harder to find.
+
+Rejected: **one shared buffer behind the idempotency table's existing mutex.** It would hold
+a lock across a disk read, which D35 and D57 both forbid for the same reason: a lock held
+over I/O turns one slow read into everyone's slow read. Per-worker buffers need no lock at
+all.
+
+Rejected: **storing enough in the idempotency record to render without reading.** D61 already
+costed the full version at 750 MB. The cheap version — keeping only the timestamps and
+re-deriving the rest from the retry's own headers — is worse than expensive, it is wrong: two
+requests can share a key and a body while carrying different tags, and a replay must report
+what the *original* stored. Reading the record is not an implementation detail of D61, it is
+the reason D61 works.
+
+**Accepted consequence: memory grows by 2.0 MB, and it is resident.** Unlike the request
+slots, which are touched only as traffic reaches them, these are touched on the first replay
+and stay. `04-storage.md`'s memory table gains the row rather than letting the figure be
+emergent.
+
 ---
 
 ## Deferred

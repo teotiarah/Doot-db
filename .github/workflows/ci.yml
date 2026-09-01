@@ -97,3 +97,14 @@ jobs:
       # constant (D45), so waiting for a pass is waiting in real time.
       - name: M2 origin binary checks
         run: tools/boot-check.sh
+
+      # M2's two remaining exit conditions, which each need a harness configured differently
+      # from the one the data-plane checks drive: an index budget small enough that admission
+      # control is already closed, and a stopped clock so the rate limit's refill cannot make
+      # a burst assertion approximate (D65, D66).
+      #
+      # Includes the idempotency race, which is a scheduling outcome rather than a property.
+      # Per D53 the correctness half is asserted on every attempt and only the observation is
+      # retried, so this is not a source of intermittent red.
+      - name: M2 exactness checks
+        run: tools/exactness-check.sh

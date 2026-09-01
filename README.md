@@ -86,9 +86,15 @@ edge:
 | M2 — SSE and the edge | **outstanding.** The change feed ring is built and published to; nothing consumes it. Origin TLS and the Cloudflare zone gate on infrastructure that does not exist yet |
 | M3–M6 | not started |
 
-Two of M2's exit conditions remain and need no infrastructure: five rows of the error
-catalogue are not reproduced by a `curl` check in CI, and credits and the rate limit are
-verified single-threaded rather than exact under concurrent load.
+**Two of M2's three exit conditions are now met**: every row of the error catalogue is
+reproduced by a `curl` invocation in CI, and credits and the rate limit are verified *exactly*
+under concurrent load rather than within a tolerance. Only the SSE probe through the real
+Cloudflare zone is outstanding, and it needs the zone to exist.
+
+Closing them turned up two defects worth naming, both now fixed and both regression-checked:
+a `Content-Type` carrying a control byte was stored and charged for and then failed on every
+read (D64), and an idempotent replay of any body over 3.3 KB silently re-executed and charged
+a credit, against the published promise that replays are free (D67).
 
 **It has no way to create an account yet.** M3 owns signup, so a fresh deployment answers
 `401` to everything — deliberately, rather than growing an operator subcommand built to be
@@ -107,15 +113,16 @@ Recovery is a warm-page-cache figure and says so: it moves with the filesystem, 
 number the operational lever derives from gets re-measured on the deployed volume in M5
 (D48).
 
-**430 unit tests plus five harnesses, all run by CI on every push:**
+**440 unit tests plus six harnesses, all run by CI on every push:**
 
 ```bash
 tools/vocab-check.sh                                    # D2 vocabulary rule
-zig build test                                          # 430 unit tests
+zig build test                                          # 440 unit tests
 zig build verify && ./zig-out/bin/m1 all /dev/shm/doot-m1  # 5 M1 exit conditions
-tools/transport-check.sh                                # 44 curl checks
-tools/dataplane-check.sh                                # 145 curl checks
+tools/transport-check.sh                                # 52 curl checks
+tools/dataplane-check.sh                                # 158 curl checks
 tools/boot-check.sh                                     # 30 checks against the real binary
+tools/exactness-check.sh                                # 28 concurrency and capacity checks
 ```
 
 `m1 all` runs the recovery check at its 300,000-record default, which measures the replay

@@ -46,10 +46,56 @@ pub const Options = struct {
     max_ttl_s: u32,
     /// The idempotency table, owned by the caller so its ~56 MB is allocated once.
     idempotency: *IdempotencyTable,
+    /// Where a replay re-reads the record it is reproducing (D67). Owned by the caller for
+    /// the same reason the table is: ~2 MB has no business being copied into a vtable.
+    replays: *ReplayBuffers,
 };
 
 /// The production table size. 48 B a record at the cap `04-storage.md` records (D62).
 pub const IdempotencyTable = idempotency.Table(idempotency.default_records);
+
+/// One record-sized buffer per I/O worker, for replays to re-read into.
+///
+/// `Reply.out` cannot serve: it is the *tail* of the request slot, so it is only large
+/// enough for a whole record while the request body is under about 3 KB — which silently
+/// turned every larger replay into a re-execution that charged a credit and overwrote the
+/// entry (D67). This is the buffer that makes "replays are free" true at every body size.
+///
+/// A worker runs one job at a time and there are exactly as many buffers as workers, so a
+/// claim cannot fail. No lock, because a lock here would be held across a disk read, which
+/// D35 and D57 both refuse.
+pub const ReplayBuffers = struct {
+    /// One bit per buffer. `fetchOr` claims, `fetchAnd` releases.
+    claimed: std.atomic.Value(u32) = .init(0),
+    buffers: [server.config.io_workers][storage.store.read_buffer_bytes]u8 = undefined,
+
+    comptime {
+        std.debug.assert(server.config.io_workers <= 32); // one bit each
+    }
+
+    pub fn init(self: *ReplayBuffers) void {
+        // Only the bitmask needs initialising; the buffers are written before they are read.
+        self.claimed = .init(0);
+    }
+
+    pub const Claim = struct { index: u5, buffer: []u8 };
+
+    pub fn acquire(self: *ReplayBuffers) ?Claim {
+        for (0..server.config.io_workers) |i| {
+            const bit = @as(u32, 1) << @intCast(i);
+            const prev = self.claimed.fetchOr(bit, .acquire);
+            if (prev & bit == 0) {
+                return .{ .index = @intCast(i), .buffer = &self.buffers[i] };
+            }
+        }
+        return null;
+    }
+
+    pub fn release(self: *ReplayBuffers, index: u5) void {
+        const bit = @as(u32, 1) << index;
+        _ = self.claimed.fetchAnd(~bit, .release);
+    }
+};
 
 pub const Service = struct {
     store: *storage.Store,
@@ -60,6 +106,8 @@ pub const Service = struct {
     /// Borrowed rather than embedded: the table is ~56 MB and a `Service` is passed by
     /// value into a handler vtable.
     idempotency: *IdempotencyTable,
+    /// Borrowed for the same reason (D67).
+    replays: *ReplayBuffers,
 
     pub fn init(options: Options) Service {
         return .{
@@ -69,6 +117,7 @@ pub const Service = struct {
             .cursor_secret = options.cursor_secret,
             .max_ttl_s = options.max_ttl_s,
             .idempotency = options.idempotency,
+            .replays = options.replays,
         };
     }
 
@@ -444,15 +493,22 @@ pub const Service = struct {
         if (work.ttl_s < storage.config.min_ttl_s) return failPlain(out, .ttl_too_short);
         if (work.ttl_s > ceiling) return failPlain(out, .ttl_too_long);
 
-        // The content type is stored verbatim and echoed on read; the server never acts on
-        // it. Borrowed rather than copied, because the request head outlives the write.
+        // 7. The content type is stored verbatim and echoed on read; the server never acts
+        // on it. Borrowed rather than copied, because the request head outlives the write.
         if (in.header("content-type")) |ct| {
             if (ct.len > storage.config.max_content_type_bytes)
                 return failPlain(out, .content_type_too_long);
+            // Because it is echoed into a response header, it has to be something a header
+            // can carry (D64). Without this a `NUL` or `CR` is stored happily and then
+            // fails `response.headerSafe` on every subsequent read — a write that succeeds,
+            // charges a credit, and leaves an entry nobody can ever get. Printable ASCII
+            // rather than just the three bytes the writer rejects, so the rule survives the
+            // writer's prohibitions being tightened.
+            if (!api.parse.printableAscii(ct)) return failPlain(out, .invalid_content_type);
             if (ct.len > 0) work.content_type = ct;
         }
 
-        // 7. Idempotency.
+        // 8. Idempotency.
         if (in.header("idempotency-key")) |raw| {
             // "Any string, 1-255 bytes" (`02-api.md`). A header that cannot be used as a
             // key is a malformed request rather than a validation failure on an entry
@@ -602,14 +658,20 @@ pub const Service = struct {
     /// the idempotency table kept (D61) — so it is what the first response said, not what
     /// the entry has since become.
     fn replayInto(self: *Service, out: *Reply, work: *const WriteWork, r: idempotency.Replay) bool {
-        const buf = out.out;
-        if (buf.len < storage.store.read_buffer_bytes) return false;
+        // A buffer of our own, not `out.out` (D67). `out.out` is the slot's tail, which only
+        // holds a whole record while the request body is under ~3 KB — so using it made
+        // every larger replay re-execute, charge a credit, and overwrite the entry, which is
+        // the opposite of what an idempotency key is for. A claim cannot fail: one job per
+        // worker, one buffer per worker.
+        const claim = self.replays.acquire() orelse return false;
+        defer self.replays.release(claim.index);
+        const buf = claim.buffer;
 
         const found = self.store.readAt(work.account_id, r.location, buf) catch return false;
         const got = found orelse return false;
 
-        // Rendered into scratch rather than `out.out`, which is currently holding the record
-        // the metadata is being read out of.
+        // Rendered into scratch rather than the read buffer, which is currently holding the
+        // record the metadata is being read out of.
         var scratch: [1024]u8 = undefined;
         var body = json.Writer.init(&scratch);
         writeMetadataOf(&body, got) catch return false;
@@ -838,4 +900,114 @@ test {
     _ = json;
     _ = ids;
     _ = idempotency;
+}
+
+
+// ---------------------------------------------------------------------------
+// Replay buffers (D67)
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "a replay buffer is large enough for the largest record that can exist" {
+    // The whole point of D67: `Reply.out` is the slot's *tail*, which is only this large
+    // while the request body is under about 3 KB. These are not.
+    try testing.expect(storage.store.read_buffer_bytes >= storage.config.max_body_bytes);
+    const one = @sizeOf(@TypeOf(@as(ReplayBuffers, undefined).buffers[0]));
+    try testing.expectEqual(@as(usize, storage.store.read_buffer_bytes), one);
+}
+
+test "there is one buffer per I/O worker, so a claim can never fail" {
+    const buffers = try testing.allocator.create(ReplayBuffers);
+    defer testing.allocator.destroy(buffers);
+    buffers.init();
+
+    var claims: [server.config.io_workers]ReplayBuffers.Claim = undefined;
+    for (&claims) |*c| {
+        c.* = buffers.acquire() orelse return error.ClaimFailed;
+    }
+
+    // Every worker holding one at once is the worst case, and it is exactly covered.
+    try testing.expectEqual(@as(usize, server.config.io_workers), claims.len);
+
+    // One more than there are workers cannot be satisfied — which is fine, because no
+    // ninth job can exist, and the caller degrades to re-executing rather than misbehaving.
+    try testing.expect(buffers.acquire() == null);
+
+    for (claims) |c| buffers.release(c.index);
+    // All released, so the pool is whole again.
+    const again = buffers.acquire() orelse return error.ClaimFailed;
+    try testing.expectEqual(@as(u5, 0), again.index);
+    buffers.release(again.index);
+}
+
+test "claims are exclusive: no two hold the same bytes" {
+    const buffers = try testing.allocator.create(ReplayBuffers);
+    defer testing.allocator.destroy(buffers);
+    buffers.init();
+
+    const a = buffers.acquire() orelse return error.ClaimFailed;
+    const b = buffers.acquire() orelse return error.ClaimFailed;
+    try testing.expect(a.index != b.index);
+    try testing.expect(a.buffer.ptr != b.buffer.ptr);
+    // Non-overlapping, not merely different: a replay writes a whole record into this.
+    const a_end = @intFromPtr(a.buffer.ptr) + a.buffer.len;
+    const b_start = @intFromPtr(b.buffer.ptr);
+    try testing.expect(a_end <= b_start or @intFromPtr(b.buffer.ptr) + b.buffer.len <= @intFromPtr(a.buffer.ptr));
+
+    buffers.release(a.index);
+    buffers.release(b.index);
+}
+
+test "a released buffer is reused rather than leaked" {
+    const buffers = try testing.allocator.create(ReplayBuffers);
+    defer testing.allocator.destroy(buffers);
+    buffers.init();
+
+    // Many more acquire/release cycles than there are buffers, which is what a long-lived
+    // process does. A leak would exhaust the pool and start returning null.
+    for (0..1000) |_| {
+        const c = buffers.acquire() orelse return error.ClaimFailed;
+        buffers.release(c.index);
+    }
+    try testing.expect(buffers.acquire() != null);
+}
+
+test "concurrent claims never hand out the same buffer" {
+    const buffers = try testing.allocator.create(ReplayBuffers);
+    defer testing.allocator.destroy(buffers);
+    buffers.init();
+
+    // The property that matters on the I/O worker pool: two threads claiming at once must
+    // not both be given the same bytes to read a record into.
+    const Worker = struct {
+        buffers: *ReplayBuffers,
+        seen: [server.config.io_workers]std.atomic.Value(u32),
+        collisions: std.atomic.Value(u32) = .init(0),
+
+        fn run(self: *@This()) void {
+            for (0..2000) |_| {
+                const c = self.buffers.acquire() orelse continue;
+                // While held, mark it. Anyone else marking the same slot is a collision.
+                const before = self.seen[c.index].fetchAdd(1, .acq_rel);
+                if (before != 0) _ = self.collisions.fetchAdd(1, .monotonic);
+                std.atomic.spinLoopHint();
+                _ = self.seen[c.index].fetchSub(1, .acq_rel);
+                self.buffers.release(c.index);
+            }
+        }
+    };
+
+    const w = try testing.allocator.create(Worker);
+    defer testing.allocator.destroy(w);
+    w.* = .{ .buffers = buffers, .seen = undefined };
+    for (&w.seen) |*s| s.* = .init(0);
+
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{w});
+    for (threads) |t| t.join();
+
+    try testing.expectEqual(@as(u32, 0), w.collisions.load(.monotonic));
+    // And the pool is not left claimed by a thread that exited.
+    try testing.expectEqual(@as(u32, 0), buffers.claimed.load(.acquire));
 }

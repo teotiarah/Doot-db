@@ -93,6 +93,15 @@ pub fn main(init: std.process.Init) !u8 {
     // Not field-by-field: the embedded mutex would be left holding garbage.
     idem.init();
 
+    // ~2 MB, one record-sized buffer per I/O worker, so a replay has somewhere to re-read
+    // the record it is reproducing (D67).
+    const replays = gpa.create(service.ReplayBuffers) catch |err| {
+        boot.fatalError("replay buffers", err);
+        return 1;
+    };
+    defer gpa.destroy(replays);
+    replays.init();
+
     var svc = service.Service.init(.{
         .store = store,
         .control = ctl,
@@ -101,6 +110,7 @@ pub fn main(init: std.process.Init) !u8 {
         // The engine ceiling every plan maximum is clamped against (D56).
         .max_ttl_s = cfg.options.max_ttl_s,
         .idempotency = idem,
+        .replays = replays,
     });
 
     // ---- maintenance, and the loop that wakes it ----

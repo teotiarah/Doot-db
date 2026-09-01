@@ -32,6 +32,7 @@ pub const Code = enum {
     invalid_limit,
     missing_tag,
     content_type_too_long,
+    invalid_content_type,
     invalid_request,
     // 401
     missing_credentials,
@@ -76,6 +77,7 @@ pub const Code = enum {
             .invalid_limit,
             .missing_tag,
             .content_type_too_long,
+            .invalid_content_type,
             .invalid_request,
             => 400,
             .missing_credentials, .invalid_credentials => 401,
@@ -127,6 +129,7 @@ pub const Code = enum {
             .invalid_limit => "limit must be between 1 and 100.",
             .missing_tag => "Listing entries requires exactly one tag parameter.",
             .content_type_too_long => "Content-Type may be at most 128 bytes.",
+            .invalid_content_type => "Content-Type must contain only printable ASCII characters.",
             .invalid_request => "The request line or headers could not be parsed.",
             .missing_credentials => "Provide an API key as 'Authorization: Bearer <key>'.",
             .invalid_credentials => "The API key is unknown or has been revoked.",

@@ -202,10 +202,47 @@ has "an oversized body is 413" "HTTP/1.1 413 Content Too Large" "$RESP"
 has "an oversized body names the code" '"code":"body_too_large"' "$RESP"
 has "an oversized body ends the connection" "Connection: close" "$RESP"
 
+# ---------------------------------------------------------------------------
+hdr "the 500 row of the catalogue"
+# ---------------------------------------------------------------------------
+
+# `/fault` is a fixture that fails on purpose, and it is the only way to reach this row
+# (D65). After D64 closed the poisoned-`Content-Type` defect, no request can make the real
+# service return a 500: every remaining site is a defensive branch on a state the request
+# path cannot produce. So what these three lines prove is the 500's *wire shape* — status,
+# stable code, and a closed connection — and deliberately not that a client can cause one.
+# The fixture lives here rather than in the data plane so that no production code path
+# exists whose only purpose is to fail.
+RESP="$($CURL -i "$BASE/fault" 2>/dev/null)"
+has "a failing handler is 500" "HTTP/1.1 500 Internal Server Error" "$RESP"
+has "a 500 names the code" '"code":"internal_error"' "$RESP"
+has "a 500 is JSON like every other error" "Content-Type: application/json" "$RESP"
+# D52: it says nothing about what went wrong, on purpose. `/fault` is the path, so if the
+# path leaked into the body this would catch it.
+lacks "a 500 leaks nothing about the cause" "fault" "$RESP"
+
+# Deliberately *not* asserted here: `Connection: close`. A 500 raised by a handler keeps the
+# connection, like every other handler error, while a 500 the transport raises for itself
+# goes through the terminal path and closes. Both are correct and they are different shapes,
+# so the closing shape is asserted where the transport actually produces it — the 413, 431
+# and 411 cases above.
+has "a handler's 500 keeps the connection, like its other errors" "Connection: keep-alive" "$RESP"
+
 # A header block past the 8 KB ceiling.
 BIG_HEADER="$(head -c 9000 /dev/zero | tr '\0' 'a')"
 RESP="$($CURL -i -H "X-Big: $BIG_HEADER" "$BASE/fixed" 2>/dev/null)"
 has "an oversized head is 431" "431 Request Header Fields Too Large" "$RESP"
+# The code, not only the status. Every error the transport renders carries one, and a check
+# that asserts 431 alone cannot tell `headers_too_large` from any other 431 (D65).
+has "an oversized head names the code" '"code":"headers_too_large"' "$RESP"
+
+# The header *count* ceiling, which is a separate bound from the byte ceiling: 65 tiny
+# headers is a 431 however small the head is.
+MANY=()
+for i in $(seq 1 70); do MANY+=(-H "X-P$i: v"); done
+RESP="$($CURL -i "${MANY[@]}" "$BASE/fixed" 2>/dev/null)"
+has "too many headers is 431 even when the head is small" "431 Request Header Fields Too Large" "$RESP"
+has "and names the same code" '"code":"headers_too_large"' "$RESP"
 
 # A head over the inline buffer but under the ceiling is ordinary traffic.
 MID_HEADER="$(head -c 2000 /dev/zero | tr '\0' 'p')"

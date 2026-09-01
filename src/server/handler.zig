@@ -105,10 +105,16 @@ pub const Reply = struct {
     /// Set alongside returning `.deferred`. Runs on an I/O worker thread and fills in
     /// the rest of this same `Reply`; the loop sends whatever it leaves.
     ///
-    /// It receives the handler's own context back, so it can reach a `Store` without the
-    /// transport ever holding one. Everything it is handed outlives it: the head and body
-    /// live in the pooled `Request`, which is deliberately not released while a job is in
-    /// flight.
+    /// It receives **the context of the handler registered with the `Loop`** — not the
+    /// context of whoever assigned this field. The two are the same thing in every normal
+    /// arrangement, and they differ in exactly one: a handler that *decorates* another and
+    /// delegates to it. Such a handler must not defer, because the inner handler's work
+    /// function would be handed the outer handler's pointer and reinterpret it. If a
+    /// decorating handler is ever genuinely needed, this field has to become a
+    /// `{ ctx, fn }` pair rather than a bare function (D66 amendment).
+    ///
+    /// Everything it is handed outlives it: the head and body live in the pooled
+    /// `Request`, which is deliberately not released while a job is in flight.
     ///
     /// It runs on another thread, so it must not touch anything the loop owns — no
     /// connection state, no ring, no statistics.
