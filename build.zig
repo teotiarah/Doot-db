@@ -29,6 +29,20 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "storage", .module = storage }},
     });
 
+    // ---- transport (M2: io_uring loop, HTTP/1.1 framing, pooled connections) ----
+    // Depends on the engine for its syscall layer and the read-slot size, and on the
+    // request layer for the error catalogue. Knows nothing about endpoints: routing
+    // plugs in above it through `server.Handler`.
+    const server = b.addModule("server", .{
+        .root_source_file = b.path("src/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "storage", .module = storage },
+            .{ .name = "api", .module = api },
+        },
+    });
+
     // ---- unit tests ----
     const test_step = b.step("test", "Run unit tests");
 
@@ -38,6 +52,7 @@ pub fn build(b: *std.Build) void {
         .{ "storage-tests", storage },
         .{ "control-tests", control },
         .{ "api-tests", api },
+        .{ "server-tests", server },
     }) |t| {
         const unit_tests = b.addTest(.{ .name = t[0], .root_module = t[1] });
         const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -61,6 +76,23 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
     }
 
-    const verify_step = b.step("verify", "Build the M1 exit-condition harness");
+    // ---- M2 transport harness ----
+    // The real event loop behind a fixed handler, so an HTTP client we did not write
+    // can judge our framing. Driven by tools/transport-check.sh.
+    const transport = b.addExecutable(.{
+        .name = "transport",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/transport.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "server", .module = server },
+                .{ .name = "storage", .module = storage },
+            },
+        }),
+    });
+    b.installArtifact(transport);
+
+    const verify_step = b.step("verify", "Build the exit-condition harnesses");
     verify_step.dependOn(b.getInstallStep());
 }

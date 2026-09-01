@@ -56,7 +56,7 @@ jobs:
       - name: Unit tests
         run: zig build test --summary all
 
-      - name: Build the exit-condition harness
+      - name: Build the exit-condition harnesses
         run: zig build verify
 
       # Run on tmpfs deliberately. The harness is single-threaded, so every write becomes
@@ -70,3 +70,10 @@ jobs:
           df -h /dev/shm
           mkdir -p /dev/shm/doot-m1
           ./zig-out/bin/m1 all /dev/shm/doot-m1
+
+      # The transport's own tests run inside `zig build test` against a client written
+      # alongside it, so both sides can share a misunderstanding and still agree. This
+      # step points `curl` at it instead — a client that decides for itself whether our
+      # framing, connection reuse and `Expect: 100-continue` handling are correct.
+      - name: M2 transport checks
+        run: tools/transport-check.sh

@@ -41,7 +41,9 @@ that turned out to be wrong is more useful than a clean record.
    first, code second. A design question is never settled inside an implementation
    diff.
 2. **Constants live in one place.** Every limit, size and interval is defined in
-   `01-product.md` (user-visible) or `04-storage.md` (internal). Other docs reference,
-   never restate.
+   `01-product.md` (user-visible), `04-storage.md` (storage-internal) or
+   `05-architecture.md` (process model and transport). Other docs reference, never
+   restate. In code the mirrors are `src/storage/config.zig` and `src/server/config.zig`;
+   nothing else may hardcode a limit.
 3. **Vocabulary is enforced.** See `00-vision.md`. The words "key" and "value" do not
    appear in code identifiers, endpoints, error messages, docs or UI copy.
