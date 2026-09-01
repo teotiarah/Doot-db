@@ -501,10 +501,16 @@ compounding.
 | state | why RAM only |
 |---|---|
 | rate-limit buckets | 16 B/account; every bucket starts full after a restart, which is the generous direction. Persisting a token count across a ten-second outage preserves a number that has already refilled |
-| idempotency records | ~50 B, capped at 1M, lost on restart (D42). Persisting would put an `fsync` on the path every automated caller is told to use, and would leave orphaned in-progress keys returning `409` for 24 hours after a crash |
+| idempotency records | 48 B, capped at 1M, lost on restart (D42). Persisting would put an `fsync` on the path every automated caller is told to use, and would leave orphaned in-progress keys returning `409` for 24 hours after a crash |
 
-At the idempotency cap, records closest to expiry are dropped first. **A full table never
-rejects a write** — an optional header must not be able to fail a valid request, and
+A record holds two truncated hashes, the packed location of the record it wrote, a status
+and an expiry — **not** the metadata it replays. That does not fit in 48 bytes, so a replay
+re-reads the record at that location and renders the document from it (D61).
+
+At the idempotency cap, records closest to expiry are dropped first. Because every record
+gets the same 24-hour window from its own insertion, expiry order *is* insertion order, so
+that rule is a write cursor that wraps rather than a priority queue (D62). **A full table
+never rejects a write** — an optional header must not be able to fail a valid request, and
 dropping a record degrades to re-execution, which is what omitting the header already does.
 
 ## Backup
@@ -545,7 +551,7 @@ The number this design exists to control. At 10 million live entries on a 16 GB 
 |---|---|---|
 | index | 29 B/entry | 286 MB |
 | tag chain heads | O(tags/account) | ~32 MB |
-| idempotency records | ~50 B, capped at 1M | ≤ 50 MB |
+| idempotency records | 48 B × 1M, plus an 8 MB index into them (D62) | ~56 MB |
 | in-flight request buffers | 256 concurrent × 260 KiB | 65 MB |
 | control-plane image | O(accounts), ~200 B each plus keys and sessions | ~10 MB at 10k accounts |
 | connection state | pooled, 0.63 KB/conn at a 512 B idle read buffer (D28) | ~1.3 MB at 2,000 |

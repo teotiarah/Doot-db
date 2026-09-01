@@ -1812,6 +1812,148 @@ choice.
 
 ---
 
+## D60 — The metadata document, which `02-api.md` referred to and did not define · locked
+
+`02-api.md` says of a write: "Body is a JSON metadata document (see Metadata shape)."
+There is no Metadata shape section. It has been a dangling reference since the API was
+written, and the write path is the first thing that has to emit one.
+
+Resolution: **the same document the list endpoint already publishes per entry**, as a
+single object rather than inside an array:
+
+```json
+{
+  "name": "ci/last-green-sha",
+  "tags": ["ci", "main"],
+  "content_type": "text/plain",
+  "size": 13,
+  "created_at": "2026-08-30T20:41:07Z",
+  "expires_at": "2026-09-06T20:41:07Z"
+}
+```
+
+Defined once in `02-api.md` and referenced by `PUT`, `POST` and the list, so the three
+cannot drift. One renderer in code for the same reason.
+
+The list's shape is the anchor because it is the one already published, and inventing a
+second shape for writes would mean a caller that reads its own write back through a
+listing gets two different descriptions of one entry.
+
+**`seq` is deliberately not in it.** It is the engine's ordering number, it appears in
+`GET /healthz` only as a liveness signal, and putting it on a write response invites
+callers to depend on it — at which point it becomes a compatibility obligation and the
+write path can never be reordered again. Nothing in the product needs it.
+
+`created_at` on an overwrite is the *new* write's time, because `PUT` replaces the entry
+completely including its lifetime (D19). An overwrite is not an edit.
+
+---
+
+## D61 — An idempotency record stores a location, not an outcome · locked
+
+Two locked statements could not both be satisfied, and the write path is where they meet.
+
+`02-api.md` says a replay "replays the recorded outcome (status and metadata)".
+`04-storage.md` budgets idempotency records at **~50 B, capped at 1M, ≤ 50 MB**, and D42
+locked that cap.
+
+A metadata document (D60) does not fit in 50 bytes. The name alone is up to 256, the tags
+up to 324, the content type up to 128. Stored inline, a record is roughly 750 B and the
+table is 750 MB at the cap — on a box that also holds a 286 MB index, 65 MB of request
+buffers and 107 MB of transport reservation. Inline storage and the cap are mutually
+exclusive.
+
+Resolution: **a record stores the packed `Location` of the record it wrote, and a replay
+re-reads it.** 48 bytes, under budget:
+
+| field | bytes | why |
+|---|---|---|
+| key hash | 16 | truncated SHA-256 of `(account_id, key)`. 128 bits is not collidable, and a collision would return another account's outcome |
+| body hash | 16 | truncated. Detects same key with a different body, which is `409` |
+| location | 8 | the packed segment and offset of the record written |
+| status | 1 | `200` or `201`, which a replay must reproduce and cannot re-derive |
+| expiry | 4 | 24 hours from insertion |
+
+The location is what makes this work, and it works **uniformly for `PUT` and `POST`**. The
+record on disk already holds the name, the tags, the content type, the size and both
+timestamps — everything the metadata document needs. So the replay reads one record and
+renders the same document the original response did, without the table holding any of it.
+It also removes what would otherwise be an asymmetry: a `PUT` replay could have recovered
+its name from the request path, but a `POST` replay could not, because that name was
+server-assigned.
+
+**A replay returns the original entry's metadata, not the current entry's**, and that is
+the correct reading of "the recorded outcome". Segments are append-only and reclaimed
+wholesale, so a superseded record is still readable at its old location — an overwrite
+between the original and the replay does not change what the replay reports.
+
+Rejected: **raising the cap's memory budget to store outcomes inline.** 750 MB for a
+convenience feature, against 286 MB for the index that is the product.
+
+Rejected: **storing the name and re-rendering from the request.** Asymmetric between `PUT`
+and `POST`, and a name is 256 B on its own — five times the budget for one field.
+
+Rejected: **re-reading the entry by name rather than by location.** It would return the
+*current* entry, so an overwrite between the original and the replay would make the replay
+report metadata the original never sent.
+
+**Accepted consequence: a replay whose location no longer reads re-executes.** An entry
+with a lifetime under 24 hours can expire, and its segment be reclaimed, while its
+idempotency record is still live. The read then fails and there is no outcome to reproduce.
+The record is treated as absent and the request executes normally, consuming a credit —
+which is precisely the degradation D42 already accepted for a record dropped at the cap:
+"dropping a record degrades to re-execution, which is what omitting the header already
+does." It needs a retry arriving after the entry has both expired and been reclaimed, which
+is rare, and it fails in the direction of doing the work rather than lying about it.
+
+This needs one engine addition: reading a record by location. `Store` gains it rather than
+the service reaching into `segs`, per D58.
+
+---
+
+## D62 — The idempotency table is a FIFO ring, in the service layer · locked
+
+**Where.** `src/service/`, owned by the `Service` — not `Control`, even though `Control` is
+where D58 put the rate-limit bucket.
+
+The bucket is two fields on an `Account` that already exists, and it survives in RAM beside
+state the log does reconstruct. `Control`'s identity is "an append-only log with a full
+in-RAM image" (D40), and what makes it auditable is that its memory is exactly its log
+replayed. A 50 MB table that is deliberately *never* logged (D42) breaks that
+correspondence — it would be the one part of the control plane a replay cannot rebuild.
+Idempotency is request-path state, and the service layer is where request-path state lives.
+
+**Structure: a fixed ring of records, plus an open-addressed index into it.**
+
+The eviction rule D42 locked is "records closest to expiry are dropped first". Every record
+gets the same 24-hour window measured from its own insertion, so **expiry order is
+insertion order** — and dropping the closest to expiry is dropping the oldest. That turns
+what sounds like a priority queue into a write cursor that wraps: O(1), no heap, no scan,
+no ordering to maintain. When the cursor lands on a live record, that record's index entry
+is removed and the slot is reused.
+
+Memory, stated honestly rather than reusing the old estimate: 1M × 48 B for the ring plus a
+2M-slot `u32` index at 8 MB is **~56 MB**, not the ≤ 50 MB `04-storage.md` carried. The
+figure there was an estimate made before the record had a layout; it is corrected rather
+than met by shrinking the cap, because the cap is the published 24-hour window's real
+constraint and 6 MB is not worth trading it for.
+
+**Concurrency.** The check-and-reserve is memory-only, so it happens on the event loop
+where the rest of validation does (D57) — which also means two requests carrying one key
+cannot both pass the check, because a single loop serialises them by construction. The
+completion, which records the location and the status, happens on the I/O worker once the
+write is durable. The table therefore has its own mutex, because two threads touch it.
+
+That split is what makes `409 idempotency_in_progress` reachable at all: the reservation
+exists precisely for the window between the loop admitting the request and the worker
+finishing it.
+
+**A reservation is always resolved.** If the write fails, the reservation is removed rather
+than left in place — an in-progress marker with no request behind it is the orphan D42
+refused to inherit from a durable table, and it would be no better for being in RAM.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
