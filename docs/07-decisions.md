@@ -2665,7 +2665,32 @@ outstanding OTP codes and OAuth `state` values.** All three degrade to an action
 already knows how to take — log in again, request a new code, click the button again — and
 none of them can silently succeed when they should have failed.
 
----
+**M3 amendment — "the earlier of the log and the checkpoint" was wrong, and writing
+`applyLocked` is what showed it.** The rule above made the safe direction explicit by
+comparison, and the comparison cannot fire: a refresh only ever *extends* an expiry, so a
+checkpoint is always later than the `session_created` it belongs to, so "earlier of" always
+picks creation. That has two consequences, both bad. `sessions_checkpoint` becomes dead code
+— written on every cadence and never once able to affect a replay. And the sliding window
+stops surviving a restart at all, which is the entire reason the event exists.
+
+The correct rule is the one credits already use: **the checkpoint is authoritative, and the
+last one seen wins.** The safe direction is not something to enforce with a comparison,
+because it is already the *shape* of checkpointing — a crash loses the most recent
+checkpoints, so it loses the most recent extensions, so the session expires earlier than it
+would have. Exactly parallel to D41, where a crash loses recent deductions and the customer
+gains: same mechanism, and each falls on its own safe side without being told to.
+
+Revocation is unaffected and that is what makes this sound. `session_revoked` is a logged
+event, replay applies it in order, and a revoked session is removed from the image — so no
+checkpoint for it is ever written afterwards, and none can resurrect it. The failure D70
+feared, a session outliving its revocation, is prevented by the revocation being durable
+rather than by the expiry being pessimistic.
+
+**No absolute ceiling on total session lifetime is introduced.** `06-auth.md` specifies 30
+days sliding, refreshed on use when over 24 hours old, which means an active user stays
+signed in indefinitely — and that is a product choice already made, not an oversight to
+correct inside an implementation diff. The bounds that do exist are logout, password change
+invalidating every session for the account, and account deletion.
 
 ## D71 — Argon2id parameters, and where password hashing runs · locked
 

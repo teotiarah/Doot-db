@@ -62,6 +62,52 @@ pub fn limits(plan: Plan) Limits {
     return table[@intFromEnum(plan)];
 }
 
+// ---------------------------------------------------------------------------
+// Control-plane limits (D74)
+// ---------------------------------------------------------------------------
+//
+// Not per-plan, and deliberately so: the dashboard costs the same to serve whoever is
+// signed in, and `01-product.md` quotes one number for it rather than a column per tier.
+// They live here beside the data-plane table because both mirror `01-product.md` and
+// working rule 2 wants one home per constant, not one home per plane.
+
+/// Sustained control-plane operations per minute, per account.
+pub const control_rate_per_min: u32 = 300;
+pub const control_burst: u32 = 300;
+
+/// Unauthenticated `/app/auth/*`, per client address.
+pub const control_unauth_rate_per_min: u32 = 20;
+pub const control_unauth_burst: u32 = 20;
+
+/// Unauthenticated `/app/auth/*`, across the whole surface.
+///
+/// Not redundant with the per-address bucket: that one depends on believing the client
+/// address, which behind Cloudflare means believing a header, and that is only sound once
+/// the origin refuses connections which did not arrive through Cloudflare. Until then this
+/// is what actually bounds the surface (D74, D68).
+pub const control_global_rate_per_min: u32 = 600;
+pub const control_global_burst: u32 = 600;
+
+/// A fixed table, so an attacker rotating addresses cannot grow it.
+///
+/// Lossy on collision, which fails in the safe direction: two addresses sharing a bucket
+/// makes the limit stricter for both and never looser. A map that allocated per address
+/// would be a memory-exhaustion vector on the one surface that has to survive being
+/// attacked.
+pub const control_address_buckets: usize = 4096;
+
+pub fn controlRefillPerSecond() f64 {
+    return @as(f64, @floatFromInt(control_rate_per_min)) / 60.0;
+}
+
+pub fn controlUnauthRefillPerSecond() f64 {
+    return @as(f64, @floatFromInt(control_unauth_rate_per_min)) / 60.0;
+}
+
+pub fn controlGlobalRefillPerSecond() f64 {
+    return @as(f64, @floatFromInt(control_global_rate_per_min)) / 60.0;
+}
+
 /// The effective maximum lifetime for a plan, given what the store is configured for.
 ///
 /// There are two ceilings and the lower one wins: the **engine** ceiling
