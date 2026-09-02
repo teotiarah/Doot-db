@@ -264,7 +264,7 @@ request can provoke one. A row whose cause is a bug cannot have a script that ca
 
 ---
 
-## M3 — Accounts · **IN PROGRESS**
+## M3 — Accounts · **COMPLETE**
 
 This is where D63's one recorded open question gets answered: **how the first account comes
 into being.** Signup does it, and nothing else needs to.
@@ -302,8 +302,8 @@ rules that could not have worked: D70's session-expiry comparison could never fi
 peer capture would have cost a syscall per connection for a fallback the production shape never
 reaches.
 
-**Outstanding:** GitHub OAuth's token exchange, and a `curl` harness for the `/app` surface. The
-OAuth routes are deliberately unrouted until the exchange exists (D82).
+GitHub OAuth is built: the authorize redirect with its `state` binding, and the token exchange
+on an I/O worker. `tools/app-check.sh` drives the whole surface with `curl` — 60 checks.
 
 - GitHub OAuth with `state` binding
 - Email + password, Argon2id, OTP verification, queued outbound mail via ZeptoMail
@@ -313,9 +313,17 @@ OAuth routes are deliberately unrouted until the exchange exists (D82).
 - Password reset, account deletion
 - Separate control-plane rate-limit bucket
 
-**Exit:** both signup paths reach an issued API key. Revocation takes effect on the next
-request. Enumeration probes on signup, login and reset return identical responses — and the
-timing of those three is asserted, not only their bodies (D75).
+**Exit — met.** Reproduce with `tools/app-check.sh`.
+
+| condition | state |
+|---|---|
+| both signup paths reach an issued API key | **met.** Both end in a session and the key comes from `POST /app/keys` (D83) — one shape, because a top-level OAuth redirect cannot carry a credential |
+| revocation takes effect on the next request | **met**, asserted with no interval and nothing to expire between the revoke and the next `/v1` call |
+| enumeration probes return identical responses | **met**, and the *timing* with it: measured over the wire at **179 ms known against 178 ms unknown** (D75) |
+
+The timing row is the one that needed a harness. An unknown address pays for a full Argon2id
+verification against a generated dummy hash, and the first run of the script proved why it has
+to be measured from outside: a 5 ms "unknown" turned out to be a `429`, not a fast path.
 
 ---
 

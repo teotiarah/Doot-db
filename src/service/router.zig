@@ -81,13 +81,9 @@ pub const AppRoute = union(enum) {
     login,
     /// `POST /app/auth/logout`
     logout,
-    // `GET /app/auth/github` and its callback are deliberately **absent** until the OAuth
-    // exchange exists, for the same reason `/app/stream` is: a route that cannot complete
-    // tells a client the path works and then fails in a way no error code describes
-    // honestly. The variants stay declared so `needsSynchroniser` and the tests keep
-    // covering them, and `routeApp` starts returning them in the commit that implements
-    // the flow.
+    /// `GET /app/auth/github` — OAuth entry.
     github_start,
+    /// `GET /app/auth/github/callback`
     github_callback,
     /// `POST /app/auth/password/reset` — request a reset code.
     password_reset,
@@ -182,6 +178,15 @@ pub fn routeApp(method: Method, path: []const u8) AppRoute {
     }
     if (std.mem.eql(u8, path, "/app/auth/logout")) {
         return if (method == .post) .logout else .{ .wrong_method = "POST" };
+    }
+    // The callback is checked **before** the entry point: `/app/auth/github` is a prefix of
+    // `/app/auth/github/callback`, so matching the shorter one first makes the callback
+    // unreachable and the whole flow fails at its last step.
+    if (std.mem.eql(u8, path, "/app/auth/github/callback")) {
+        return if (method == .get) .github_callback else .{ .wrong_method = "GET" };
+    }
+    if (std.mem.eql(u8, path, "/app/auth/github")) {
+        return if (method == .get) .github_start else .{ .wrong_method = "GET" };
     }
     if (std.mem.eql(u8, path, "/app/auth/password/reset")) {
         return if (method == .post) .password_reset else .{ .wrong_method = "POST" };
@@ -366,6 +371,8 @@ test "every route in 06-auth.md's control-plane table exists" {
     try testing.expectEqual(AppRoute.verify, routeApp(.post, "/app/auth/verify"));
     try testing.expectEqual(AppRoute.login, routeApp(.post, "/app/auth/login"));
     try testing.expectEqual(AppRoute.logout, routeApp(.post, "/app/auth/logout"));
+    try testing.expectEqual(AppRoute.github_start, routeApp(.get, "/app/auth/github"));
+    try testing.expectEqual(AppRoute.github_callback, routeApp(.get, "/app/auth/github/callback"));
     try testing.expectEqual(AppRoute.password_reset, routeApp(.post, "/app/auth/password/reset"));
     try testing.expectEqual(AppRoute.password_confirm, routeApp(.post, "/app/auth/password/confirm"));
     try testing.expectEqual(AppRoute.account, routeApp(.get, "/app/account"));
@@ -384,14 +391,15 @@ test "account deletion has a route, which the surface table had omitted" {
     try testing.expectEqualStrings("GET, DELETE", routeApp(.post, "/app/account").wrong_method);
 }
 
-test "the OAuth paths are unrouted until the exchange exists" {
-    // Declared as variants, not yet reachable. When the flow lands, the callback must be
-    // matched *before* the entry point -- `/app/auth/github` is a prefix of
-    // `/app/auth/github/callback`, so matching the shorter one first makes the callback
-    // unreachable and the whole flow fails at its last step.
-    try testing.expectEqual(AppRoute.unrouted, routeApp(.get, "/app/auth/github"));
-    try testing.expectEqual(AppRoute.unrouted, routeApp(.get, "/app/auth/github/callback"));
+test "the OAuth callback is not swallowed by the entry point" {
+    // `/app/auth/github` is a prefix of `/app/auth/github/callback`, so matching the shorter
+    // one first would make the callback unreachable and the flow would fail at its last step.
+    try testing.expectEqual(AppRoute.github_callback, routeApp(.get, "/app/auth/github/callback"));
+    try testing.expectEqual(AppRoute.github_start, routeApp(.get, "/app/auth/github"));
+    // And neither absorbs a longer path.
+    try testing.expectEqual(AppRoute.unrouted, routeApp(.get, "/app/auth/github/callback/extra"));
     try testing.expectEqual(AppRoute.unrouted, routeApp(.get, "/app/auth/githubx"));
+    try testing.expectEqualStrings("GET", routeApp(.post, "/app/auth/github").wrong_method);
 }
 
 test "the explorer is read-only, and says so with a 405 rather than a 404" {
@@ -423,6 +431,7 @@ test "every Allow the control plane advertises is a method that routes" {
     // earn another 405.
     inline for (.{
         .{ "/app/auth/login", "POST" },
+        .{ "/app/auth/github", "GET" },
         .{ "/app/account", "GET, DELETE" },
         .{ "/app/keys", "GET, POST" },
         .{ "/app/keys/key_1", "DELETE" },

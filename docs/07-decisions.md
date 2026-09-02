@@ -3285,6 +3285,53 @@ operator has a reason to choose, and it would make the surface depend on which w
 
 ---
 
+## D83 — Both signup paths end in a session, and the first API key is issued by the dashboard · locked
+
+`06-auth.md` says both signup paths "land in the same place: a dashboard with an API key
+already issued", and `01-product.md` says "an API key is issued immediately on first landing in
+the dashboard". Building the two paths showed those sentences describe two different mechanisms
+unless something is decided.
+
+The email path's `POST /app/auth/verify` is an XHR from a page, so it can return JSON — and the
+first implementation had it return the new key directly. **The OAuth callback cannot.** It is a
+top-level browser navigation back from GitHub; its response is a document or a redirect, and a
+key delivered in one would be a credential in the browser's history and in any referrer.
+
+Three ways out, and the asymmetry is the thing to resolve rather than paper over.
+
+Resolution: **both paths end by establishing a session and issuing no key. The dashboard's
+first-run screen calls `POST /app/keys`, which already exists.**
+
+- It is symmetric: each path does what its transport allows, and neither is a special case.
+- It needs **no new state**. The alternative — a one-time key retrieval tied to a fresh session
+  — is another table, another expiry, and another credential in flight.
+- It matches `01-product.md` literally: the key is issued *on first landing in the dashboard*,
+  which is the dashboard asking for one.
+- The key still appears exactly once, in the response to the request that created it (D76).
+  Nothing is retrievable later, which is the property that mattered.
+
+M3's exit condition — "both signup paths reach an issued API key" — is unchanged in substance
+and now has one shape: verify or callback, then `POST /app/keys`. The harness drives exactly
+that.
+
+Rejected: **returning the key from the OAuth callback in an HTML document.** It puts a
+credential in browser history, in the back button, and in any referrer the page later emits.
+
+Rejected: **redirecting with the key in a fragment.** Fragments stay out of referrers and
+server logs, which is why OAuth implicit flow used them — and the reason implicit flow was
+deprecated is that everything else about them is bad: history, extensions, and any script on
+the page.
+
+Rejected: **a one-time key handed over by the session's first `GET /app/account`.** It makes an
+otherwise idempotent read mutate state exactly once, which is the kind of surprise that reads
+as a bug forever after.
+
+**Accepted consequence: a fresh account has a session and no key until the dashboard asks.**
+Until M4 exists, a caller drives the second step itself — which is what the harness does, and
+what any script automating signup would do anyway.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |

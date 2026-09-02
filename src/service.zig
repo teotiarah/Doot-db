@@ -35,6 +35,7 @@ pub const ratelimit = @import("service/ratelimit.zig");
 pub const challenge = @import("service/challenge.zig");
 pub const mail = @import("service/mail.zig");
 pub const app = @import("service/app.zig");
+pub const github = @import("service/github.zig");
 
 const Incoming = server.handler.Incoming;
 const Reply = server.handler.Reply;
@@ -248,7 +249,7 @@ pub const Service = struct {
         // The unauthenticated half. Rate limited per address and under a global ceiling,
         // because there is no account to charge yet (D74).
         switch (route) {
-            .signup, .login, .verify, .password_confirm, .password_reset => {
+            .signup, .login, .verify, .password_confirm, .password_reset, .github_start, .github_callback => {
                 var key_buf: [server.net.client_key_bytes]u8 = undefined;
                 const address = app.clientAddress(in, &key_buf);
                 const d = st.unauth.take(address, self.clock.now());
@@ -263,22 +264,28 @@ pub const Service = struct {
                     .verify => self.verifyChallenge(in, out),
                     .password_reset => self.requestReset(in, out),
                     .password_confirm => self.beginConfirmReset(in, out),
+                    .github_start => self.githubStart(out),
+                    .github_callback => self.beginGithubCallback(in, out),
                     else => unreachable,
                 };
             },
-            // The OAuth variants are declared but not yet routed (D68's sibling reasoning);
-            // `routeApp` never returns them, so reaching here would be a routing bug.
-            .github_start, .github_callback => return failPlain(out, .not_found),
             else => {},
         }
 
         // Everything else needs a session. **The cookie, and never a bearer token** — the
         // separation `06-auth.md` requires, enforced here and asserted by tests.
-        const session = self.resolveSessionCookie(in) orelse
-            return failPlain(out, if (in.header("cookie") == null)
-                .missing_credentials
-            else
-                .invalid_credentials);
+        // The same two codes the data plane uses, because they mean the same thing -- but with
+        // control-plane messages. The catalogue's defaults tell the caller to send
+        // `Authorization: Bearer`, which is precisely what this surface must never accept, so
+        // the default message would be actively misleading here.
+        const session = self.resolveSessionCookie(in) orelse {
+            if (in.header("cookie") == null) {
+                out.failWith(.missing_credentials, "Sign in first: this surface authenticates with a session cookie.");
+            } else {
+                out.failWith(.invalid_credentials, "The session has expired or is no longer valid. Sign in again.");
+            }
+            return .complete;
+        };
 
         // The control plane's own bucket, so exploring data cannot exhaust the bucket a
         // production script depends on (D74, `01-product.md`).
@@ -459,7 +466,12 @@ pub const Service = struct {
         const granted: u32 = if (owner == id) control.plan.limits(.trial).granted_credits else 0;
         self.control.activateAccount(id, granted) catch return failPlain(out, .internal_error);
 
-        return self.issueKeyResponse(out, id, 201, "Created", granted);
+        // A session, and **no key** (D83). The dashboard's first-run screen calls
+        // `POST /app/keys`, which is the one way a key is ever issued — so the email and OAuth
+        // paths end identically even though only one of them can carry JSON back.
+        self.startSession(out, id) catch return failPlain(out, .internal_error);
+        out.ok(201, "Created");
+        return .complete;
     }
 
     /// Generates a key, records its digest, and returns the plaintext exactly once.
@@ -499,6 +511,169 @@ pub const Service = struct {
             return .complete;
         }
         return failPlain(out, .internal_error);
+    }
+
+    // ---- GET /app/auth/github and its callback ----
+
+    /// Redirects to GitHub, binding a fresh `state` to a short-lived cookie.
+    ///
+    /// The binding is what makes the callback trustworthy: a callback presenting a `state` we
+    /// never issued, or one issued to a different browser, is refused rather than acted on.
+    /// **Both halves are required** — the server-side entry proves we issued it, and the cookie
+    /// proves it was issued to *this* browser. Either alone is forgeable by someone who can
+    /// make the victim's browser follow a link.
+    fn githubStart(self: *Service, out: *Reply) Disposition {
+        const st = self.app.?;
+
+        const state = api.secret.sessionToken() catch return failPlain(out, .internal_error);
+        st.challenges.beginOauth(control.hashKey(&state), self.clock.now());
+
+        var cookie_buf: [api.cookie.max_set_cookie_bytes]u8 = undefined;
+        // No `Max-Age`: a browser that abandons the flow forgets it when it closes, and the
+        // server-side entry expires in ten minutes regardless.
+        const set = api.cookie.set(&cookie_buf, api.cookie.oauth_name, &state, null) catch
+            return failPlain(out, .internal_error);
+        out.headerCopy("Set-Cookie", set);
+
+        var url_buf: [640]u8 = undefined;
+        const url = github.authorizeUrl(
+            st.cfg.github_client_id,
+            st.cfg.public_origin,
+            &state,
+            &url_buf,
+        ) catch return failPlain(out, .internal_error);
+
+        out.ok(302, "Found");
+        out.headerCopy("Location", url);
+        // Nothing may cache a redirect that carries a one-time state.
+        out.header("Cache-Control", "no-store");
+        out.body = &.{};
+        return .complete;
+    }
+
+    const GithubCtx = struct {
+        code: [512]u8,
+        code_len: u16,
+    };
+
+    /// Validates the `state` on the loop, then hands the exchange to a worker.
+    ///
+    /// The state check happens here, before any outbound call: an unsolicited callback must
+    /// cost us nothing, and a round trip to GitHub for a request we can already refuse is
+    /// exactly what an attacker would use to make us do their network calls.
+    fn beginGithubCallback(self: *Service, in: Incoming, out: *Reply) Disposition {
+        const st = self.app.?;
+
+        // Query values are percent-decoded before use: GitHub's own code is alphanumeric, but
+        // the value on the wire is caller-supplied and decoding it once is what makes
+        // "the bytes GitHub gave us" and "the bytes we send back" the same string.
+        var code_buf: [512]u8 = undefined;
+        var state_buf: [128]u8 = undefined;
+        const raw_code = query.get(in.query(), "code") orelse
+            return failPlain(out, .invalid_request);
+        const raw_state = query.get(in.query(), "state") orelse
+            return failPlain(out, .invalid_request);
+        if (raw_code.len == 0 or raw_code.len > code_buf.len) return failPlain(out, .invalid_request);
+        if (raw_state.len == 0 or raw_state.len > state_buf.len) return failPlain(out, .invalid_request);
+        const code = api.form.decode(raw_code, &code_buf) catch
+            return failPlain(out, .invalid_request);
+        const state = api.form.decode(raw_state, &state_buf) catch
+            return failPlain(out, .invalid_request);
+
+        // The cookie half: was this state issued to this browser?
+        const cookie_state = api.cookie.get(in.header("cookie"), api.cookie.oauth_name) orelse
+            return failPlain(out, .invalid_request);
+        if (!std.crypto.timing_safe.eql(
+            [32]u8,
+            control.hashKey(state),
+            control.hashKey(cookie_state),
+        )) return failPlain(out, .invalid_request);
+
+        // The server-side half: did we issue it, and is this the first use? `takeOauth`
+        // consumes, so a replayed callback finds nothing.
+        if (!st.challenges.takeOauth(control.hashKey(state), self.clock.now())) {
+            return failPlain(out, .invalid_request);
+        }
+
+        const ctx = out.workCtx(GithubCtx);
+        ctx.code_len = @intCast(code.len);
+        @memcpy(ctx.code[0..code.len], code);
+        out.work = githubCallbackWork;
+        return .deferred;
+    }
+
+    fn githubCallbackWork(ctx_ptr: *anyopaque, _: Incoming, out: *Reply) void {
+        const self: *Service = @ptrCast(@alignCast(ctx_ptr));
+        const st = self.app.?;
+        const c = out.workCtx(GithubCtx);
+
+        const identity = github.exchange(
+            st.gpa,
+            st.cfg.github_client_id,
+            st.cfg.github_client_secret,
+            st.cfg.public_origin,
+            c.code[0..c.code_len],
+        ) catch |err| return switch (err) {
+            // The one failure a user can act on, so it is the one that is distinguishable.
+            error.NoVerifiedEmail => out.failWith(
+                .invalid_email,
+                "Your GitHub account has no verified email address. Verify one and try again.",
+            ),
+            else => out.fail(.internal_error),
+        };
+
+        const address = identity.email();
+        const anchor = api.email.anchorHash(address) catch return out.fail(.internal_error);
+
+        // Match on the GitHub id first, then the verified email, else create — the order
+        // `06-auth.md` specifies. The id leads because it is the anchor that cannot be
+        // reassigned; a username can, and an email can change hands between providers.
+        const account_id = self.control.githubOwner(identity.user_id) orelse
+            st.lookupAccount(anchor) orelse
+            blk: {
+                // GitHub verified the address, so the account is `active` immediately — there
+                // is nothing left for an OTP to prove.
+                const id = self.control.createAccount(address, .trial, .active, 0) catch
+                    return out.fail(.internal_error);
+                st.indexAccount(anchor, id);
+                break :blk id;
+            };
+
+        // Idempotent, so an existing account simply keeps its link.
+        self.control.linkGithub(account_id, identity.user_id) catch
+            return out.fail(.internal_error);
+
+        // Both anchors, because the grant is bound to either (D72, `01-product.md`). The
+        // *email* anchor decides the grant: it is the one an attacker would rotate, and
+        // claiming the GitHub one too is what stops delete-and-resignup through this path.
+        const email_owner = self.control.claimAnchor(.email, anchor, account_id) catch
+            return out.fail(.internal_error);
+        var gh_anchor: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, gh_anchor[0..8], identity.user_id, .little);
+        _ = self.control.claimAnchor(.github, gh_anchor, account_id) catch
+            return out.fail(.internal_error);
+
+        // Activation is idempotent in effect: an account signing in again keeps the balance it
+        // has, and only a first activation grants anything.
+        const account = self.control.account(account_id) orelse return out.fail(.internal_error);
+        if (account.state != .active or account.credits_granted == 0) {
+            const granted: u32 = if (email_owner == account_id)
+                control.plan.limits(.trial).granted_credits
+            else
+                0;
+            self.control.activateAccount(account_id, granted) catch
+                return out.fail(.internal_error);
+        }
+
+        self.startSession(out, account_id) catch return out.fail(.internal_error);
+
+        // A browser navigation, so the answer is a redirect rather than the JSON `startSession`
+        // wrote — and the key is **not** delivered here (D83): a credential in a redirect ends
+        // up in history and in any referrer the landing page emits.
+        out.body = &.{};
+        out.ok(302, "Found");
+        out.headerCopy("Location", st.cfg.public_origin);
+        out.header("Cache-Control", "no-store");
     }
 
     // ---- POST /app/auth/login ----
@@ -1526,6 +1701,22 @@ fn attachRateHeaders(out: *Reply, d: control.Control.RateDecision) void {
 }
 
 test {
+    // Forces semantic analysis of every declaration reachable from `Service`, and it is here
+    // for a specific reason rather than as tidiness.
+    //
+    // Zig analyses lazily: a function nothing references is never type-checked. No unit test
+    // drives `Service.respond` — the endpoints are exercised over HTTP by the `curl` harnesses
+    // instead — so **the handler bodies were invisible to `zig build test` entirely.** A
+    // three-argument call to a two-argument function sat in the control plane and the whole
+    // test suite passed; only `zig build`, which reaches `respond` through `main.zig`, caught
+    // it. Referencing them here means the test binary type-checks them too, so a mistake
+    // surfaces in the fast check rather than the slow one.
+    // Not the recursive form: that walks every declaration of `storage`, `control`, `api` and
+    // `server` too, and the analysis does not finish in any useful time. The non-recursive one
+    // reaches `handler`, which references `respond`, which reaches every handler — which is
+    // exactly the surface that was going unchecked.
+    std.testing.refAllDecls(Service);
+
     _ = router;
     _ = query;
     _ = json;
@@ -1535,6 +1726,7 @@ test {
     _ = ratelimit;
     _ = challenge;
     _ = mail;
+    _ = github;
 }
 
 
