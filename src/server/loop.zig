@@ -519,8 +519,12 @@ pub const Loop = struct {
         // The slot's unused tail. A read has no request body, so a handler serving one
         // gets the whole slot, which is exactly what `Store.get` requires (D51).
         r.reply.out = r.slot[r.body_got..];
+        r.socket = c.fd;
 
-        switch (self.handler.respond(.{ .head = &r.head, .body = r.body() }, &r.reply)) {
+        switch (self.handler.respond(
+            .{ .head = &r.head, .body = r.body(), .socket = r.socket },
+            &r.reply,
+        )) {
             .complete => self.sendReply(c),
             .deferred => {
                 // A handler that defers without naming the work would park the
@@ -573,7 +577,7 @@ pub const Loop = struct {
         const self: *Loop = @ptrCast(@alignCast(r.job_loop.?));
         r.reply.work.?(
             self.handler.ctx,
-            .{ .head = &r.head, .body = r.body() },
+            .{ .head = &r.head, .body = r.body(), .socket = r.socket },
             &r.reply,
         );
     }

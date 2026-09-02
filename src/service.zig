@@ -30,6 +30,12 @@ pub const query = @import("service/query.zig");
 pub const json = @import("service/json.zig");
 pub const ids = @import("service/ids.zig");
 pub const idempotency = @import("service/idempotency.zig");
+pub const password = @import("service/password.zig");
+pub const ratelimit = @import("service/ratelimit.zig");
+pub const challenge = @import("service/challenge.zig");
+pub const mail = @import("service/mail.zig");
+pub const app = @import("service/app.zig");
+pub const github = @import("service/github.zig");
 
 const Incoming = server.handler.Incoming;
 const Reply = server.handler.Reply;
@@ -49,6 +55,15 @@ pub const Options = struct {
     /// Where a replay re-reads the record it is reproducing (D67). Owned by the caller for
     /// the same reason the table is: ~2 MB has no business being copied into a vtable.
     replays: *ReplayBuffers,
+
+    /// The control plane's state, or null for an instance that serves only `/v1` (D73).
+    ///
+    /// Null is a **capability boundary, not a degraded mode**: `/app/*` becomes `unrouted`
+    /// and answers `404` like any other unknown path, which is exactly right for
+    /// `tools/dataplane.zig` — a data-plane harness that has no business owning a mail queue
+    /// or an OAuth secret. `main.zig` always supplies it, and `boot.Config` requires the five
+    /// variables it needs, so a deployed binary cannot reach production without one.
+    app: ?*app.State = null,
 };
 
 /// The production table size. 48 B a record at the cap `04-storage.md` records (D62).
@@ -108,6 +123,8 @@ pub const Service = struct {
     idempotency: *IdempotencyTable,
     /// Borrowed for the same reason (D67).
     replays: *ReplayBuffers,
+    /// Null on a data-plane-only instance. See `Options.app`.
+    app: ?*app.State = null,
 
     pub fn init(options: Options) Service {
         return .{
@@ -118,6 +135,7 @@ pub const Service = struct {
             .max_ttl_s = options.max_ttl_s,
             .idempotency = options.idempotency,
             .replays = options.replays,
+            .app = options.app,
         };
     }
 
@@ -132,6 +150,14 @@ pub const Service = struct {
     fn respond(ctx: *anyopaque, in: Incoming, out: *Reply) Disposition {
         const self: *Service = @ptrCast(@alignCast(ctx));
         const path = in.path();
+
+        // The plane split, before any credential is looked at (D73).
+        //
+        // It has to come first because the two planes authenticate differently and there is
+        // nothing to check until the plane is known: `/v1` reads `Authorization` and never a
+        // cookie, `/app` reads the session cookie and never a bearer token. That asymmetry
+        // is what removes CSRF from the data plane entirely.
+        if (router.plane(path) == .control) return self.respondControl(in, out);
 
         // `/healthz` is outside authentication and outside the meter, and is the only
         // endpoint that is (`02-api.md`). Handled before anything else so a liveness
@@ -197,6 +223,786 @@ pub const Service = struct {
 
         out.header("Content-Type", "application/json");
         out.body = out.dupe(w.done()) orelse return out.fail(.internal_error);
+    }
+
+    // -----------------------------------------------------------------------
+    // The control plane (D73)
+    // -----------------------------------------------------------------------
+
+    /// Session-authenticated state, resolved once per control-plane request.
+    const Session = struct {
+        auth: control.Control.SessionAuth,
+        token_hash: [32]u8,
+    };
+
+    fn respondControl(self: *Service, in: Incoming, out: *Reply) Disposition {
+        const st = self.app orelse return failPlain(out, .not_found);
+        const route = router.routeApp(in.method(), in.path());
+
+        // Before any credential, because neither depends on one.
+        switch (route) {
+            .unrouted => return failPlain(out, .not_found),
+            .wrong_method => |allow| return fail(out, .method_not_allowed, allow),
+            else => {},
+        }
+
+        // The unauthenticated half. Rate limited per address and under a global ceiling,
+        // because there is no account to charge yet (D74).
+        switch (route) {
+            .signup, .login, .verify, .password_confirm, .password_reset, .github_start, .github_callback => {
+                var key_buf: [server.net.client_key_bytes]u8 = undefined;
+                const address = app.clientAddress(in, &key_buf);
+                const d = st.unauth.take(address, self.clock.now());
+                attachRateHeaders(out, d);
+                if (!d.allowed) {
+                    out.retry_after_s = d.retry_after_s;
+                    return failPlain(out, .rate_limited);
+                }
+                return switch (route) {
+                    .signup => self.beginSignup(in, out),
+                    .login => self.beginLogin(in, out),
+                    .verify => self.verifyChallenge(in, out),
+                    .password_reset => self.requestReset(in, out),
+                    .password_confirm => self.beginConfirmReset(in, out),
+                    .github_start => self.githubStart(out),
+                    .github_callback => self.beginGithubCallback(in, out),
+                    else => unreachable,
+                };
+            },
+            else => {},
+        }
+
+        // Everything else needs a session. **The cookie, and never a bearer token** — the
+        // separation `06-auth.md` requires, enforced here and asserted by tests.
+        // The same two codes the data plane uses, because they mean the same thing -- but with
+        // control-plane messages. The catalogue's defaults tell the caller to send
+        // `Authorization: Bearer`, which is precisely what this surface must never accept, so
+        // the default message would be actively misleading here.
+        const session = self.resolveSessionCookie(in) orelse {
+            if (in.header("cookie") == null) {
+                out.failWith(.missing_credentials, "Sign in first: this surface authenticates with a session cookie.");
+            } else {
+                out.failWith(.invalid_credentials, "The session has expired or is no longer valid. Sign in again.");
+            }
+            return .complete;
+        };
+
+        // The control plane's own bucket, so exploring data cannot exhaust the bucket a
+        // production script depends on (D74, `01-product.md`).
+        const d = self.control.takeControlToken(session.auth.account_id) orelse
+            return failPlain(out, .internal_error);
+        attachRateHeaders(out, d);
+        if (!d.allowed) {
+            out.retry_after_s = d.retry_after_s;
+            return failPlain(out, .rate_limited);
+        }
+
+        // The synchroniser token, on exactly the routes that change state — decided by the
+        // route rather than by each handler, so none can forget (`06-auth.md`).
+        if (router.needsSynchroniser(route) and !self.synchroniserOk(in, session)) {
+            return failPlain(out, .invalid_synchroniser);
+        }
+
+        return switch (route) {
+            .logout => self.logout(out, session),
+            .account => self.accountView(out, session),
+            .account_delete => self.deleteAccount(out, session),
+            .keys => self.listKeys(out, session),
+            .keys_create => self.createKey(in, out, session),
+            .key_revoke => |raw| self.revokeKey(out, session, raw),
+            // The explorer goes through the **same** list and read path `/v1` uses. A second
+            // implementation is the divergence `00-vision.md` made it read-only to prevent.
+            .entries => self.beginList(in, out, self.sessionAsAuth(session)),
+            .entry => |raw| self.beginEntry(out, self.sessionAsAuth(session), raw, .read),
+            else => failPlain(out, .internal_error),
+        };
+    }
+
+    /// A session, or null. Unknown, expired, deleted and unverified are one answer, so this
+    /// is no more an oracle than `resolveKey` is.
+    fn resolveSessionCookie(self: *Service, in: Incoming) ?Session {
+        const token = api.cookie.get(in.header("cookie"), api.cookie.session_name) orelse
+            return null;
+        const auth = self.control.resolveSession(token) orelse return null;
+        return .{ .auth = auth, .token_hash = control.hashKey(token) };
+    }
+
+    /// The explorer reads as the session's account, at the account's plan.
+    ///
+    /// A synthesised `Auth` rather than a second code path: `key_id` is zero because no key
+    /// was presented, and nothing on the read path consults it — `whoami` is the only
+    /// endpoint that does, and it is not reachable from here.
+    fn sessionAsAuth(_: *Service, s: Session) control.Auth {
+        return .{
+            .account_id = s.auth.account_id,
+            .key_id = 0,
+            .plan = s.auth.plan,
+            .credits_remaining = 0,
+        };
+    }
+
+    fn synchroniserOk(self: *Service, in: Incoming, s: Session) bool {
+        const expected = api.secret.csrfToken(self.cursor_secret, s.token_hash);
+        const presented = in.header("x-doot-synchroniser") orelse return false;
+        return api.secret.csrfMatches(expected, presented);
+    }
+
+    // ---- POST /app/auth/signup ----
+
+    const SignupCtx = struct {
+        anchor: [32]u8,
+        email: [api.email.max_bytes]u8,
+        email_len: u16,
+        password: [app.max_password_bytes]u8,
+        password_len: u16,
+    };
+
+    /// Validates on the loop and hands the hashing to a worker (D71).
+    ///
+    /// **Always answers `202`**, whether or not the address is already known — and the worker
+    /// performs the same Argon2id hash either way (D75). Identical responses alone are not
+    /// enough: the branch that decides whether to hash is itself the oracle.
+    fn beginSignup(self: *Service, in: Incoming, out: *Reply) Disposition {
+        _ = self;
+        var email_buf: [api.email.max_bytes]u8 = undefined;
+        var pw_buf: [app.max_password_bytes]u8 = undefined;
+
+        const email = (api.form.field(in.body, "email", &email_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .invalid_email);
+        const pw = (api.form.field(in.body, "password", &pw_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .password_too_short);
+
+        api.email.check(email) catch return failPlain(out, .invalid_email);
+        if (!app.passwordAcceptable(pw)) return failPlain(out, .password_too_short);
+        const anchor = api.email.anchorHash(email) catch return failPlain(out, .invalid_email);
+
+        const ctx = out.workCtx(SignupCtx);
+        ctx.anchor = anchor;
+        ctx.email_len = @intCast(email.len);
+        @memcpy(ctx.email[0..email.len], email);
+        ctx.password_len = @intCast(pw.len);
+        @memcpy(ctx.password[0..pw.len], pw);
+
+        out.work = signupWork;
+        return .deferred;
+    }
+
+    fn signupWork(ctx_ptr: *anyopaque, _: Incoming, out: *Reply) void {
+        const self: *Service = @ptrCast(@alignCast(ctx_ptr));
+        const st = self.app.?;
+        const c = out.workCtx(SignupCtx);
+        const email = c.email[0..c.email_len];
+        const pw = c.password[0..c.password_len];
+
+        // Unconditional, and before the lookup: the cost must not depend on the answer.
+        var phc_buf: [password.max_phc_bytes]u8 = undefined;
+        const phc = password.hash(st.gpa, pw, &phc_buf) catch
+            return out.fail(.internal_error);
+
+        if (st.lookupAccount(c.anchor) == null) {
+            const id = self.control.createAccount(email, .trial, .pending_verification, 0) catch
+                return out.fail(.internal_error);
+            self.control.setPassword(id, phc) catch return out.fail(.internal_error);
+            st.indexAccount(c.anchor, id);
+            self.issueChallenge(.verify, c.anchor, email);
+        }
+        // Nothing is created and no mail is sent for a known address — and the response is
+        // the same one a new signup gets.
+        self.acceptedPending(out);
+    }
+
+    fn acceptedPending(_: *Service, out: *Reply) void {
+        out.ok(202, "Accepted");
+        out.header("Content-Type", "application/json");
+        out.body = "{\"status\":\"pending_verification\"}";
+    }
+
+    /// Issues an OTP and queues the mail. Failures are swallowed on purpose: a caller must
+    /// not learn from the response whether a code was actually sent.
+    fn issueChallenge(self: *Service, purpose: challenge.Purpose, anchor: [32]u8, email: []const u8) void {
+        const st = self.app.?;
+        const code = challenge.generateCode() catch return;
+        if (st.challenges.issue(purpose, anchor, &code, self.clock.now()) != .ok) return;
+
+        const kind: mail.Kind = switch (purpose) {
+            .verify => .verify,
+            .reset => .reset,
+        };
+        const msg = mail.Message.init(kind, email, &code) orelse return;
+        _ = st.queue.push(msg);
+    }
+
+    // ---- POST /app/auth/verify ----
+
+    /// Activates an account and issues its first API key, all in one response.
+    ///
+    /// `01-product.md`'s conversion moment: the key is shown once, here, and never again.
+    fn verifyChallenge(self: *Service, in: Incoming, out: *Reply) Disposition {
+        const st = self.app.?;
+        var email_buf: [api.email.max_bytes]u8 = undefined;
+        var code_buf: [16]u8 = undefined;
+
+        const email = (api.form.field(in.body, "email", &email_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .invalid_email);
+        const code = (api.form.field(in.body, "code", &code_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .invalid_challenge);
+        const anchor = api.email.anchorHash(email) catch return failPlain(out, .invalid_email);
+
+        if (st.challenges.present(.verify, anchor, code, self.clock.now()) != .ok) {
+            return failPlain(out, .invalid_challenge);
+        }
+
+        const id = st.lookupAccount(anchor) orelse return failPlain(out, .invalid_challenge);
+
+        // The grant is decided by the anchor, not by the plan table: a second account on the
+        // same identity activates with zero (`06-auth.md`, D72). `claimAnchor` is idempotent,
+        // so a retried activation cannot hand out a second grant.
+        const owner = self.control.claimAnchor(.email, anchor, id) catch
+            return failPlain(out, .internal_error);
+        const granted: u32 = if (owner == id) control.plan.limits(.trial).granted_credits else 0;
+        self.control.activateAccount(id, granted) catch return failPlain(out, .internal_error);
+
+        // A session, and **no key** (D83). The dashboard's first-run screen calls
+        // `POST /app/keys`, which is the one way a key is ever issued — so the email and OAuth
+        // paths end identically even though only one of them can carry JSON back.
+        self.startSession(out, id) catch return failPlain(out, .internal_error);
+        out.ok(201, "Created");
+        return .complete;
+    }
+
+    /// Generates a key, records its digest, and returns the plaintext exactly once.
+    fn issueKeyResponse(
+        self: *Service,
+        out: *Reply,
+        account_id: u32,
+        status: u16,
+        reason: []const u8,
+        granted: ?u32,
+    ) Disposition {
+        const plaintext = api.secret.apiKey() catch return failPlain(out, .internal_error);
+        const key_id = self.control.issueKey(account_id, "", &plaintext) catch |err| {
+            return failPlain(out, switch (err) {
+                error.KeyLimitReached => .key_limit_reached,
+                else => .internal_error,
+            });
+        };
+
+        var buf: [256]u8 = undefined;
+        var w = json.Writer.init(&buf);
+        var acct: [ids.len]u8 = undefined;
+        var kid: [ids.len]u8 = undefined;
+        blk: {
+            w.beginObject() catch break :blk;
+            w.stringMember("account_id", ids.render("acct", account_id, &acct)) catch break :blk;
+            w.stringMember("key_id", ids.render("key", key_id, &kid)) catch break :blk;
+            // The only time this value exists in a response. It is never stored and cannot be
+            // retrieved again (`06-auth.md`, D76).
+            w.stringMember("api_key", &plaintext) catch break :blk;
+            if (granted) |g| w.numberMember("credits_granted", g) catch break :blk;
+            w.endObject() catch break :blk;
+
+            out.ok(status, reason);
+            out.header("Content-Type", "application/json");
+            out.body = out.dupe(w.done()) orelse return failPlain(out, .internal_error);
+            return .complete;
+        }
+        return failPlain(out, .internal_error);
+    }
+
+    // ---- GET /app/auth/github and its callback ----
+
+    /// Redirects to GitHub, binding a fresh `state` to a short-lived cookie.
+    ///
+    /// The binding is what makes the callback trustworthy: a callback presenting a `state` we
+    /// never issued, or one issued to a different browser, is refused rather than acted on.
+    /// **Both halves are required** — the server-side entry proves we issued it, and the cookie
+    /// proves it was issued to *this* browser. Either alone is forgeable by someone who can
+    /// make the victim's browser follow a link.
+    fn githubStart(self: *Service, out: *Reply) Disposition {
+        const st = self.app.?;
+
+        const state = api.secret.sessionToken() catch return failPlain(out, .internal_error);
+        st.challenges.beginOauth(control.hashKey(&state), self.clock.now());
+
+        var cookie_buf: [api.cookie.max_set_cookie_bytes]u8 = undefined;
+        // No `Max-Age`: a browser that abandons the flow forgets it when it closes, and the
+        // server-side entry expires in ten minutes regardless.
+        const set = api.cookie.set(&cookie_buf, api.cookie.oauth_name, &state, null) catch
+            return failPlain(out, .internal_error);
+        out.headerCopy("Set-Cookie", set);
+
+        var url_buf: [640]u8 = undefined;
+        const url = github.authorizeUrl(
+            st.cfg.github_client_id,
+            st.cfg.public_origin,
+            &state,
+            &url_buf,
+        ) catch return failPlain(out, .internal_error);
+
+        out.ok(302, "Found");
+        out.headerCopy("Location", url);
+        // Nothing may cache a redirect that carries a one-time state.
+        out.header("Cache-Control", "no-store");
+        out.body = &.{};
+        return .complete;
+    }
+
+    const GithubCtx = struct {
+        code: [512]u8,
+        code_len: u16,
+    };
+
+    /// Validates the `state` on the loop, then hands the exchange to a worker.
+    ///
+    /// The state check happens here, before any outbound call: an unsolicited callback must
+    /// cost us nothing, and a round trip to GitHub for a request we can already refuse is
+    /// exactly what an attacker would use to make us do their network calls.
+    fn beginGithubCallback(self: *Service, in: Incoming, out: *Reply) Disposition {
+        const st = self.app.?;
+
+        // Query values are percent-decoded before use: GitHub's own code is alphanumeric, but
+        // the value on the wire is caller-supplied and decoding it once is what makes
+        // "the bytes GitHub gave us" and "the bytes we send back" the same string.
+        var code_buf: [512]u8 = undefined;
+        var state_buf: [128]u8 = undefined;
+        const raw_code = query.get(in.query(), "code") orelse
+            return failPlain(out, .invalid_request);
+        const raw_state = query.get(in.query(), "state") orelse
+            return failPlain(out, .invalid_request);
+        if (raw_code.len == 0 or raw_code.len > code_buf.len) return failPlain(out, .invalid_request);
+        if (raw_state.len == 0 or raw_state.len > state_buf.len) return failPlain(out, .invalid_request);
+        const code = api.form.decode(raw_code, &code_buf) catch
+            return failPlain(out, .invalid_request);
+        const state = api.form.decode(raw_state, &state_buf) catch
+            return failPlain(out, .invalid_request);
+
+        // The cookie half: was this state issued to this browser?
+        const cookie_state = api.cookie.get(in.header("cookie"), api.cookie.oauth_name) orelse
+            return failPlain(out, .invalid_request);
+        if (!std.crypto.timing_safe.eql(
+            [32]u8,
+            control.hashKey(state),
+            control.hashKey(cookie_state),
+        )) return failPlain(out, .invalid_request);
+
+        // The server-side half: did we issue it, and is this the first use? `takeOauth`
+        // consumes, so a replayed callback finds nothing.
+        if (!st.challenges.takeOauth(control.hashKey(state), self.clock.now())) {
+            return failPlain(out, .invalid_request);
+        }
+
+        const ctx = out.workCtx(GithubCtx);
+        ctx.code_len = @intCast(code.len);
+        @memcpy(ctx.code[0..code.len], code);
+        out.work = githubCallbackWork;
+        return .deferred;
+    }
+
+    fn githubCallbackWork(ctx_ptr: *anyopaque, _: Incoming, out: *Reply) void {
+        const self: *Service = @ptrCast(@alignCast(ctx_ptr));
+        const st = self.app.?;
+        const c = out.workCtx(GithubCtx);
+
+        const identity = github.exchange(
+            st.gpa,
+            st.cfg.github_client_id,
+            st.cfg.github_client_secret,
+            st.cfg.public_origin,
+            c.code[0..c.code_len],
+        ) catch |err| return switch (err) {
+            // The one failure a user can act on, so it is the one that is distinguishable.
+            error.NoVerifiedEmail => out.failWith(
+                .invalid_email,
+                "Your GitHub account has no verified email address. Verify one and try again.",
+            ),
+            else => out.fail(.internal_error),
+        };
+
+        const address = identity.email();
+        const anchor = api.email.anchorHash(address) catch return out.fail(.internal_error);
+
+        // Match on the GitHub id first, then the verified email, else create — the order
+        // `06-auth.md` specifies. The id leads because it is the anchor that cannot be
+        // reassigned; a username can, and an email can change hands between providers.
+        const account_id = self.control.githubOwner(identity.user_id) orelse
+            st.lookupAccount(anchor) orelse
+            blk: {
+                // GitHub verified the address, so the account is `active` immediately — there
+                // is nothing left for an OTP to prove.
+                const id = self.control.createAccount(address, .trial, .active, 0) catch
+                    return out.fail(.internal_error);
+                st.indexAccount(anchor, id);
+                break :blk id;
+            };
+
+        // Idempotent, so an existing account simply keeps its link.
+        self.control.linkGithub(account_id, identity.user_id) catch
+            return out.fail(.internal_error);
+
+        // Both anchors, because the grant is bound to either (D72, `01-product.md`). The
+        // *email* anchor decides the grant: it is the one an attacker would rotate, and
+        // claiming the GitHub one too is what stops delete-and-resignup through this path.
+        const email_owner = self.control.claimAnchor(.email, anchor, account_id) catch
+            return out.fail(.internal_error);
+        var gh_anchor: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, gh_anchor[0..8], identity.user_id, .little);
+        _ = self.control.claimAnchor(.github, gh_anchor, account_id) catch
+            return out.fail(.internal_error);
+
+        // Activation is idempotent in effect: an account signing in again keeps the balance it
+        // has, and only a first activation grants anything.
+        const account = self.control.account(account_id) orelse return out.fail(.internal_error);
+        if (account.state != .active or account.credits_granted == 0) {
+            const granted: u32 = if (email_owner == account_id)
+                control.plan.limits(.trial).granted_credits
+            else
+                0;
+            self.control.activateAccount(account_id, granted) catch
+                return out.fail(.internal_error);
+        }
+
+        self.startSession(out, account_id) catch return out.fail(.internal_error);
+
+        // A browser navigation, so the answer is a redirect rather than the JSON `startSession`
+        // wrote — and the key is **not** delivered here (D83): a credential in a redirect ends
+        // up in history and in any referrer the landing page emits.
+        out.body = &.{};
+        out.ok(302, "Found");
+        out.headerCopy("Location", st.cfg.public_origin);
+        out.header("Cache-Control", "no-store");
+    }
+
+    // ---- POST /app/auth/login ----
+
+    const LoginCtx = struct {
+        anchor: [32]u8,
+        password: [app.max_password_bytes]u8,
+        password_len: u16,
+    };
+
+    fn beginLogin(self: *Service, in: Incoming, out: *Reply) Disposition {
+        _ = self;
+        var email_buf: [api.email.max_bytes]u8 = undefined;
+        var pw_buf: [app.max_password_bytes]u8 = undefined;
+
+        const email = (api.form.field(in.body, "email", &email_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .invalid_credentials);
+        const pw = (api.form.field(in.body, "password", &pw_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .invalid_credentials);
+
+        // A malformed address is `invalid_credentials`, not `invalid_email`: on login the two
+        // must be indistinguishable, or the endpoint reports which addresses are well-formed
+        // enough to exist.
+        const anchor = api.email.anchorHash(email) catch
+            return failPlain(out, .invalid_credentials);
+
+        const ctx = out.workCtx(LoginCtx);
+        ctx.anchor = anchor;
+        ctx.password_len = @intCast(pw.len);
+        @memcpy(ctx.password[0..pw.len], pw);
+
+        out.work = loginWork;
+        return .deferred;
+    }
+
+    fn loginWork(ctx_ptr: *anyopaque, _: Incoming, out: *Reply) void {
+        const self: *Service = @ptrCast(@alignCast(ctx_ptr));
+        const st = self.app.?;
+        const c = out.workCtx(LoginCtx);
+        const pw = c.password[0..c.password_len];
+
+        // The stored hash is **copied** before the verification: `Control.password` borrows
+        // the store's copy, a concurrent password change frees it, and a verification is
+        // exactly long enough for that to matter.
+        var phc_buf: [password.max_phc_bytes]u8 = undefined;
+        var stored: ?[]const u8 = null;
+        if (st.lookupAccount(c.anchor)) |id| {
+            if (self.control.password(id)) |p| {
+                @memcpy(phc_buf[0..p.phc.len], p.phc);
+                stored = phc_buf[0..p.phc.len];
+            }
+        }
+
+        // Runs a full verification either way, so an unknown address costs what a known one
+        // costs (D75).
+        if (!password.verifyOrEqualise(st.gpa, stored, st.dummy, pw)) {
+            return out.fail(.invalid_credentials);
+        }
+
+        const id = st.lookupAccount(c.anchor) orelse return out.fail(.invalid_credentials);
+        const account = self.control.account(id) orelse return out.fail(.invalid_credentials);
+        // An unverified account cannot sign in, and says so with the same answer a wrong
+        // password gets.
+        if (account.state != .active) return out.fail(.invalid_credentials);
+
+        self.startSession(out, id) catch out.fail(.internal_error);
+    }
+
+    /// Creates a session, sets the cookie, and returns the synchroniser token.
+    ///
+    /// The token is derived rather than stored (D76), so it needs no storage and survives a
+    /// restart; the browser reads it here and sends it back on state-changing requests.
+    fn startSession(self: *Service, out: *Reply, account_id: u32) !void {
+        const token = try api.secret.sessionToken();
+        _ = try self.control.createSession(account_id, &token);
+
+        var cookie_buf: [api.cookie.max_set_cookie_bytes]u8 = undefined;
+        const set = try api.cookie.set(
+            &cookie_buf,
+            api.cookie.session_name,
+            &token,
+            control.store.session_lifetime_s,
+        );
+        out.headerCopy("Set-Cookie", set);
+
+        const csrf = api.secret.csrfToken(self.cursor_secret, control.hashKey(&token));
+        var buf: [192]u8 = undefined;
+        var w = json.Writer.init(&buf);
+        var acct: [ids.len]u8 = undefined;
+        try w.beginObject();
+        try w.stringMember("account_id", ids.render("acct", account_id, &acct));
+        try w.stringMember("synchroniser", &csrf);
+        try w.endObject();
+
+        out.header("Content-Type", "application/json");
+        out.body = out.dupe(w.done()) orelse return error.NoSpace;
+    }
+
+    // ---- POST /app/auth/logout ----
+
+    fn logout(self: *Service, out: *Reply, s: Session) Disposition {
+        _ = self.control.revokeSession(s.auth.session_id) catch
+            return failPlain(out, .internal_error);
+        return self.clearedSession(out, 204, "No Content");
+    }
+
+    fn clearedSession(_: *Service, out: *Reply, status: u16, reason: []const u8) Disposition {
+        var cookie_buf: [api.cookie.max_set_cookie_bytes]u8 = undefined;
+        const cleared = api.cookie.clear(&cookie_buf, api.cookie.session_name) catch
+            return failPlain(out, .internal_error);
+        out.headerCopy("Set-Cookie", cleared);
+        out.ok(status, reason);
+        out.body = &.{};
+        return .complete;
+    }
+
+    // ---- POST /app/auth/password/reset and /confirm ----
+
+    /// Always `202`, whether or not the address is known (`06-auth.md`, D75).
+    fn requestReset(self: *Service, in: Incoming, out: *Reply) Disposition {
+        const st = self.app.?;
+        var email_buf: [api.email.max_bytes]u8 = undefined;
+        const email = (api.form.field(in.body, "email", &email_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .invalid_email);
+
+        // A well-formed address that does not exist reaches exactly the same code as one that
+        // does, right up to the enqueue.
+        if (api.email.anchorHash(email)) |anchor| {
+            if (st.lookupAccount(anchor) != null) self.issueChallenge(.reset, anchor, email);
+        } else |_| {}
+
+        out.ok(202, "Accepted");
+        out.header("Content-Type", "application/json");
+        out.body = "{\"status\":\"sent\"}";
+        return .complete;
+    }
+
+    const ConfirmCtx = struct {
+        anchor: [32]u8,
+        account_id: u32,
+        password: [app.max_password_bytes]u8,
+        password_len: u16,
+    };
+
+    fn beginConfirmReset(self: *Service, in: Incoming, out: *Reply) Disposition {
+        const st = self.app.?;
+        var email_buf: [api.email.max_bytes]u8 = undefined;
+        var code_buf: [16]u8 = undefined;
+        var pw_buf: [app.max_password_bytes]u8 = undefined;
+
+        const email = (api.form.field(in.body, "email", &email_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .invalid_email);
+        const code = (api.form.field(in.body, "code", &code_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .invalid_challenge);
+        const pw = (api.form.field(in.body, "password", &pw_buf) catch
+            return failPlain(out, .invalid_request)) orelse
+            return failPlain(out, .password_too_short);
+
+        if (!app.passwordAcceptable(pw)) return failPlain(out, .password_too_short);
+        const anchor = api.email.anchorHash(email) catch return failPlain(out, .invalid_email);
+
+        if (st.challenges.present(.reset, anchor, code, self.clock.now()) != .ok) {
+            return failPlain(out, .invalid_challenge);
+        }
+        const id = st.lookupAccount(anchor) orelse return failPlain(out, .invalid_challenge);
+
+        const ctx = out.workCtx(ConfirmCtx);
+        ctx.anchor = anchor;
+        ctx.account_id = id;
+        ctx.password_len = @intCast(pw.len);
+        @memcpy(ctx.password[0..pw.len], pw);
+
+        out.work = confirmResetWork;
+        return .deferred;
+    }
+
+    fn confirmResetWork(ctx_ptr: *anyopaque, _: Incoming, out: *Reply) void {
+        const self: *Service = @ptrCast(@alignCast(ctx_ptr));
+        const st = self.app.?;
+        const c = out.workCtx(ConfirmCtx);
+
+        var phc_buf: [password.max_phc_bytes]u8 = undefined;
+        const phc = password.hash(st.gpa, c.password[0..c.password_len], &phc_buf) catch
+            return out.fail(.internal_error);
+        self.control.setPassword(c.account_id, phc) catch return out.fail(.internal_error);
+
+        // Every session for the account goes (`06-auth.md`). A reset is what someone does
+        // when they think a credential is compromised, so leaving a session alive would
+        // defeat the point of it.
+        _ = self.control.revokeSessionsFor(c.account_id) catch {};
+
+        out.ok(200, "OK");
+        out.header("Content-Type", "application/json");
+        out.body = "{\"status\":\"reset\"}";
+    }
+
+    // ---- GET and DELETE /app/account ----
+
+    fn accountView(self: *Service, out: *Reply, s: Session) Disposition {
+        const account = self.control.account(s.auth.account_id) orelse
+            return failPlain(out, .internal_error);
+        const limits = control.plan.limits(account.plan);
+
+        var buf: [512]u8 = undefined;
+        var w = json.Writer.init(&buf);
+        var acct: [ids.len]u8 = undefined;
+        var created: [server.response.timestamp_len]u8 = undefined;
+        blk: {
+            w.beginObject() catch break :blk;
+            w.stringMember("account_id", ids.render("acct", account.id, &acct)) catch break :blk;
+            // The delivery address, exactly as supplied — never the anchor (D72).
+            w.stringMember("email", account.email) catch break :blk;
+            w.stringMember("plan", @tagName(account.plan)) catch break :blk;
+            w.stringMember("state", @tagName(account.state)) catch break :blk;
+            w.stringMember(
+                "created_at",
+                server.response.timestamp(account.created_at, &created),
+            ) catch break :blk;
+            w.key("credits") catch break :blk;
+            w.beginObject() catch break :blk;
+            w.numberMember("remaining", account.credits_remaining) catch break :blk;
+            w.numberMember("granted", account.credits_granted) catch break :blk;
+            w.endObject() catch break :blk;
+            w.numberMember("max_ttl_seconds", control.plan.maxTtl(account.plan, self.max_ttl_s)) catch break :blk;
+            w.numberMember("rate_limit", limits.rate_per_min) catch break :blk;
+            // Re-derived per response rather than stored, so a browser that reloads always
+            // has a usable one (D76).
+            w.stringMember(
+                "synchroniser",
+                &api.secret.csrfToken(self.cursor_secret, s.token_hash),
+            ) catch break :blk;
+            w.endObject() catch break :blk;
+
+            out.header("Content-Type", "application/json");
+            out.body = out.dupe(w.done()) orelse return failPlain(out, .internal_error);
+            return .complete;
+        }
+        return failPlain(out, .internal_error);
+    }
+
+    /// Self-service deletion (D77).
+    ///
+    /// Entries are **not** deleted, and cannot be: the index holds no names, so nothing can
+    /// enumerate an account's entries. Access ends here and the bytes leave with their
+    /// expiry, bounded by the plan's maximum lifetime.
+    fn deleteAccount(self: *Service, out: *Reply, s: Session) Disposition {
+        const st = self.app.?;
+        const account = self.control.account(s.auth.account_id) orelse
+            return failPlain(out, .internal_error);
+
+        // Unindexed first: after the account is gone its address is no longer available to
+        // compute an anchor from, and a stale index entry would point at nothing.
+        if (api.email.anchorHash(account.email)) |anchor| {
+            st.unindexAccount(anchor);
+        } else |_| {}
+
+        _ = self.control.deleteAccount(s.auth.account_id) catch
+            return failPlain(out, .internal_error);
+        return self.clearedSession(out, 204, "No Content");
+    }
+
+    // ---- /app/keys ----
+
+    fn listKeys(self: *Service, out: *Reply, s: Session) Disposition {
+        var buf: [640]u8 = undefined;
+        const KeyCollector = struct {
+            w: *json.Writer,
+            failed: bool = false,
+            fn visit(c: *@This(), k: control.ApiKey) void {
+                if (c.failed) return;
+                var kid: [ids.len]u8 = undefined;
+                var created: [server.response.timestamp_len]u8 = undefined;
+                c.emit(k, &kid, &created) catch {
+                    c.failed = true;
+                };
+            }
+            fn emit(
+                c: *@This(),
+                k: control.ApiKey,
+                kid: *[ids.len]u8,
+                created: *[server.response.timestamp_len]u8,
+            ) !void {
+                try c.w.beginObject();
+                try c.w.stringMember("id", ids.render("key", k.id, kid));
+                try c.w.stringMember("label", k.label);
+                try c.w.stringMember("created_at", server.response.timestamp(k.created_at, created));
+                try c.w.endObject();
+            }
+        };
+
+        var w = json.Writer.init(&buf);
+        var collector: KeyCollector = .{ .w = &w };
+        blk: {
+            w.beginObject() catch break :blk;
+            w.key("keys") catch break :blk;
+            w.beginArray() catch break :blk;
+            self.control.forEachKey(s.auth.account_id, &collector, KeyCollector.visit);
+            if (collector.failed) break :blk;
+            w.endArray() catch break :blk;
+            w.numberMember("maximum", control.store.max_keys_per_account) catch break :blk;
+            w.endObject() catch break :blk;
+
+            out.header("Content-Type", "application/json");
+            out.body = out.dupe(w.done()) orelse return failPlain(out, .internal_error);
+            return .complete;
+        }
+        return failPlain(out, .internal_error);
+    }
+
+    fn createKey(self: *Service, in: Incoming, out: *Reply, s: Session) Disposition {
+        _ = in;
+        return self.issueKeyResponse(out, s.auth.account_id, 201, "Created", null);
+    }
+
+    fn revokeKey(self: *Service, out: *Reply, s: Session, raw: []const u8) Disposition {
+        const key_id = ids.parse("key", raw) orelse return failPlain(out, .not_found);
+        // Ownership is checked inside `Control`, not here: a check the caller performs is a
+        // check the caller can forget, and forgetting it would let one session revoke another
+        // account's key.
+        const revoked = self.control.revokeOwnedKey(s.auth.account_id, key_id) catch
+            return failPlain(out, .internal_error);
+        if (!revoked) return failPlain(out, .not_found);
+        out.ok(204, "No Content");
+        return .complete;
     }
 
     // -----------------------------------------------------------------------
@@ -895,11 +1701,32 @@ fn attachRateHeaders(out: *Reply, d: control.Control.RateDecision) void {
 }
 
 test {
+    // Forces semantic analysis of every declaration reachable from `Service`, and it is here
+    // for a specific reason rather than as tidiness.
+    //
+    // Zig analyses lazily: a function nothing references is never type-checked. No unit test
+    // drives `Service.respond` — the endpoints are exercised over HTTP by the `curl` harnesses
+    // instead — so **the handler bodies were invisible to `zig build test` entirely.** A
+    // three-argument call to a two-argument function sat in the control plane and the whole
+    // test suite passed; only `zig build`, which reaches `respond` through `main.zig`, caught
+    // it. Referencing them here means the test binary type-checks them too, so a mistake
+    // surfaces in the fast check rather than the slow one.
+    // Not the recursive form: that walks every declaration of `storage`, `control`, `api` and
+    // `server` too, and the analysis does not finish in any useful time. The non-recursive one
+    // reaches `handler`, which references `respond`, which reaches every handler — which is
+    // exactly the surface that was going unchecked.
+    std.testing.refAllDecls(Service);
+
     _ = router;
     _ = query;
     _ = json;
     _ = ids;
     _ = idempotency;
+    _ = password;
+    _ = ratelimit;
+    _ = challenge;
+    _ = mail;
+    _ = github;
 }
 
 

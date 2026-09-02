@@ -84,7 +84,8 @@ edge:
 | M2 — data plane | endpoints, credits, rate limit, idempotency: **complete and verified over HTTP** |
 | M2 — origin binary | **complete.** `zig build` produces `doot`: configuration from the environment, the maintenance thread, and a graceful shutdown that keeps credit balances exact across a deploy (D63) |
 | M2 — SSE and the edge | **outstanding.** The change feed ring is built and published to; nothing consumes it. Origin TLS and the Cloudflare zone gate on infrastructure that does not exist yet |
-| M3–M6 | not started |
+| M3 — accounts | **complete.** Signup, verification, login, sessions, password reset, account and key management, the read-only explorer, and GitHub OAuth. Both exit conditions verified over the wire by `tools/app-check.sh`, including enumeration resistance as a *timing* property |
+| M4–M6 | not started |
 
 **Two of M2's three exit conditions are now met**: every row of the error catalogue is
 reproduced by a `curl` invocation in CI, and credits and the rate limit are verified *exactly*
@@ -96,9 +97,15 @@ a `Content-Type` carrying a control byte was stored and charged for and then fai
 read (D64), and an idempotent replay of any body over 3.3 KB silently re-executed and charged
 a credit, against the published promise that replays are free (D67).
 
-**It has no way to create an account yet.** M3 owns signup, so a fresh deployment answers
-`401` to everything — deliberately, rather than growing an operator subcommand built to be
-replaced (D63).
+**Accounts now exist.** M3's control plane is built: signup with email and a one-time code,
+login, sessions, API key management and self-service deletion, all under `/app/*` with session
+cookies and a synchroniser token. That closed D63's one recorded open question — how the first
+account comes into being — without the operator subcommand it warned would be built to be
+replaced.
+
+The **live feed** is the one part of the dashboard's surface deliberately not yet routed,
+because a route that cannot complete is a worse answer than no route (D82). It waits on the
+transport seam D68 describes.
 
 | | measured on one 8-core box |
 |---|---|
@@ -113,16 +120,17 @@ Recovery is a warm-page-cache figure and says so: it moves with the filesystem, 
 number the operational lever derives from gets re-measured on the deployed volume in M5
 (D48).
 
-**440 unit tests plus six harnesses, all run by CI on every push:**
+**612 unit tests plus seven harnesses, all run by CI on every push:**
 
 ```bash
 tools/vocab-check.sh                                    # D2 vocabulary rule
-zig build test                                          # 440 unit tests
+zig build test                                          # 612 unit tests
 zig build verify && ./zig-out/bin/m1 all /dev/shm/doot-m1  # 5 M1 exit conditions
 tools/transport-check.sh                                # 52 curl checks
 tools/dataplane-check.sh                                # 158 curl checks
 tools/boot-check.sh                                     # 30 checks against the real binary
 tools/exactness-check.sh                                # 28 concurrency and capacity checks
+tools/app-check.sh                                      # 60 control-plane checks
 ```
 
 `m1 all` runs the recovery check at its 300,000-record default, which measures the replay
@@ -151,8 +159,9 @@ Don't use Doot as the only copy of anything you cannot lose.
 ## Built with
 
 A single statically linked [Zig](https://ziglang.org) binary. One process, one machine.
-Plain HTML, CSS and vanilla JavaScript for the dashboard, embedded into the binary at
-compile time — no framework, no bundler, no build step, no separate deployment.
+The dashboard will be plain HTML, CSS and vanilla JavaScript embedded into the binary with
+`@embedFile` — no framework, no bundler, no build step, no separate deployment. **It is not
+built yet**; M4 owns it, and nothing in the tree embeds an asset today.
 
 ## Documentation
 

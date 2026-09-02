@@ -112,6 +112,18 @@ pub const Request = struct {
     /// arrived alongside it. Anything past this is a pipelined follower.
     consumed: u32 = 0,
 
+    /// The socket this request arrived on, handed to the handler as `Incoming.socket` so
+    /// that `Incoming.peer()` can answer without a handler ever holding a descriptor
+    /// (D74 amendment).
+    ///
+    /// Distinct from `job_fd` on purpose. That one exists to detect a completion arriving
+    /// after its connection was closed and the descriptor reused, and is only meaningful
+    /// alongside `job_gen`; reusing it here would tangle a lifetime check with a plain
+    /// piece of request context. This one is set on every dispatch, so the on-loop and
+    /// deferred paths hand the handler the same thing and a deferred handler asking for
+    /// the peer does not silently get nothing.
+    socket: Fd = -1,
+
     // -- deferred work (D57) --
 
     /// Storage for the job when this request's reply needs an I/O worker. Embedded, so

@@ -108,3 +108,15 @@ jobs:
       # retried, so this is not a source of intermittent red.
       - name: M2 exactness checks
         run: tools/exactness-check.sh
+
+      # M3's control plane, driven by `curl`. The one substitution is the mail transport: a
+      # verification code goes to a real inbox and a check script has none, so the harness
+      # prints what it would have sent. Everything else is production code -- the same
+      # handlers, the same Argon2id, the same rate limiters.
+      #
+      # It carries the half of D75 no unit test can assert: that an unknown address costs the
+      # same as a known one. That is only observable from outside the process, and the band is
+      # deliberately wide because a tight timing assertion on shared CI hardware is D53's
+      # flaky-by-construction shape.
+      - name: M3 control-plane checks
+        run: tools/app-check.sh

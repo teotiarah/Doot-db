@@ -45,6 +45,15 @@ pub const Error = error{
     MaxTtlTooShort,
     SegmentBytesInvalid,
     SnapshotIntervalInvalid,
+
+    // M3's five (D78). All required, none defaulted.
+    PublicOriginMissing,
+    PublicOriginInvalid,
+    GithubClientIdMissing,
+    GithubClientSecretMissing,
+    ZeptomailTokenMissing,
+    SupportEmailMissing,
+    SupportEmailInvalid,
 };
 
 /// `DOOT_HMAC_SECRET` is exactly this many characters, and they are lowercase hex (D63).
@@ -53,6 +62,20 @@ pub const Error = error{
 /// becoming a shorter secret — which is the failure a "whatever bytes you typed" reading
 /// would hide.
 pub const hmac_secret_hex_len: usize = 64;
+
+/// The five variables the control plane reads (D78).
+///
+/// Declared here rather than reusing `service.app.Config`, because `boot` deliberately does
+/// **not** import `service` — D63 made that split so the process layer depends on the pieces
+/// it starts rather than on the composition above them. `main.zig` maps one to the other,
+/// which is the one place that already knows about both.
+pub const AppConfig = struct {
+    public_origin: []const u8,
+    support_email: []const u8,
+    github_client_id: []const u8,
+    github_client_secret: []const u8,
+    zeptomail_token: []const u8,
+};
 
 pub const Config = struct {
     /// Borrowed from the environment, which outlives the process's run: `std.process.Init`
@@ -67,8 +90,12 @@ pub const Config = struct {
     data_dir_buf: [std.fs.max_path_bytes]u8,
     data_dir_len: u16,
 
-    /// Signs pagination cursors (D46).
+    /// Signs pagination cursors (D46) and derives the synchroniser token (D76).
     hmac_secret: [32]u8,
+
+    /// The control plane's configuration (D78). Borrowed from the environment, which
+    /// `std.process.Init` owns for the life of the process.
+    app: AppConfig,
 
     /// Everything the engine is configured with. Defaults are `04-storage.md`'s, mirrored
     /// in `storage.config.Options` — this fills in only what the environment overrides.
@@ -93,6 +120,13 @@ pub const Config = struct {
             .data_dir_buf = undefined,
             .data_dir_len = 0,
             .hmac_secret = @splat(0),
+            .app = .{
+                .public_origin = "",
+                .support_email = "",
+                .github_client_id = "",
+                .github_client_secret = "",
+                .zeptomail_token = "",
+            },
             .options = .{},
         };
 
@@ -122,6 +156,45 @@ pub const Config = struct {
 
         const secret = env.get("DOOT_HMAC_SECRET") orelse return error.HmacSecretMissing;
         self.hmac_secret = try parseHmacSecret(secret);
+
+        // -- M3: the control plane (D78) --
+        //
+        // All required and none defaulted. There is deliberately no switch to disable one
+        // signup path: `06-auth.md` specifies two that both land in the same place, and a
+        // half-configured control plane is a product with one broken button.
+
+        const origin = env.get("DOOT_PUBLIC_ORIGIN") orelse return error.PublicOriginMissing;
+        if (origin.len == 0) return error.PublicOriginMissing;
+        // An absolute https origin with no path. Checked here because an OAuth `redirect_uri`
+        // that does not match the one registered with GitHub fails at the moment a real user
+        // first tries to sign up -- a boot check moves that discovery to the deploy.
+        if (!std.mem.startsWith(u8, origin, "https://")) return error.PublicOriginInvalid;
+        if (std.mem.indexOfScalarPos(u8, origin, "https://".len, '/') != null) {
+            return error.PublicOriginInvalid;
+        }
+        if (origin.len <= "https://".len) return error.PublicOriginInvalid;
+        self.app.public_origin = origin;
+
+        const gh_id = env.get("DOOT_GITHUB_CLIENT_ID") orelse return error.GithubClientIdMissing;
+        if (gh_id.len == 0) return error.GithubClientIdMissing;
+        self.app.github_client_id = gh_id;
+
+        const gh_secret = env.get("DOOT_GITHUB_CLIENT_SECRET") orelse
+            return error.GithubClientSecretMissing;
+        if (gh_secret.len == 0) return error.GithubClientSecretMissing;
+        self.app.github_client_secret = gh_secret;
+
+        const zepto = env.get("DOOT_ZEPTOMAIL_TOKEN") orelse return error.ZeptomailTokenMissing;
+        if (zepto.len == 0) return error.ZeptomailTokenMissing;
+        self.app.zeptomail_token = zepto;
+
+        // Not defaulted for a sharper reason than the others: it is published to users in
+        // `402` bodies, so a default would be a real address in our source receiving other
+        // deployments' mail.
+        const support = env.get("DOOT_SUPPORT_EMAIL") orelse return error.SupportEmailMissing;
+        if (support.len == 0) return error.SupportEmailMissing;
+        api.email.check(support) catch return error.SupportEmailInvalid;
+        self.app.support_email = support;
 
         // -- optional, defaulting to the engine's own constants --
 
@@ -196,6 +269,13 @@ pub fn describe(err: Error) []const u8 {
         error.MaxTtlTooShort => "DOOT_MAX_TTL is below the minimum lifetime an entry may be given",
         error.SegmentBytesInvalid => "DOOT_SEGMENT_BYTES is outside the range the storage layout allows",
         error.SnapshotIntervalInvalid => "DOOT_SNAPSHOT_INTERVAL_S must be a positive number of seconds",
+        error.PublicOriginMissing => "DOOT_PUBLIC_ORIGIN is required, for example https://doot.run",
+        error.PublicOriginInvalid => "DOOT_PUBLIC_ORIGIN must be an absolute https origin with no path, for example https://doot.run",
+        error.GithubClientIdMissing => "DOOT_GITHUB_CLIENT_ID is required: there is no switch to disable one signup path",
+        error.GithubClientSecretMissing => "DOOT_GITHUB_CLIENT_SECRET is required",
+        error.ZeptomailTokenMissing => "DOOT_ZEPTOMAIL_TOKEN is required: without it no verification code can be delivered and no account can be activated",
+        error.SupportEmailMissing => "DOOT_SUPPORT_EMAIL is required and is never defaulted, because it is published to users in 402 responses",
+        error.SupportEmailInvalid => "DOOT_SUPPORT_EMAIL is not an email address",
     };
 }
 
@@ -429,7 +509,10 @@ pub fn info(comptime fmt: []const u8, args: anytype) void {
 
 const testing = std.testing;
 
-/// The four M2 variables, as a starting point a test can then break one field of.
+/// Every required variable, as a starting point a test can then break one field of.
+///
+/// M2's four plus M3's five (D78). A test that removes one and expects a named failure is
+/// what keeps "the binary refuses to start rather than starting degraded" true.
 fn validEnv(gpa: std.mem.Allocator) !std.process.Environ.Map {
     var m: std.process.Environ.Map = .init(gpa);
     errdefer m.deinit();
@@ -437,6 +520,11 @@ fn validEnv(gpa: std.mem.Allocator) !std.process.Environ.Map {
     try m.put("DOOT_DATA_DIR", "/var/lib/doot");
     try m.put("DOOT_MAX_INDEX_BYTES", "300000000");
     try m.put("DOOT_HMAC_SECRET", "0123456789abcdef" ** 4);
+    try m.put("DOOT_PUBLIC_ORIGIN", "https://doot.run");
+    try m.put("DOOT_GITHUB_CLIENT_ID", "Iv1.abcdef0123456789");
+    try m.put("DOOT_GITHUB_CLIENT_SECRET", "ghs_0123456789abcdef");
+    try m.put("DOOT_ZEPTOMAIL_TOKEN", "Zoho-enczapikey-test");
+    try m.put("DOOT_SUPPORT_EMAIL", "support@doot.run");
     return m;
 }
 
@@ -475,6 +563,11 @@ test "each required variable is required, and says which one it is" {
         .{ "DOOT_DATA_DIR", Error.DataDirMissing },
         .{ "DOOT_MAX_INDEX_BYTES", Error.MaxIndexBytesMissing },
         .{ "DOOT_HMAC_SECRET", Error.HmacSecretMissing },
+        .{ "DOOT_PUBLIC_ORIGIN", Error.PublicOriginMissing },
+        .{ "DOOT_GITHUB_CLIENT_ID", Error.GithubClientIdMissing },
+        .{ "DOOT_GITHUB_CLIENT_SECRET", Error.GithubClientSecretMissing },
+        .{ "DOOT_ZEPTOMAIL_TOKEN", Error.ZeptomailTokenMissing },
+        .{ "DOOT_SUPPORT_EMAIL", Error.SupportEmailMissing },
     }) |case| {
         var m = try validEnv(testing.allocator);
         defer m.deinit();
@@ -855,4 +948,62 @@ test "stopping a thread that never started is a no-op" {
     };
     maint.stop();
     try testing.expectEqual(@as(u32, 0), maint.runs.load(.monotonic));
+}
+
+test "M3's five variables are read, and there is no switch to disable a signup path" {
+    var m = try validEnv(testing.allocator);
+    defer m.deinit();
+    const cfg = try Config.fromEnv(&m);
+
+    try testing.expectEqualStrings("https://doot.run", cfg.app.public_origin);
+    try testing.expectEqualStrings("Iv1.abcdef0123456789", cfg.app.github_client_id);
+    try testing.expectEqualStrings("ghs_0123456789abcdef", cfg.app.github_client_secret);
+    try testing.expectEqualStrings("Zoho-enczapikey-test", cfg.app.zeptomail_token);
+    try testing.expectEqualStrings("support@doot.run", cfg.app.support_email);
+}
+
+test "the public origin must be an absolute https origin with no path" {
+    // An OAuth redirect_uri that does not match the one registered with GitHub fails at the
+    // moment a real user first tries to sign up. A boot check moves that discovery to the
+    // deploy, where it costs nothing.
+    for ([_][]const u8{
+        "doot.run",
+        "http://doot.run",
+        "https://doot.run/",
+        "https://doot.run/app",
+        "https://",
+        "//doot.run",
+    }) |bad| {
+        var m = try validEnv(testing.allocator);
+        defer m.deinit();
+        try m.put("DOOT_PUBLIC_ORIGIN", bad);
+        try testing.expectError(error.PublicOriginInvalid, Config.fromEnv(&m));
+    }
+
+    // And a port is fine, because a staging origin has one.
+    var ok = try validEnv(testing.allocator);
+    defer ok.deinit();
+    try ok.put("DOOT_PUBLIC_ORIGIN", "https://doot.run:8443");
+    const cfg = try Config.fromEnv(&ok);
+    try testing.expectEqualStrings("https://doot.run:8443", cfg.app.public_origin);
+}
+
+test "the support address is validated, because it is published to users" {
+    // It appears in 402 bodies (01-product.md), so a typo is visible to every caller who runs
+    // out of credits rather than only to us.
+    var m = try validEnv(testing.allocator);
+    defer m.deinit();
+    try m.put("DOOT_SUPPORT_EMAIL", "not-an-address");
+    try testing.expectError(error.SupportEmailInvalid, Config.fromEnv(&m));
+}
+
+test "every configuration error has a description naming its variable" {
+    // The promise is that a missing variable is *named*, not defaulted. A description that
+    // forgot to mention which one would make the failure a guessing game.
+    inline for (@typeInfo(Error).error_set.?) |f| {
+        const err: Error = @field(Error, f.name);
+        const text = describe(err);
+        try testing.expect(text.len > 0);
+        try testing.expect(std.mem.indexOf(u8, text, "DOOT_") != null);
+    }
 }

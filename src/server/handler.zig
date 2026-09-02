@@ -9,12 +9,20 @@
 //! implementation on the far side must be replaceable — by the router in production
 //! and by a fixture in a test — without the transport being recompiled around it.
 //!
-//! The handler never touches a socket, never sees a descriptor, and cannot choose when
-//! its response is written. It reads an `Incoming` and fills in a `Reply`.
+//! The handler performs no socket I/O and cannot choose when its response is written. It
+//! reads an `Incoming` and fills in a `Reply`.
+//!
+//! It does now *carry* a descriptor, in `Incoming.socket`, which the original wording here
+//! denied outright. The reason is D74's amendment: the control plane needs the client
+//! address when `CF-Connecting-IP` is absent, and reading it lazily through
+//! `Incoming.peer()` is cheaper than capturing one on every accept. The property that
+//! matters is preserved, and is a stronger claim than "never sees a descriptor": every
+//! socket syscall still happens on this side of the seam, and nothing above it makes one.
 
 const std = @import("std");
 const api = @import("api");
 const head_mod = @import("head.zig");
+const net = @import("net.zig");
 
 const Code = api.errors.Code;
 
@@ -59,6 +67,13 @@ pub const Incoming = struct {
     /// The complete body. Empty when the request declared none.
     body: []const u8,
 
+    /// The socket this request arrived on.
+    ///
+    /// Present so that `peer` below can answer without the handler ever holding a
+    /// descriptor of its own. Nothing in `src/service/` reads this field directly, and it
+    /// is not a licence to: every socket syscall stays on this side of the seam (D58).
+    socket: net.Fd = -1,
+
     pub fn method(i: Incoming) head_mod.Method {
         return i.head.method;
     }
@@ -70,6 +85,22 @@ pub const Incoming = struct {
     }
     pub fn header(i: Incoming, name: []const u8) ?[]const u8 {
         return i.head.header(name);
+    }
+
+    /// The address at the far end, read on demand.
+    ///
+    /// **Costs a `getpeername` each time it is called, and nothing when it is not.** That
+    /// is the whole point of it being a method rather than a field: `accept_multishot` has
+    /// nowhere to return a peer address, so capturing one would mean a syscall on every
+    /// connection and bytes in the `Conn` slab whose size D28 publishes as a measured
+    /// figure — to serve a fallback the production shape never reaches, because behind
+    /// Cloudflare the client address arrives in a header (D74 amendment).
+    ///
+    /// Null when the socket is not one we can name, which a handler must treat as "no
+    /// address" rather than as an error: the caller is still a caller.
+    pub fn peer(i: Incoming) ?net.Address {
+        if (i.socket < 0) return null;
+        return net.peerName(i.socket) catch null;
     }
 };
 

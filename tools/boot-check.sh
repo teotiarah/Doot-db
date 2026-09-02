@@ -26,6 +26,14 @@ PASS=0
 FAIL=0
 
 # A fixture secret, and labelled as one. A real deployment's is 32 bytes from the CSPRNG.
+# M3's five variables (D78). All required, so every start below needs them -- and the two
+# checks added at the end prove they are genuinely required rather than merely accepted.
+M3_ENV="DOOT_PUBLIC_ORIGIN=https://doot.run \
+DOOT_GITHUB_CLIENT_ID=Iv1.test0123456789 \
+DOOT_GITHUB_CLIENT_SECRET=ghs_test0123456789 \
+DOOT_ZEPTOMAIL_TOKEN=Zoho-enczapikey-test \
+DOOT_SUPPORT_EMAIL=support@doot.run"
+
 SECRET="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 # The account `tools/dataplane.zig` seeds. Used here because the binary deliberately has no
 # account-creation path: M3 owns signup, and inventing an operator subcommand for this
@@ -91,7 +99,8 @@ refuses() {
 
 start_doot() {
   env DOOT_LISTEN_ADDR="127.0.0.1:$PORT" DOOT_DATA_DIR="$DATA" \
-    DOOT_MAX_INDEX_BYTES=300000000 DOOT_HMAC_SECRET="$SECRET" "$@" \
+    DOOT_MAX_INDEX_BYTES=300000000 DOOT_HMAC_SECRET="$SECRET" \
+    $M3_ENV "$@" \
     "$BIN" >>"$WORK/doot.log" 2>&1 &
   DOOT_PID=$!
   for _ in $(seq 1 100); do
@@ -111,7 +120,8 @@ credits() {
 hdr "it refuses to start, and says which variable is wrong"
 # ---------------------------------------------------------------------------
 
-# Each of the four M2 variables, removed one at a time from an otherwise complete set.
+# Each required variable, removed one at a time from an otherwise complete set -- so a
+# refusal is attributable to the variable removed rather than to whichever is checked first.
 refuses "no configuration at all is a refusal about the first variable" \
   "DOOT_LISTEN_ADDR is required"
 refuses "a missing data directory is named" \
@@ -119,38 +129,58 @@ refuses "a missing data directory is named" \
   DOOT_LISTEN_ADDR=127.0.0.1:1
 refuses "a missing index ceiling is named, and explains itself (D43)" \
   "DOOT_MAX_INDEX_BYTES is required" \
-  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA"
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" $M3_ENV
 refuses "a missing signing secret is named, and is never defaulted" \
   "DOOT_HMAC_SECRET is required" \
-  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 $M3_ENV
 
 refuses "an index ceiling of zero is refused, not treated as unlimited" \
   "must be a positive number" \
-  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=0 DOOT_HMAC_SECRET="$SECRET"
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=0 DOOT_HMAC_SECRET="$SECRET" $M3_ENV
 refuses "an address that is not host:port is refused at boot" \
   "is not an address:port" \
-  DOOT_LISTEN_ADDR=nonsense DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 DOOT_HMAC_SECRET="$SECRET"
+  DOOT_LISTEN_ADDR=nonsense DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 DOOT_HMAC_SECRET="$SECRET" $M3_ENV
 
 # The secret's format, which is the one an operator is most likely to get half-right.
 refuses "a truncated signing secret is refused rather than silently shortened" \
   "64 lowercase hex" \
-  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 DOOT_HMAC_SECRET=abcdef
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 DOOT_HMAC_SECRET=abcdef $M3_ENV
 refuses "an uppercase signing secret is refused, because one spelling means one secret" \
   "64 lowercase hex" \
-  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 \
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 $M3_ENV \
   DOOT_HMAC_SECRET=0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
 
 # The lifetime grammar D47 settled, inherited rather than restated (D63).
 refuses "DOOT_MAX_TTL refuses the compound form X-Doot-TTL refuses" \
   "optional s, m, h or d" \
-  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 \
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 $M3_ENV \
   DOOT_HMAC_SECRET="$SECRET" DOOT_MAX_TTL=1h30m
 refuses "a lifetime ceiling below the minimum lifetime is refused at boot" \
   "below the minimum lifetime" \
-  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 \
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 $M3_ENV \
   DOOT_HMAC_SECRET="$SECRET" DOOT_MAX_TTL=30s
 
 # ---------------------------------------------------------------------------
+# M3's five (D78). Present in every start above, so without these checks they could be
+# accepted-but-unused and nothing would notice.
+refuses "DOOT_PUBLIC_ORIGIN is required" \
+  "DOOT_PUBLIC_ORIGIN is required" \
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 \
+  DOOT_HMAC_SECRET="$SECRET"
+
+refuses "a public origin with a path is refused, because an OAuth redirect_uri must match exactly" \
+  "must be an absolute https origin with no path" \
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 \
+  DOOT_HMAC_SECRET="$SECRET" DOOT_PUBLIC_ORIGIN=https://doot.run/app \
+  DOOT_GITHUB_CLIENT_ID=x DOOT_GITHUB_CLIENT_SECRET=y DOOT_ZEPTOMAIL_TOKEN=z \
+  DOOT_SUPPORT_EMAIL=support@doot.run
+
+refuses "DOOT_SUPPORT_EMAIL is required, because it is published to users in 402 bodies" \
+  "DOOT_SUPPORT_EMAIL is required" \
+  DOOT_LISTEN_ADDR=127.0.0.1:1 DOOT_DATA_DIR="$DATA" DOOT_MAX_INDEX_BYTES=300000000 \
+  DOOT_HMAC_SECRET="$SECRET" DOOT_PUBLIC_ORIGIN=https://doot.run \
+  DOOT_GITHUB_CLIENT_ID=x DOOT_GITHUB_CLIENT_SECRET=y DOOT_ZEPTOMAIL_TOKEN=z
+
 hdr "it starts, and serves"
 # ---------------------------------------------------------------------------
 

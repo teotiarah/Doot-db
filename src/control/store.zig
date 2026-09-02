@@ -58,6 +58,16 @@ const temp_name = "CONTROL.tmp";
 /// multiply their limit fivefold, so keys are credentials, not namespaces.
 pub const max_keys_per_account: usize = 5;
 
+/// `06-auth.md`: unverified accounts are deleted after 7 days.
+pub const pending_verification_ttl_s: u32 = 7 * 24 * 60 * 60;
+
+/// `06-auth.md`: sessions last 30 days, sliding.
+pub const session_lifetime_s: u32 = 30 * 24 * 60 * 60;
+
+/// `06-auth.md`: refreshed on use once over 24 hours old. The threshold exists so that a
+/// busy dashboard does not move the expiry on every single request.
+pub const session_refresh_after_s: u32 = 24 * 60 * 60;
+
 /// A log below this never triggers a rewrite. Expressed as one page rather than a
 /// new tunable: without a floor, a store holding a single account would rewrite on
 /// almost every mutation.
@@ -73,6 +83,8 @@ pub const Error = error{
     KeyLimitReached,
     KeyAlreadyExists,
     IdSpaceExhausted,
+    PasswordHashTooLong,
+    SessionAlreadyExists,
 } || event.Error || os.Error || std.mem.Allocator.Error;
 
 pub const Plan = event.Plan;
@@ -98,6 +110,14 @@ pub const Account = struct {
     tokens: f64 = 0,
     /// When `tokens` was last brought up to date.
     tokens_at: u32 = 0,
+
+    /// The control plane's own bucket, on the same account and behind the same mutex
+    /// (D74). Separate from the pooled data-plane bucket above because exploring your
+    /// data in the dashboard must not be able to exhaust the bucket a production script
+    /// depends on — which is a product requirement, not a tuning choice
+    /// (`01-product.md`).
+    ctl_tokens: f64 = 0,
+    ctl_tokens_at: u32 = 0,
 };
 
 pub const ApiKey = struct {
@@ -119,6 +139,47 @@ pub const Auth = struct {
     credits_remaining: u32,
 };
 
+pub const AnchorKind = event.AnchorKind;
+
+/// An Argon2id hash and when it was set. Last write wins, so a password change is one
+/// more append rather than a rewrite (D70, D71).
+pub const Password = struct {
+    /// PHC string, owned by the store. Carries the parameters it was made with, which
+    /// is what allows them to be raised later without invalidating this hash.
+    phc: []const u8,
+    set_at: u32,
+};
+
+/// A dashboard session. The token itself is never stored — only its digest, exactly as
+/// with an API key (`06-auth.md`).
+pub const Session = struct {
+    id: u32,
+    account_id: u32,
+    token_hash: [32]u8,
+    created_at: u32,
+    /// Slides on use. Authoritative in RAM and checkpointed, so a crash loses the most
+    /// recent extensions and the session expires *earlier* than it would have — the
+    /// mirror of D41, where a crash loses recent deductions and the customer gains
+    /// (D70, as amended).
+    expires_at: u32,
+};
+
+// The synchroniser token for state-changing control-plane requests is deliberately
+// **not** a field here. It is derived in the service layer as a keyed hash of the
+// session digest under `DOOT_HMAC_SECRET`, which means it needs no storage, no event
+// type and no checkpoint, and it survives a restart without the log carrying it. The
+// control plane owns sessions; CSRF is a property of the HTTP surface, and D73 puts
+// that in the service layer.
+
+/// An identity-anchor claim, keyed on kind and digest together.
+///
+/// Two kinds rather than one combined identity: a GitHub signup has no verified email
+/// at the moment it claims, and an email signup never has a GitHub id (D72).
+pub const AnchorId = struct {
+    kind: AnchorKind,
+    hash: [32]u8,
+};
+
 pub const Spend = enum { spent, exhausted, no_account };
 
 pub const Stats = struct {
@@ -129,6 +190,11 @@ pub const Stats = struct {
     image_bytes: u64,
     rewrites: u64,
     credits_checkpointed: u64,
+    passwords: u64,
+    sessions: u64,
+    anchors: u64,
+    github_links: u64,
+    sessions_checkpointed: u64,
 };
 
 /// Buckets the map on the digest's leading bytes — already uniform — and compares
@@ -142,8 +208,33 @@ const KeyContext = struct {
     }
 };
 
+/// Buckets on the digest and compares byte-wise.
+///
+/// Deliberately *not* constant-time, unlike `KeyContext`. An anchor digest is never
+/// presented by a caller — it is derived server-side from an address the caller already
+/// knows they typed — so there is no secret to leak by comparison timing. What an
+/// attacker could probe here is whether an address is registered, and that is defended
+/// where it actually matters: the response is identical either way and the request pays
+/// a full Argon2id verification regardless (D75), which dwarfs a 32-byte compare by
+/// six orders of magnitude.
+const AnchorContext = struct {
+    pub fn hash(_: AnchorContext, a: AnchorId) u64 {
+        return std.mem.readInt(u64, a.hash[0..8], .little) ^
+            (@as(u64, @intFromEnum(a.kind)) << 56);
+    }
+    pub fn eql(_: AnchorContext, a: AnchorId, b: AnchorId) bool {
+        return a.kind == b.kind and std.mem.eql(u8, &a.hash, &b.hash);
+    }
+};
+
 const Accounts = std.AutoHashMapUnmanaged(u32, Account);
 const Keys = std.HashMapUnmanaged([32]u8, ApiKey, KeyContext, 80);
+const Passwords = std.AutoHashMapUnmanaged(u32, Password);
+/// Keyed on the token digest, and sharing `KeyContext` because a session token is a
+/// credential presented by the caller and must be compared in constant time.
+const Sessions = std.HashMapUnmanaged([32]u8, Session, KeyContext, 80);
+const Anchors = std.HashMapUnmanaged(AnchorId, u32, AnchorContext, 80);
+const GithubLinks = std.AutoHashMapUnmanaged(u64, u32);
 
 pub fn hashKey(plaintext: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
@@ -162,11 +253,17 @@ pub const Control = struct {
 
     accounts: Accounts = .empty,
     keys: Keys = .empty,
+    passwords: Passwords = .empty,
+    sessions: Sessions = .empty,
+    anchors: Anchors = .empty,
+    github: GithubLinks = .empty,
     next_account_id: u32 = 1,
     next_key_id: u32 = 1,
+    next_session_id: u32 = 1,
 
     rewrites: u64 = 0,
     credits_checkpointed: u64 = 0,
+    sessions_checkpointed: u64 = 0,
 
     pub fn open(gpa: std.mem.Allocator, dir_fd: os.Fd, clk: clock_mod.Clock) Error!*Control {
         const self = try gpa.create(Control);
@@ -191,6 +288,11 @@ pub const Control = struct {
     pub fn close(self: *Control) void {
         self.mutex.lock();
         _ = self.checkpointCreditsLocked() catch {};
+        // Sessions get the same treatment for the same reason: without this every
+        // deploy would rewind every session's sliding expiry to whatever the last
+        // periodic checkpoint caught, silently shortening the window `06-auth.md`
+        // publishes (D70).
+        _ = self.checkpointSessionsLocked() catch {};
         self.mutex.unlock();
         self.abandon();
     }
@@ -210,6 +312,15 @@ pub const Control = struct {
         var kit = self.keys.valueIterator();
         while (kit.next()) |k| self.gpa.free(k.label);
         self.keys.deinit(self.gpa);
+
+        var pit = self.passwords.valueIterator();
+        while (pit.next()) |p| self.gpa.free(p.phc);
+        self.passwords.deinit(self.gpa);
+
+        // Sessions, anchors and links own no allocations of their own.
+        self.sessions.deinit(self.gpa);
+        self.anchors.deinit(self.gpa);
+        self.github.deinit(self.gpa);
     }
 
     // -----------------------------------------------------------------------
@@ -520,9 +631,397 @@ pub const Control = struct {
         return a.credits_remaining;
     }
 
+    // -----------------------------------------------------------------------
+    // Passwords, activation and deletion (D70, D71, D77)
+    // -----------------------------------------------------------------------
+
+    /// Records an Argon2id PHC string for an account. Last write wins, so this is both
+    /// "set" and "change".
+    ///
+    /// The store never hashes or verifies a password: that is CPU-bound work which by
+    /// D71 belongs on an I/O worker, and putting it behind this mutex would block every
+    /// key lookup for ~100 ms.
+    pub fn setPassword(self: *Control, account_id: u32, phc: []const u8) Error!void {
+        if (phc.len == 0 or phc.len > event.max_phc_bytes) return error.PasswordHashTooLong;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!self.accounts.contains(account_id)) return error.AccountNotFound;
+
+        const owned = try self.gpa.dupe(u8, phc);
+        errdefer self.gpa.free(owned);
+        try self.passwords.ensureUnusedCapacity(self.gpa, 1);
+
+        const now = self.clock.now();
+        try self.appendLocked(.{ .password_set = .{
+            .account_id = account_id,
+            .set_at = now,
+            .phc = phc,
+        } });
+
+        if (self.passwords.fetchRemove(account_id)) |old| self.gpa.free(old.value.phc);
+        self.passwords.putAssumeCapacity(account_id, .{ .phc = owned, .set_at = now });
+    }
+
+    /// The stored hash, for a verification that happens on a worker.
+    ///
+    /// `phc` borrows the store's copy. A caller that will hold it across the
+    /// verification must copy it first, because a concurrent password change frees this
+    /// one — and a verification is exactly long enough for that to matter.
+    pub fn password(self: *Control, account_id: u32) ?Password {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.passwords.get(account_id);
+    }
+
+    /// `pending_verification` → `active`, granting the recorded credits (D70).
+    ///
+    /// The amount is passed in rather than read from the plan table, because the caller
+    /// has already evaluated the identity anchors and a match means zero regardless of
+    /// plan (`06-auth.md`).
+    pub fn activateAccount(self: *Control, account_id: u32, credits_granted: u32) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const a = self.accounts.getPtr(account_id) orelse return error.AccountNotFound;
+
+        try self.appendLocked(.{ .account_activated = .{
+            .account_id = account_id,
+            .credits_granted = credits_granted,
+        } });
+
+        a.state = .active;
+        a.credits_granted = credits_granted;
+        a.credits_remaining = credits_granted;
+    }
+
+    /// Makes an account's data permanently inaccessible, immediately (D77).
+    ///
+    /// **This does not delete entries, and cannot.** The index is keyed on a hash of
+    /// `(account_id, name)` and holds no names (D11), so nothing can enumerate an
+    /// account's entries — the same property that makes cross-account addressing
+    /// unrepresentable. Access ends here, at the credential, and the bytes leave with
+    /// their expiry, bounded by the plan's maximum lifetime.
+    ///
+    /// Returns false when the account is already gone, so deleting twice is not an error.
+    pub fn deleteAccount(self: *Control, account_id: u32) Error!bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!self.accounts.contains(account_id)) return false;
+
+        try self.appendLocked(.{ .account_deleted = .{
+            .account_id = account_id,
+            .deleted_at = self.clock.now(),
+        } });
+        self.purgeAccountLocked(account_id);
+        return true;
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity anchors and GitHub links (D72)
+    // -----------------------------------------------------------------------
+
+    /// Records a claim on an anchor, or reports who already holds it.
+    ///
+    /// Returns the owning account id — `account_id` when the claim is new, and the
+    /// existing owner when it is not. **First claim wins**, which is what makes the
+    /// trial grant one-time: the caller grants credits only when the returned id is its
+    /// own.
+    ///
+    /// Idempotent, so a retried activation cannot hand out a second grant.
+    pub fn claimAnchor(
+        self: *Control,
+        kind: AnchorKind,
+        hash: [32]u8,
+        account_id: u32,
+    ) Error!u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const id: AnchorId = .{ .kind = kind, .hash = hash };
+        if (self.anchors.get(id)) |owner| return owner;
+
+        try self.anchors.ensureUnusedCapacity(self.gpa, 1);
+        try self.appendLocked(.{ .anchor_claimed = .{
+            .kind = kind,
+            .hash = hash,
+            .account_id = account_id,
+        } });
+        self.anchors.putAssumeCapacity(id, account_id);
+        return account_id;
+    }
+
+    /// Visits every live key on an account, newest id last.
+    ///
+    /// The dashboard lists a user's keys, and the map is keyed on digest — so without this a
+    /// caller would have to know every digest to find the keys belonging to one account,
+    /// which is exactly the property that makes the digest a safe map key in the first place.
+    ///
+    /// Revoked keys are skipped: `06-auth.md` shows the dashboard a list of keys that work,
+    /// and revocation is irreversible, so a revoked one is history rather than state.
+    ///
+    /// Runs with the mutex held, so the callback must not re-enter `Control`.
+    pub fn forEachKey(
+        self: *Control,
+        account_id: u32,
+        ctx: anytype,
+        comptime visit: fn (@TypeOf(ctx), ApiKey) void,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.keys.valueIterator();
+        while (it.next()) |k| {
+            if (k.account_id != account_id or k.revoked) continue;
+            visit(ctx, k.*);
+        }
+    }
+
+    /// Revokes a key only if it belongs to `account_id`.
+    ///
+    /// Separate from `revokeKey` because the control plane must not let a session revoke
+    /// another account's key, and an ownership check the caller performs is an ownership
+    /// check the caller can forget. Returns false when the key is unknown, already revoked,
+    /// or someone else's — one answer, so this is not an oracle for which ids exist.
+    pub fn revokeOwnedKey(self: *Control, account_id: u32, key_id: u32) Error!bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var it = self.keys.valueIterator();
+        const target: *ApiKey = while (it.next()) |k| {
+            if (k.id == key_id and !k.revoked and k.account_id == account_id) break k;
+        } else return false;
+
+        try self.appendLocked(.{ .key_revoked = .{ .key_id = key_id } });
+        target.revoked = true;
+        return true;
+    }
+
+    /// Visits every account, so a caller can build an index this module cannot.
+    ///
+    /// Login has to find an account from an email address, and the normalisation that makes
+    /// that work — lowercasing, plus-stripping, the Gmail fold (D72) — lives in `api`, which
+    /// `control` does not and must not import. So the index is **derived state owned by the
+    /// layer that can compute it**: the service builds it at boot from this iteration and
+    /// maintains it on signup.
+    ///
+    /// Deriving it rather than logging it is what keeps the log unchanged. The alternative
+    /// was widening `account_created` with a 32-byte anchor and bumping its version — a
+    /// permanent wire change to serve an index that costs one pass over an in-RAM map at
+    /// startup, which D40 already establishes is single-digit megabytes at ten thousand
+    /// accounts.
+    ///
+    /// The callback runs **with the mutex held**, so it must not call back into `Control`.
+    /// It is given a copy rather than a pointer for the same reason.
+    pub fn forEachAccount(
+        self: *Control,
+        ctx: anytype,
+        comptime visit: fn (@TypeOf(ctx), Account) void,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.accounts.valueIterator();
+        while (it.next()) |a| visit(ctx, a.*);
+    }
+
+    /// Who holds an anchor, without claiming it.
+    pub fn anchorOwner(self: *Control, kind: AnchorKind, hash: [32]u8) ?u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.anchors.get(.{ .kind = kind, .hash = hash });
+    }
+
+    /// Routes a GitHub identity to an account. Keyed on the numeric user id, never the
+    /// username, because usernames can be changed and reused (`06-auth.md`).
+    pub fn linkGithub(self: *Control, account_id: u32, github_user_id: u64) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!self.accounts.contains(account_id)) return error.AccountNotFound;
+
+        try self.github.ensureUnusedCapacity(self.gpa, 1);
+        try self.appendLocked(.{ .github_linked = .{
+            .account_id = account_id,
+            .github_user_id = github_user_id,
+        } });
+        self.github.putAssumeCapacity(github_user_id, account_id);
+    }
+
+    pub fn githubOwner(self: *Control, github_user_id: u64) ?u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.github.get(github_user_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sessions (D70)
+    // -----------------------------------------------------------------------
+
+    /// What the control plane needs from a presented session cookie, in one lookup.
+    pub const SessionAuth = struct {
+        session_id: u32,
+        account_id: u32,
+        plan: Plan,
+        expires_at: u32,
+    };
+
+    /// Creates a session for an account and returns its id. The caller generates the
+    /// opaque token; only its digest is kept, exactly as with an API key.
+    pub fn createSession(self: *Control, account_id: u32, token: []const u8) Error!u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!self.accounts.contains(account_id)) return error.AccountNotFound;
+        if (self.next_session_id == std.math.maxInt(u32)) return error.IdSpaceExhausted;
+
+        const hash = hashKey(token);
+        if (self.sessions.contains(hash)) return error.SessionAlreadyExists;
+
+        const id = self.next_session_id;
+        const now = self.clock.now();
+        try self.sessions.ensureUnusedCapacity(self.gpa, 1);
+
+        try self.appendLocked(.{ .session_created = .{
+            .session_id = id,
+            .account_id = account_id,
+            .token_hash = hash,
+            .created_at = now,
+            .expires_at = now +| session_lifetime_s,
+        } });
+
+        self.sessions.putAssumeCapacity(hash, .{
+            .id = id,
+            .account_id = account_id,
+            .token_hash = hash,
+            .created_at = now,
+            .expires_at = now +| session_lifetime_s,
+        });
+        self.next_session_id = id + 1;
+        return id;
+    }
+
+    /// The control plane's authentication step, and the sliding refresh in one call.
+    ///
+    /// Unknown, expired, deleted and not-yet-verified all return null, so this is no
+    /// more an enumeration oracle than `resolveKey` is.
+    ///
+    /// **The refresh happens here, in memory only.** `06-auth.md` says a session is
+    /// refreshed on use once it is over 24 hours old, and doing it at the point of use is
+    /// the only place that knows it was used. It is not logged — that would be a log
+    /// write per dashboard request — and rides `sessions_checkpoint` instead (D70).
+    pub fn resolveSession(self: *Control, token: []const u8) ?SessionAuth {
+        const hash = hashKey(token);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const s = self.sessions.getPtr(hash) orelse return null;
+        const now = self.clock.now();
+        if (s.expires_at <= now) return null;
+
+        const a = self.accounts.get(s.account_id) orelse return null;
+        if (a.state != .active) return null;
+
+        if (now -| s.created_at >= session_refresh_after_s) {
+            s.expires_at = now +| session_lifetime_s;
+        }
+
+        return .{
+            .session_id = s.id,
+            .account_id = a.id,
+            .plan = a.plan,
+            .expires_at = s.expires_at,
+        };
+    }
+
+    /// Logout. Immediate and server-side, which is the whole reason sessions are opaque
+    /// tokens rather than signed ones (`06-auth.md`).
+    pub fn revokeSession(self: *Control, session_id: u32) Error!bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var found = false;
+        var it = self.sessions.valueIterator();
+        while (it.next()) |s| {
+            if (s.id == session_id) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+
+        try self.appendLocked(.{ .session_revoked = .{ .session_id = session_id } });
+        self.dropSessionLocked(session_id);
+        return true;
+    }
+
+    /// Invalidates every session for an account, which is what a password change and a
+    /// completed reset both require (`06-auth.md`).
+    pub fn revokeSessionsFor(self: *Control, account_id: u32) Error!usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var n: usize = 0;
+        var ids: [64]u32 = undefined;
+        while (true) {
+            var found: usize = 0;
+            var it = self.sessions.valueIterator();
+            while (it.next()) |s| {
+                if (s.account_id != account_id) continue;
+                if (found == ids.len) break;
+                ids[found] = s.id;
+                found += 1;
+            }
+            if (found == 0) break;
+            for (ids[0..found]) |id| {
+                try self.writeLocked(.{ .session_revoked = .{ .session_id = id } });
+                self.dropSessionLocked(id);
+            }
+            n += found;
+        }
+        // One flush for the batch: a password change invalidating five sessions should
+        // not pay five fsyncs.
+        if (n > 0) try self.flushLocked();
+        return n;
+    }
+
+    /// Takes one token from the account's **control-plane** bucket (D74).
+    ///
+    /// Separate from `takeToken` rather than parameterised by which bucket, because the
+    /// two carry different numbers from different tables and a boolean argument at every
+    /// call site is how the wrong bucket eventually gets charged.
+    pub fn takeControlToken(self: *Control, account_id: u32) ?RateDecision {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const a = self.accounts.getPtr(account_id) orelse return null;
+        const now = self.clock.now();
+        const burst: f64 = @floatFromInt(plan_mod.control_burst);
+        const per_second = plan_mod.controlRefillPerSecond();
+
+        const elapsed: f64 = @floatFromInt(now -| a.ctl_tokens_at);
+        a.ctl_tokens = @min(burst, a.ctl_tokens + elapsed * per_second);
+        a.ctl_tokens_at = now;
+
+        const allowed = a.ctl_tokens >= 1.0;
+        if (allowed) a.ctl_tokens -= 1.0;
+
+        return .{
+            .allowed = allowed,
+            .limit = plan_mod.control_rate_per_min,
+            .remaining = @intFromFloat(@floor(a.ctl_tokens)),
+            .reset_s = secondsToAccrue(burst - a.ctl_tokens, per_second),
+            .retry_after_s = if (allowed) 0 else secondsToAccrue(1.0 - a.ctl_tokens, per_second),
+        };
+    }
+
     pub const Maintenance = struct {
         checkpointed: usize,
         rewritten: bool,
+        sessions_checkpointed: usize = 0,
+        sessions_swept: usize = 0,
+        unverified_swept: usize = 0,
     };
 
     /// Persists balances and reclaims the log. Called from the maintenance thread,
@@ -534,7 +1033,14 @@ pub const Control = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // Sweep before checkpointing, so nothing about to be discarded is written
+        // first, and before sizing the image, so the rewrite threshold is judged
+        // against what a rewrite would actually produce.
+        const sessions_swept = self.sweepExpiredSessionsLocked();
+        const unverified_swept = try self.sweepUnverifiedAccountsLocked();
+
         const checkpointed = try self.checkpointCreditsLocked();
+        const sessions_checkpointed = try self.checkpointSessionsLocked();
 
         var rewritten = false;
         const image = self.imageBytesLocked();
@@ -542,7 +1048,13 @@ pub const Control = struct {
             try self.rewriteLocked();
             rewritten = true;
         }
-        return .{ .checkpointed = checkpointed, .rewritten = rewritten };
+        return .{
+            .checkpointed = checkpointed,
+            .rewritten = rewritten,
+            .sessions_checkpointed = sessions_checkpointed,
+            .sessions_swept = sessions_swept,
+            .unverified_swept = unverified_swept,
+        };
     }
 
     pub fn stats(self: *Control) Stats {
@@ -563,12 +1075,100 @@ pub const Control = struct {
             .image_bytes = self.imageBytesLocked(),
             .rewrites = self.rewrites,
             .credits_checkpointed = self.credits_checkpointed,
+            .passwords = self.passwords.count(),
+            .sessions = self.sessions.count(),
+            .anchors = self.anchors.count(),
+            .github_links = self.github.count(),
+            .sessions_checkpointed = self.sessions_checkpointed,
         };
     }
 
     // -----------------------------------------------------------------------
     // The log
     // -----------------------------------------------------------------------
+
+    /// One absolute expiry per live session, then a single flush.
+    ///
+    /// This is what makes the sliding window survive a restart (D70). Expired sessions
+    /// are skipped rather than checkpointed: they are about to be swept, and writing an
+    /// expiry that has already passed only makes the log longer.
+    fn checkpointSessionsLocked(self: *Control) Error!usize {
+        const now = self.clock.now();
+        var n: usize = 0;
+        var it = self.sessions.valueIterator();
+        while (it.next()) |s| {
+            if (s.expires_at <= now) continue;
+            try self.writeLocked(.{ .sessions_checkpoint = .{
+                .session_id = s.id,
+                .expires_at = s.expires_at,
+            } });
+            n += 1;
+        }
+        if (n > 0) {
+            try self.flushLocked();
+            self.sessions_checkpointed += n;
+        }
+        return n;
+    }
+
+    /// Drops sessions whose expiry has passed.
+    ///
+    /// Expiry is already authoritative at lookup — `session()` refuses an expired one —
+    /// so this is reclamation rather than enforcement, exactly as the entry store treats
+    /// a dead index slot. Without it the map would grow with every login for the life of
+    /// the process.
+    fn sweepExpiredSessionsLocked(self: *Control) usize {
+        const now = self.clock.now();
+        var removed: usize = 0;
+        var doomed: [64][32]u8 = undefined;
+        while (true) {
+            var n: usize = 0;
+            var it = self.sessions.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.expires_at > now) continue;
+                if (n == doomed.len) break;
+                doomed[n] = e.key_ptr.*;
+                n += 1;
+            }
+            if (n == 0) return removed;
+            for (doomed[0..n]) |h| _ = self.sessions.remove(h);
+            removed += n;
+        }
+    }
+
+    /// `06-auth.md`: unverified accounts are deleted after 7 days.
+    ///
+    /// Safe to purge wholesale because an anchor is claimed at *activation* (D72), so an
+    /// account that never verified holds none — there is nothing here that must outlive
+    /// the account, which is the one thing deletion has to be careful about (D77).
+    fn sweepUnverifiedAccountsLocked(self: *Control) Error!usize {
+        const now = self.clock.now();
+        var removed: usize = 0;
+        var doomed: [64]u32 = undefined;
+        while (true) {
+            var n: usize = 0;
+            var it = self.accounts.valueIterator();
+            while (it.next()) |a| {
+                if (a.state != .pending_verification) continue;
+                if (now -| a.created_at < pending_verification_ttl_s) continue;
+                if (n == doomed.len) break;
+                doomed[n] = a.id;
+                n += 1;
+            }
+            if (n == 0) return removed;
+            for (doomed[0..n]) |id| {
+                // Logged, so the purge survives a restart rather than being redone --
+                // and so a replay reaches the same image without needing the clock.
+                try self.writeLocked(.{ .account_deleted = .{
+                    .account_id = id,
+                    .deleted_at = now,
+                } });
+                self.purgeAccountLocked(id);
+            }
+            try self.flushLocked();
+            removed += n;
+        }
+    }
 
     /// One absolute balance per account, then a single flush — so the cost does not
     /// scale with how many accounts moved.
@@ -607,35 +1207,109 @@ pub const Control = struct {
         try self.flushLocked();
     }
 
-    /// What a rewrite would produce: exactly the live image, nothing historical.
-    fn imageBytesLocked(self: *Control) u64 {
-        var total: u64 = 0;
+    /// Enumerates exactly the events a rewrite writes, in replay order.
+    ///
+    /// **One definition, used by both `imageBytesLocked` and `rewriteLocked`.** Those
+    /// two held separate copies of this list, which was survivable with four event types
+    /// and is a trap with twelve: a state added to the rewrite but not to the estimate
+    /// merely mis-sizes a threshold, but a state added *neither* place is silently
+    /// destroyed the first time the log is reclaimed. Making the two share one
+    /// enumeration means a new event type cannot be half-added.
+    ///
+    /// Order matters. `account_created` precedes anything referring to an account,
+    /// because `applyLocked` attaches a password, a session or a checkpoint to an
+    /// account that must already exist.
+    fn forEachImageEvent(
+        self: *Control,
+        ctx: anytype,
+        comptime emit: fn (@TypeOf(ctx), event.Payload) Error!void,
+    ) Error!void {
+        const now = self.clock.now();
+
         var ait = self.accounts.valueIterator();
         while (ait.next()) |a| {
-            total += (event.Payload{ .account_created = .{
+            try emit(ctx, .{ .account_created = .{
                 .account_id = a.id,
                 .created_at = a.created_at,
                 .credits_granted = a.credits_granted,
                 .plan = a.plan,
+                // The live state, so an activated account is written as `.active` and
+                // needs no `account_activated` replayed after it.
                 .state = a.state,
                 .email = a.email,
-            } }).encodedLen();
-            total += (event.Payload{ .credits_checkpoint = .{
+            } });
+            try emit(ctx, .{ .credits_checkpoint = .{
                 .account_id = a.id,
                 .credits_remaining = a.credits_remaining,
-            } }).encodedLen();
+            } });
         }
+
+        var pit = self.passwords.iterator();
+        while (pit.next()) |e| {
+            try emit(ctx, .{ .password_set = .{
+                .account_id = e.key_ptr.*,
+                .set_at = e.value_ptr.set_at,
+                .phc = e.value_ptr.phc,
+            } });
+        }
+
         var kit = self.keys.valueIterator();
         while (kit.next()) |k| {
             if (k.revoked) continue;
-            total += (event.Payload{ .key_created = .{
+            try emit(ctx, .{ .key_created = .{
                 .key_id = k.id,
                 .account_id = k.account_id,
                 .created_at = k.created_at,
                 .hash = k.hash,
                 .label = k.label,
-            } }).encodedLen();
+            } });
         }
+
+        // Written with the *current* expiry, so the slide is folded in and no
+        // `sessions_checkpoint` is needed after it. An already-expired session is
+        // dropped here, which is where dead sessions finally leave the log — the same
+        // treatment a revoked key gets.
+        var sit = self.sessions.valueIterator();
+        while (sit.next()) |s| {
+            if (s.expires_at <= now) continue;
+            try emit(ctx, .{ .session_created = .{
+                .session_id = s.id,
+                .account_id = s.account_id,
+                .token_hash = s.token_hash,
+                .created_at = s.created_at,
+                .expires_at = s.expires_at,
+            } });
+        }
+
+        // Anchors outlive their accounts, so these are written whether or not the
+        // account they name is still present (D77).
+        var anit = self.anchors.iterator();
+        while (anit.next()) |e| {
+            try emit(ctx, .{ .anchor_claimed = .{
+                .kind = e.key_ptr.kind,
+                .hash = e.key_ptr.hash,
+                .account_id = e.value_ptr.*,
+            } });
+        }
+
+        var git = self.github.iterator();
+        while (git.next()) |e| {
+            try emit(ctx, .{ .github_linked = .{
+                .account_id = e.value_ptr.*,
+                .github_user_id = e.key_ptr.*,
+            } });
+        }
+    }
+
+    /// What a rewrite would produce: exactly the live image, nothing historical.
+    fn imageBytesLocked(self: *Control) u64 {
+        var total: u64 = 0;
+        // Infallible, so the error union is unreachable in practice.
+        self.forEachImageEvent(&total, struct {
+            fn emit(acc: *u64, p: event.Payload) Error!void {
+                acc.* += p.encodedLen();
+            }
+        }.emit) catch {};
         return total;
     }
 
@@ -652,35 +1326,9 @@ pub const Control = struct {
         });
         errdefer os.close(fd);
 
-        var offset: u64 = 0;
-        var buf: [event.max_event_bytes]u8 = undefined;
-
-        var ait = self.accounts.valueIterator();
-        while (ait.next()) |a| {
-            offset += (try writeAt(fd, offset, &buf, .{ .account_created = .{
-                .account_id = a.id,
-                .created_at = a.created_at,
-                .credits_granted = a.credits_granted,
-                .plan = a.plan,
-                .state = a.state,
-                .email = a.email,
-            } }));
-            offset += (try writeAt(fd, offset, &buf, .{ .credits_checkpoint = .{
-                .account_id = a.id,
-                .credits_remaining = a.credits_remaining,
-            } }));
-        }
-        var kit = self.keys.valueIterator();
-        while (kit.next()) |k| {
-            if (k.revoked) continue;
-            offset += (try writeAt(fd, offset, &buf, .{ .key_created = .{
-                .key_id = k.id,
-                .account_id = k.account_id,
-                .created_at = k.created_at,
-                .hash = k.hash,
-                .label = k.label,
-            } }));
-        }
+        var sink: Sink = .{ .fd = fd };
+        try self.forEachImageEvent(&sink, Sink.emit);
+        const offset = sink.offset;
 
         // Durable before visible, visible atomically, then the directory entry made
         // durable. A reader sees the whole old log or the whole new one.
@@ -713,11 +1361,19 @@ pub const Control = struct {
         }
     }
 
-    fn writeAt(fd: os.Fd, offset: u64, buf: []u8, p: event.Payload) Error!u64 {
-        const bytes = try event.encode(p, buf);
-        try os.pwriteAll(fd, bytes, offset);
-        return bytes.len;
-    }
+    /// Appends image events to a fresh file, carrying its own encode buffer so the
+    /// enumeration above does not have to know it is writing to disk.
+    const Sink = struct {
+        fd: os.Fd,
+        offset: u64 = 0,
+        buf: [event.max_event_bytes]u8 = undefined,
+
+        fn emit(s: *Sink, p: event.Payload) Error!void {
+            const bytes = try event.encode(p, &s.buf);
+            try os.pwriteAll(s.fd, bytes, s.offset);
+            s.offset += bytes.len;
+        }
+    };
 
     /// Rebuilds the image from the log.
     ///
@@ -793,6 +1449,125 @@ pub const Control = struct {
                     if (k.id == e.key_id) k.revoked = true;
                 }
             },
+            .password_set => |e| {
+                const owned = try self.gpa.dupe(u8, e.phc);
+                errdefer self.gpa.free(owned);
+                try self.passwords.ensureUnusedCapacity(self.gpa, 1);
+                if (self.passwords.fetchRemove(e.account_id)) |old| self.gpa.free(old.value.phc);
+                self.passwords.putAssumeCapacity(e.account_id, .{
+                    .phc = owned,
+                    .set_at = e.set_at,
+                });
+            },
+            .session_created => |e| {
+                try self.sessions.ensureUnusedCapacity(self.gpa, 1);
+                _ = self.sessions.remove(e.token_hash);
+                self.sessions.putAssumeCapacity(e.token_hash, .{
+                    .id = e.session_id,
+                    .account_id = e.account_id,
+                    .token_hash = e.token_hash,
+                    .created_at = e.created_at,
+                    .expires_at = e.expires_at,
+                });
+                if (e.session_id >= self.next_session_id) self.next_session_id = e.session_id + 1;
+            },
+            .session_revoked => |e| self.dropSessionLocked(e.session_id),
+            // Authoritative, last one wins — the same treatment `credits_checkpoint`
+            // gets, and for the same reason. The safe direction is not enforced by a
+            // comparison here: a crash loses the most recent checkpoints, so it loses
+            // the most recent extensions, so the session expires *earlier* than it
+            // would have. That falls out of checkpointing rather than being imposed on
+            // it (D70, as amended). A revoked session is already gone from the image,
+            // so no checkpoint can resurrect one.
+            .sessions_checkpoint => |e| {
+                var it = self.sessions.valueIterator();
+                while (it.next()) |s| {
+                    if (s.id == e.session_id) s.expires_at = e.expires_at;
+                }
+            },
+            .anchor_claimed => |e| {
+                try self.anchors.ensureUnusedCapacity(self.gpa, 1);
+                const id: AnchorId = .{ .kind = e.kind, .hash = e.hash };
+                // First claim wins. A later event for the same anchor would mean a
+                // second account tried to claim it, and the whole point of the anchor
+                // is that the first holder keeps it (`06-auth.md`).
+                if (!self.anchors.contains(id)) self.anchors.putAssumeCapacity(id, e.account_id);
+            },
+            .github_linked => |e| {
+                try self.github.ensureUnusedCapacity(self.gpa, 1);
+                self.github.putAssumeCapacity(e.github_user_id, e.account_id);
+            },
+            .account_activated => |e| {
+                if (self.accounts.getPtr(e.account_id)) |a| {
+                    a.state = .active;
+                    // The grant is replayed as recorded rather than re-derived, because
+                    // the amount depended on anchor evaluation at the time (D70).
+                    a.credits_granted = e.credits_granted;
+                    a.credits_remaining = e.credits_granted;
+                }
+            },
+            // A tombstone. Anchors survive it deliberately (D77, `06-auth.md`).
+            .account_deleted => |e| self.purgeAccountLocked(e.account_id),
+        }
+    }
+
+    /// Removes one session by id, wherever it sits in the digest-keyed map.
+    fn dropSessionLocked(self: *Control, session_id: u32) void {
+        var it = self.sessions.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.id == session_id) {
+                _ = self.sessions.remove(e.key_ptr.*);
+                return;
+            }
+        }
+    }
+
+    /// Removes every session belonging to an account.
+    ///
+    /// Collect-then-remove in bounded passes rather than removing mid-iteration, which
+    /// invalidates the iterator. Same shape as the revoked-key sweep in `rewriteLocked`.
+    fn dropSessionsForLocked(self: *Control, account_id: u32) void {
+        var doomed: [64][32]u8 = undefined;
+        while (true) {
+            var n: usize = 0;
+            var it = self.sessions.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.account_id != account_id) continue;
+                if (n == doomed.len) break;
+                doomed[n] = e.key_ptr.*;
+                n += 1;
+            }
+            if (n == 0) return;
+            for (doomed[0..n]) |h| _ = self.sessions.remove(h);
+        }
+    }
+
+    /// Everything deletion removes, in one place so the live path and replay cannot
+    /// disagree about what deletion means.
+    ///
+    /// **Anchor claims are not removed.** `06-auth.md` retains them as hashes so the
+    /// trial grant cannot be re-farmed by delete-and-resignup, and that is the one place
+    /// deletion is deliberately not total. The GitHub *link* does go, because it exists
+    /// to route a login to an account and there is no longer an account to route to —
+    /// the anchor claim under `.github` is what survives.
+    fn purgeAccountLocked(self: *Control, account_id: u32) void {
+        if (self.accounts.fetchRemove(account_id)) |old| self.gpa.free(old.value.email);
+        if (self.passwords.fetchRemove(account_id)) |old| self.gpa.free(old.value.phc);
+        self.dropSessionsForLocked(account_id);
+
+        var git = self.github.iterator();
+        const link: ?u64 = while (git.next()) |e| {
+            if (e.value_ptr.* == account_id) break e.key_ptr.*;
+        } else null;
+        if (link) |gid| _ = self.github.remove(gid);
+
+        // Keys are flagged rather than removed, exactly as `revokeKey` does: it keeps
+        // the operation idempotent without a second id-to-digest index, and the next
+        // wholesale rewrite drops them for good. `resolveKey` already refuses a key
+        // whose account is gone, so access ends the moment this returns.
+        var kit = self.keys.valueIterator();
+        while (kit.next()) |k| {
+            if (k.account_id == account_id) k.revoked = true;
         }
     }
 };
@@ -1475,4 +2250,611 @@ test "a replayed account's bucket behaves like a fresh one" {
         try testing.expect(d.allowed);
         try testing.expectEqual(plan_mod.limits(.trial).burst - 1, d.remaining);
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// M3: passwords, sessions, anchors, activation and deletion
+// ---------------------------------------------------------------------------
+
+const phc_a = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHRzYWx0c2FsdA$" ++
+    "aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhcw";
+const phc_b = "$argon2id$v=19$m=19456,t=2,p=1$b3RoZXJzYWx0b3RoZXJzYQ$" ++
+    "b3RoZXJoYXNob3RoZXJoYXNob3RoZXJoYXNob3RoZXI";
+
+test "a password survives a reopen, and the last one set wins" {
+    var h = try H.init(60);
+    defer h.deinit();
+
+    var id: u32 = 0;
+    {
+        const c = try h.reopen();
+        defer c.close();
+        id = try c.createAccount("a@b.co", .trial, .active, 10);
+        try c.setPassword(id, phc_a);
+        try testing.expectEqualStrings(phc_a, c.password(id).?.phc);
+
+        try c.setPassword(id, phc_b);
+        try testing.expectEqualStrings(phc_b, c.password(id).?.phc);
+    }
+    {
+        const c = try h.reopen();
+        defer c.close();
+        // Replay applies both appends in order, so the change is what survives — which is
+        // the whole reason `password_set` is its own event rather than a field on
+        // `account_created`.
+        try testing.expectEqualStrings(phc_b, c.password(id).?.phc);
+    }
+}
+
+test "a password hash beyond the ceiling is refused before anything is written" {
+    var h = try H.init(61);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    const too_long = "p" ** (event.max_phc_bytes + 1);
+    try testing.expectError(error.PasswordHashTooLong, c.setPassword(id, too_long));
+    try testing.expect(c.password(id) == null);
+}
+
+test "a password cannot be set for an account that does not exist" {
+    var h = try H.init(62);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+    try testing.expectError(error.AccountNotFound, c.setPassword(999, phc_a));
+}
+
+test "a session resolves, and an expired one does not" {
+    var h = try H.init(63);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    _ = try c.createSession(id, "session-token-one");
+
+    const auth = c.resolveSession("session-token-one").?;
+    try testing.expectEqual(id, auth.account_id);
+    try testing.expectEqual(Plan.trial, auth.plan);
+
+    try testing.expect(c.resolveSession("not-a-session") == null);
+
+    // Expiry is authoritative at lookup, exactly as an entry's is at the index.
+    h.mclock.advance(session_lifetime_s + 1);
+    try testing.expect(c.resolveSession("session-token-one") == null);
+}
+
+test "a session belonging to a non-active account does not resolve" {
+    var h = try H.init(64);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .pending_verification, 0);
+    _ = try c.createSession(id, "tok");
+    // Same posture as `resolveKey`: unknown, expired and unverified are one answer, so
+    // none of them is an enumeration oracle.
+    try testing.expect(c.resolveSession("tok") == null);
+
+    try c.activateAccount(id, 10_000);
+    try testing.expect(c.resolveSession("tok") != null);
+}
+
+test "a session slides on use, but only once it is old enough" {
+    var h = try H.init(65);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    _ = try c.createSession(id, "tok");
+    const first = c.resolveSession("tok").?.expires_at;
+
+    // Inside the refresh threshold, nothing moves — otherwise a busy dashboard would
+    // rewrite the expiry on every request.
+    h.mclock.advance(session_refresh_after_s - 1);
+    try testing.expectEqual(first, c.resolveSession("tok").?.expires_at);
+
+    // Past it, the window slides.
+    h.mclock.advance(2);
+    try testing.expect(c.resolveSession("tok").?.expires_at > first);
+}
+
+test "a clean shutdown preserves the slide, and an unclean one shortens it" {
+    // The paired halves of D70's amended rule. Both use the same timeline, and the
+    // assertion is made by *advancing past the un-slid expiry* rather than by comparing
+    // timestamps — because reading a session through `resolveSession` legitimately slides
+    // it again, so a comparison would measure the fresh refresh instead of the lost one.
+    const slide_at = 25 * 24 * 60 * 60; // past the 24 h refresh threshold
+    const just_past_original = session_lifetime_s + 60;
+
+    {
+        var h = try H.init(66);
+        defer h.deinit();
+        const c0 = try h.reopen();
+        const id = try c0.createAccount("a@b.co", .trial, .active, 10);
+        _ = try c0.createSession(id, "tok");
+        h.mclock.advance(slide_at);
+        _ = c0.resolveSession("tok"); // slides to now + 30 days
+        c0.close(); // checkpoints sessions
+
+        const c1 = try h.reopen();
+        defer c1.close();
+        h.mclock.set(H.start_time + just_past_original);
+        // Past where the session would have died without the slide, and the slide was
+        // preserved — so it is still good.
+        try testing.expect(c1.resolveSession("tok") != null);
+    }
+
+    {
+        var h = try H.init(67);
+        defer h.deinit();
+        const c0 = try h.reopen();
+        const id = try c0.createAccount("a@b.co", .trial, .active, 10);
+        _ = try c0.createSession(id, "tok");
+        h.mclock.advance(slide_at);
+        _ = c0.resolveSession("tok"); // slides in RAM only
+        c0.abandon(); // a crash: no checkpoint
+
+        const c1 = try h.reopen();
+        defer c1.close();
+        h.mclock.set(H.start_time + just_past_original);
+        // The extension is gone, so the session expires *earlier* than it would have.
+        // That is the direction D70 requires, and it falls out of checkpointing rather
+        // than being imposed by a comparison: a crash loses recent checkpoints, and for a
+        // credential losing recent updates is the safe side. The mirror of D41, where
+        // losing recent deductions favours the customer.
+        try testing.expect(c1.resolveSession("tok") == null);
+    }
+}
+
+test "logout is immediate and survives a reopen" {
+    var h = try H.init(68);
+    defer h.deinit();
+
+    var sid: u32 = 0;
+    {
+        const c = try h.reopen();
+        defer c.close();
+        const id = try c.createAccount("a@b.co", .trial, .active, 10);
+        sid = try c.createSession(id, "tok");
+        try testing.expect(try c.revokeSession(sid));
+        try testing.expect(c.resolveSession("tok") == null);
+        // Revoking twice is not an error, matching `revokeKey`.
+        try testing.expect(!(try c.revokeSession(sid)));
+    }
+    {
+        const c = try h.reopen();
+        defer c.close();
+        try testing.expect(c.resolveSession("tok") == null);
+    }
+}
+
+test "a password change invalidates every session for the account, and no others" {
+    var h = try H.init(69);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const a = try c.createAccount("a@b.co", .trial, .active, 10);
+    const b = try c.createAccount("b@b.co", .trial, .active, 10);
+    _ = try c.createSession(a, "a1");
+    _ = try c.createSession(a, "a2");
+    _ = try c.createSession(b, "b1");
+
+    try testing.expectEqual(@as(usize, 2), try c.revokeSessionsFor(a));
+    try testing.expect(c.resolveSession("a1") == null);
+    try testing.expect(c.resolveSession("a2") == null);
+    try testing.expect(c.resolveSession("b1") != null);
+}
+
+test "an anchor is claimed once, and the first holder keeps it" {
+    var h = try H.init(70);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const first = try c.createAccount("a@b.co", .trial, .active, 0);
+    const second = try c.createAccount("b@b.co", .trial, .active, 0);
+    const anchor: [32]u8 = @splat(0x11);
+
+    try testing.expectEqual(first, try c.claimAnchor(.email, anchor, first));
+    // The second account is told who holds it, which is how the caller knows to grant
+    // zero credits (06-auth.md) rather than a second trial.
+    try testing.expectEqual(first, try c.claimAnchor(.email, anchor, second));
+    // Idempotent, so a retried activation cannot hand out a second grant.
+    try testing.expectEqual(first, try c.claimAnchor(.email, anchor, first));
+    try testing.expectEqual(first, c.anchorOwner(.email, anchor).?);
+
+    // The two kinds are separate namespaces: the same digest under `.github` is unclaimed.
+    try testing.expect(c.anchorOwner(.github, anchor) == null);
+}
+
+test "a GitHub link routes to an account, and goes when the account does" {
+    var h = try H.init(71);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    try c.linkGithub(id, 987_654_321);
+    try testing.expectEqual(id, c.githubOwner(987_654_321).?);
+
+    _ = try c.deleteAccount(id);
+    // The link is gone, because it exists to route a login to an account and there is no
+    // longer an account to route to.
+    try testing.expect(c.githubOwner(987_654_321) == null);
+}
+
+test "activation grants the recorded credits and turns the key on" {
+    var h = try H.init(72);
+    defer h.deinit();
+
+    var id: u32 = 0;
+    {
+        const c = try h.reopen();
+        defer c.close();
+        id = try c.createAccount("a@b.co", .trial, .pending_verification, 0);
+        _ = try c.issueKey(id, "k", "doot_live_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        // Unverified cannot authenticate, which is what `pending_verification` is for.
+        try testing.expect(c.resolveKey("doot_live_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == null);
+
+        try c.activateAccount(id, 10_000);
+        const auth = c.resolveKey("doot_live_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").?;
+        try testing.expectEqual(@as(u32, 10_000), auth.credits_remaining);
+    }
+    {
+        const c = try h.reopen();
+        defer c.close();
+        const a = c.account(id).?;
+        try testing.expectEqual(AccountState.active, a.state);
+        try testing.expectEqual(@as(u32, 10_000), a.credits_granted);
+    }
+}
+
+test "activation with a matching anchor can grant zero, and replay reproduces that" {
+    var h = try H.init(73);
+    defer h.deinit();
+
+    var second: u32 = 0;
+    {
+        const c = try h.reopen();
+        defer c.close();
+        const anchor: [32]u8 = @splat(0x22);
+        const first = try c.createAccount("a@b.co", .trial, .pending_verification, 0);
+        _ = try c.claimAnchor(.email, anchor, first);
+        try c.activateAccount(first, 10_000);
+
+        second = try c.createAccount("a+x@b.co", .trial, .pending_verification, 0);
+        const owner = try c.claimAnchor(.email, anchor, second);
+        try testing.expect(owner != second);
+        try c.activateAccount(second, 0);
+    }
+    {
+        const c = try h.reopen();
+        defer c.close();
+        // The grant is replayed as recorded rather than re-derived from the plan table,
+        // which is exactly why `account_activated` carries the figure (D70).
+        try testing.expectEqual(@as(u32, 0), c.account(second).?.credits_granted);
+    }
+}
+
+test "deletion ends access at once, and the anchor outlives the account" {
+    var h = try H.init(74);
+    defer h.deinit();
+
+    const anchor: [32]u8 = @splat(0x33);
+    var id: u32 = 0;
+    {
+        const c = try h.reopen();
+        defer c.close();
+        id = try c.createAccount("a@b.co", .trial, .active, 10);
+        _ = try c.claimAnchor(.email, anchor, id);
+        try c.setPassword(id, phc_a);
+        _ = try c.issueKey(id, "k", "doot_live_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        _ = try c.createSession(id, "tok");
+
+        try testing.expect(try c.deleteAccount(id));
+
+        // Access ends at the credential, which is what D77 substitutes for a deletion the
+        // index cannot perform: nothing can enumerate an account's entries, so the bytes
+        // leave with their expiry instead.
+        try testing.expect(c.resolveKey("doot_live_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") == null);
+        try testing.expect(c.resolveSession("tok") == null);
+        try testing.expect(c.password(id) == null);
+        try testing.expect(c.account(id) == null);
+        // Retained, so the trial grant cannot be re-farmed by delete-and-resignup.
+        try testing.expectEqual(id, c.anchorOwner(.email, anchor).?);
+
+        try testing.expect(!(try c.deleteAccount(id)));
+    }
+    {
+        const c = try h.reopen();
+        defer c.close();
+        // The tombstone means replay does not resurrect it.
+        try testing.expect(c.account(id) == null);
+        try testing.expect(c.resolveKey("doot_live_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") == null);
+        try testing.expectEqual(id, c.anchorOwner(.email, anchor).?);
+    }
+}
+
+test "a rewrite preserves every kind of M3 state" {
+    // The test this whole file most needed. `imageBytesLocked` and `rewriteLocked` used to
+    // hold separate copies of the event list, and a state present in neither is *destroyed*
+    // by the next reclamation rather than merely mis-sized. They now share one enumeration;
+    // this asserts the enumeration is complete.
+    var h = try H.init(75);
+    defer h.deinit();
+
+    const anchor: [32]u8 = @splat(0x44);
+    var id: u32 = 0;
+    var sid: u32 = 0;
+    var expiry: u32 = 0;
+    {
+        const c = try h.reopen();
+        defer c.close();
+        id = try c.createAccount("a@b.co", .trial, .pending_verification, 0);
+        try c.activateAccount(id, 10_000);
+        try c.setPassword(id, phc_a);
+        try c.linkGithub(id, 424_242);
+        _ = try c.claimAnchor(.github, anchor, id);
+        _ = try c.issueKey(id, "live", "doot_live_cccccccccccccccccccccccccccccccc");
+        sid = try c.createSession(id, "tok");
+        _ = c.spendCredit(id);
+        expiry = c.resolveSession("tok").?.expires_at;
+
+        // Force the rewrite by pushing the log past its own image. Each `maintain` appends
+        // a couple of checkpoints, and the threshold is eight times the image or the
+        // 4 KiB floor — so this is a loop with a bound rather than a guessed count.
+        var n: usize = 0;
+        while (c.stats().rewrites == 0 and n < 5_000) : (n += 1) _ = try c.maintain();
+        try testing.expect(c.stats().rewrites > 0);
+
+        // Everything still present in RAM immediately after the rewrite.
+        try testing.expectEqualStrings(phc_a, c.password(id).?.phc);
+        try testing.expectEqual(id, c.githubOwner(424_242).?);
+        try testing.expectEqual(id, c.anchorOwner(.github, anchor).?);
+        try testing.expect(c.resolveSession("tok") != null);
+        try testing.expect(c.resolveKey("doot_live_cccccccccccccccccccccccccccccccc") != null);
+    }
+    {
+        // And present again after replaying only the rewritten log.
+        const c = try h.reopen();
+        defer c.close();
+        const a = c.account(id).?;
+        try testing.expectEqual(AccountState.active, a.state);
+        try testing.expectEqual(@as(u32, 9_999), a.credits_remaining);
+        try testing.expectEqualStrings(phc_a, c.password(id).?.phc);
+        try testing.expectEqual(id, c.githubOwner(424_242).?);
+        try testing.expectEqual(id, c.anchorOwner(.github, anchor).?);
+        try testing.expect(c.resolveKey("doot_live_cccccccccccccccccccccccccccccccc") != null);
+        const s = c.resolveSession("tok").?;
+        try testing.expectEqual(sid, s.session_id);
+        try testing.expectEqual(expiry, s.expires_at);
+    }
+}
+
+test "the control-plane bucket is separate from the data-plane one" {
+    var h = try H.init(76);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+
+    // Draining the dashboard's bucket must not touch the bucket a production script
+    // depends on. That is a product requirement, not a tuning choice (01-product.md).
+    var taken: u32 = 0;
+    while (c.takeControlToken(id).?.allowed) : (taken += 1) {}
+    try testing.expectEqual(plan_mod.control_burst, taken);
+
+    const data = c.takeToken(id).?;
+    try testing.expect(data.allowed);
+    try testing.expectEqual(plan_mod.limits(.trial).rate_per_min, data.limit);
+}
+
+test "expired sessions are swept, and live ones are not" {
+    var h = try H.init(77);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    _ = try c.createSession(id, "old");
+    h.mclock.advance(session_lifetime_s - 10);
+    _ = try c.createSession(id, "new");
+
+    // `old` is now past its expiry, `new` is not.
+    h.mclock.advance(20);
+    const m = try c.maintain();
+    try testing.expectEqual(@as(usize, 1), m.sessions_swept);
+    try testing.expect(c.resolveSession("old") == null);
+    try testing.expect(c.resolveSession("new") != null);
+    try testing.expectEqual(@as(u64, 1), c.stats().sessions);
+}
+
+test "an unverified account is swept after seven days, and a verified one is not" {
+    var h = try H.init(78);
+    defer h.deinit();
+
+    var pending: u32 = 0;
+    var active: u32 = 0;
+    {
+        const c = try h.reopen();
+        defer c.close();
+        pending = try c.createAccount("p@b.co", .trial, .pending_verification, 0);
+        active = try c.createAccount("a@b.co", .trial, .active, 10);
+
+        h.mclock.advance(pending_verification_ttl_s + 1);
+        const m = try c.maintain();
+        try testing.expectEqual(@as(usize, 1), m.unverified_swept);
+        try testing.expect(c.account(pending) == null);
+        try testing.expect(c.account(active) != null);
+    }
+    {
+        // Logged, so the sweep is not redone on every boot and replay reaches the same
+        // image without consulting the clock.
+        const c = try h.reopen();
+        defer c.close();
+        try testing.expect(c.account(pending) == null);
+        try testing.expect(c.account(active) != null);
+    }
+}
+
+test "the same session token cannot be registered twice" {
+    var h = try H.init(79);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("a@b.co", .trial, .active, 10);
+    _ = try c.createSession(id, "tok");
+    try testing.expectError(error.SessionAlreadyExists, c.createSession(id, "tok"));
+}
+
+test "a session cannot be created for an account that does not exist" {
+    var h = try H.init(80);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+    try testing.expectError(error.AccountNotFound, c.createSession(999, "tok"));
+}
+
+test "session ids keep ascending across a reopen" {
+    var h = try H.init(81);
+    defer h.deinit();
+
+    var id: u32 = 0;
+    var first: u32 = 0;
+    {
+        const c = try h.reopen();
+        defer c.close();
+        id = try c.createAccount("a@b.co", .trial, .active, 10);
+        first = try c.createSession(id, "one");
+    }
+    {
+        const c = try h.reopen();
+        defer c.close();
+        try testing.expect((try c.createSession(id, "two")) > first);
+    }
+}
+
+
+test "every account can be visited, so a caller can derive an index" {
+    // Login needs email -> account, and the normalisation that makes it work lives in `api`,
+    // which `control` must not import. So the index is derived by the layer that can compute
+    // it, from this iteration -- which is what keeps the log format unchanged.
+    var h = try H.init(82);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const a = try c.createAccount("a@b.co", .trial, .active, 10);
+    const b = try c.createAccount("b@b.co", .trial, .pending_verification, 0);
+    _ = try c.createAccount("c@b.co", .paid, .active, 0);
+
+    const Seen = struct {
+        n: usize = 0,
+        found_a: bool = false,
+        found_pending: bool = false,
+        fn visit(s: *@This(), acct: Account) void {
+            s.n += 1;
+            if (std.mem.eql(u8, acct.email, "a@b.co")) s.found_a = true;
+            if (acct.state == .pending_verification) s.found_pending = true;
+        }
+    };
+    var seen: Seen = .{};
+    c.forEachAccount(&seen, Seen.visit);
+
+    try testing.expectEqual(@as(usize, 3), seen.n);
+    try testing.expect(seen.found_a);
+    // Pending accounts are visited too: a signup for an address that already has an
+    // unverified account must be recognised, or the second attempt would create a duplicate.
+    try testing.expect(seen.found_pending);
+    _ = a;
+    _ = b;
+}
+
+test "a deleted account is not visited" {
+    var h = try H.init(83);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("gone@b.co", .trial, .active, 10);
+    _ = try c.createAccount("here@b.co", .trial, .active, 10);
+    _ = try c.deleteAccount(id);
+
+    const Counter = struct {
+        n: usize = 0,
+        fn visit(s: *@This(), _: Account) void {
+            s.n += 1;
+        }
+    };
+    var counter: Counter = .{};
+    c.forEachAccount(&counter, Counter.visit);
+    // Deletion removes the account outright, so an index rebuilt from this cannot resurrect
+    // a login for it (D77).
+    try testing.expectEqual(@as(usize, 1), counter.n);
+}
+
+
+test "an account's live keys can be listed, and revoked ones are not" {
+    var h = try H.init(84);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const a = try c.createAccount("a@b.co", .trial, .active, 10);
+    const b = try c.createAccount("b@b.co", .trial, .active, 10);
+    const k1 = try c.issueKey(a, "one", "doot_live_1111111111111111111111111111111111");
+    _ = try c.issueKey(a, "two", "doot_live_2222222222222222222222222222222222");
+    _ = try c.issueKey(b, "other", "doot_live_3333333333333333333333333333333333");
+    _ = try c.revokeKey(k1);
+
+    const Seen = struct {
+        n: usize = 0,
+        labels: [8][]const u8 = undefined,
+        fn visit(s: *@This(), k: ApiKey) void {
+            if (s.n == s.labels.len) return;
+            s.labels[s.n] = k.label;
+            s.n += 1;
+        }
+    };
+    var seen: Seen = .{};
+    c.forEachKey(a, &seen, Seen.visit);
+
+    // Only the live key on *this* account. The dashboard shows keys that work, and revocation
+    // is irreversible, so a revoked one is history rather than state.
+    try testing.expectEqual(@as(usize, 1), seen.n);
+    try testing.expectEqualStrings("two", seen.labels[0]);
+}
+
+test "one account cannot revoke another's key" {
+    // The check lives in Control rather than at the call site, because a check the caller
+    // performs is a check the caller can forget -- and forgetting this one lets a session
+    // revoke a stranger's credential.
+    var h = try H.init(85);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const a = try c.createAccount("a@b.co", .trial, .active, 10);
+    const b = try c.createAccount("b@b.co", .trial, .active, 10);
+    const victim = try c.issueKey(b, "victim", "doot_live_4444444444444444444444444444444444");
+
+    try testing.expect(!(try c.revokeOwnedKey(a, victim)));
+    // Still working, which is the property that matters.
+    try testing.expect(c.resolveKey("doot_live_4444444444444444444444444444444444") != null);
+
+    // And the owner can.
+    try testing.expect(try c.revokeOwnedKey(b, victim));
+    try testing.expect(c.resolveKey("doot_live_4444444444444444444444444444444444") == null);
+    // Twice is not an error, and an unknown id is the same answer as someone else's -- so
+    // this is not an oracle for which ids exist.
+    try testing.expect(!(try c.revokeOwnedKey(b, victim)));
+    try testing.expect(!(try c.revokeOwnedKey(b, 9_999)));
 }

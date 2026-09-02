@@ -97,6 +97,17 @@ never draw from the data-plane pool. If exploring your data could exhaust the sa
 bucket your production script depends on, the explorer would be a liability rather
 than the feature the product is betting on.
 
+| control-plane surface | limit |
+|---|---|
+| authenticated `/app/*`, per account | 300 ops/min |
+| unauthenticated `/app/auth/*`, per client address | 20 ops/min |
+| unauthenticated `/app/auth/*`, global ceiling | 600 ops/min |
+
+The global ceiling is not redundant: the per-address limit depends on believing the client
+address, which behind Cloudflare means believing a header, and that is only sound once the
+origin refuses connections that did not come through Cloudflare. Reasoning and the dependency
+in `07-decisions.md` D74.
+
 `/healthz` is unauthenticated and never rate limited.
 
 Every data-plane response carries the current bucket state; see `02-api.md`.

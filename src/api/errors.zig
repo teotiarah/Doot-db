@@ -59,6 +59,32 @@ pub const Code = enum {
     // 503
     capacity_exhausted,
 
+    // ---------------------------------------------------------------------
+    // Control plane only (M3)
+    // ---------------------------------------------------------------------
+    //
+    // These never appear on a `/v1` response, and they are **not** in `02-api.md`'s
+    // catalogue — that table is the published data-plane contract, and a code a caller can
+    // never receive has no business in it. They are documented in `06-auth.md` alongside the
+    // surface that emits them, which `06-auth.md` already says is neither public API nor
+    // versioned.
+    //
+    // Separate codes rather than overloading near neighbours, per D52: `invalid_request`
+    // would be a lie for a password that parsed fine and was merely too short.
+    //
+    // 400
+    invalid_email,
+    password_too_short,
+    /// One answer for wrong, expired and exhausted (`06-auth.md`, D75). The table
+    /// distinguishes them internally; the wire deliberately does not, because "that code was
+    /// wrong" and "that code has expired" together tell an attacker whether a code was ever
+    /// issued for the address.
+    invalid_challenge,
+    // 403
+    invalid_synchroniser,
+    // 409
+    key_limit_reached,
+
     /// The published identifier. Identical to the enum name, so the two cannot
     /// drift.
     pub fn slug(c: Code) []const u8 {
@@ -91,6 +117,11 @@ pub const Code = enum {
             .headers_too_large => 431,
             .internal_error => 500,
             .capacity_exhausted => 503,
+
+            // Control plane (M3).
+            .invalid_email, .password_too_short, .invalid_challenge => 400,
+            .invalid_synchroniser => 403,
+            .key_limit_reached => 409,
         };
     }
 
@@ -102,6 +133,7 @@ pub const Code = enum {
             401 => "Unauthorized",
             402 => "Payment Required",
             404 => "Not Found",
+            403 => "Forbidden",
             405 => "Method Not Allowed",
             409 => "Conflict",
             411 => "Length Required",
@@ -145,6 +177,30 @@ pub const Code = enum {
             // Deliberately says nothing. See D52.
             .internal_error => "The server could not complete the request.",
             .capacity_exhausted => "The origin cannot accept new entries. Existing entries remain readable.",
+
+            // Control plane (M3).
+            .invalid_email => "That does not look like an email address.",
+            .password_too_short => "A password must be at least 10 characters.",
+            // Says nothing about which of the three it was, on purpose.
+            .invalid_challenge => "That code is not valid. Request a new one.",
+            .invalid_synchroniser => "Missing or incorrect synchroniser token.",
+            .key_limit_reached => "An account may hold at most 5 API keys. Revoke one first.",
+        };
+    }
+
+    /// Is this code one only the control plane emits?
+    ///
+    /// Exists so a test can assert that no `/v1` response can carry one, which is what keeps
+    /// `02-api.md`'s catalogue an accurate list of what a data-plane caller may receive.
+    pub fn controlPlaneOnly(c: Code) bool {
+        return switch (c) {
+            .invalid_email,
+            .password_too_short,
+            .invalid_challenge,
+            .invalid_synchroniser,
+            .key_limit_reached,
+            => true,
+            else => false,
         };
     }
 };
@@ -325,4 +381,41 @@ test "the whole engine error set maps to something" {
         const code = fromStore(@field(anyerror, e.name));
         try testing.expect(code.status() >= 400);
     }
+}
+
+
+test "02-api.md's catalogue still has exactly the twenty-five data-plane codes" {
+    // M3 added five codes that only the control plane emits. This asserts they did not
+    // silently join the published data-plane catalogue, which `02-api.md` enumerates and
+    // `tools/dataplane-check.sh` reproduces row by row — a code a `/v1` caller can never
+    // receive has no business in either.
+    var data_plane: usize = 0;
+    var control_plane: usize = 0;
+    inline for (@typeInfo(Code).@"enum".fields) |f| {
+        const c: Code = @enumFromInt(f.value);
+        if (c.controlPlaneOnly()) control_plane += 1 else data_plane += 1;
+    }
+    try testing.expectEqual(@as(usize, 25), data_plane);
+    try testing.expectEqual(@as(usize, 5), control_plane);
+}
+
+test "the control-plane codes carry the statuses 06-auth.md describes" {
+    try testing.expectEqual(@as(u16, 400), Code.invalid_email.status());
+    try testing.expectEqual(@as(u16, 400), Code.password_too_short.status());
+    try testing.expectEqual(@as(u16, 400), Code.invalid_challenge.status());
+    try testing.expectEqual(@as(u16, 403), Code.invalid_synchroniser.status());
+    try testing.expectEqual(@as(u16, 409), Code.key_limit_reached.status());
+    // 403 was not previously reachable, so `reason` had no arm for it — a gap that would
+    // have been an `unreachable` at the first CSRF failure rather than a compile error.
+    try testing.expectEqualStrings("Forbidden", Code.invalid_synchroniser.reason());
+}
+
+test "a failed challenge says nothing about which kind of failure it was" {
+    // 06-auth.md requires that verify and reset reveal nothing about whether an address is
+    // known, and D75 extends that to the work performed. The message is part of the same
+    // promise: three internal outcomes, one sentence.
+    const msg = Code.invalid_challenge.defaultMessage();
+    try testing.expect(std.mem.indexOf(u8, msg, "expired") == null);
+    try testing.expect(std.mem.indexOf(u8, msg, "attempts") == null);
+    try testing.expect(std.mem.indexOf(u8, msg, "unknown") == null);
 }

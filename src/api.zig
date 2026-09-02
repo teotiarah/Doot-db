@@ -19,6 +19,10 @@ pub const errors = @import("api/errors.zig");
 pub const parse = @import("api/parse.zig");
 pub const ulid = @import("api/ulid.zig");
 pub const cursor = @import("api/cursor.zig");
+pub const email = @import("api/email.zig");
+pub const secret = @import("api/secret.zig");
+pub const cookie = @import("api/cookie.zig");
+pub const form = @import("api/form.zig");
 
 pub const Code = errors.Code;
 pub const TagSet = parse.TagSet;
@@ -29,4 +33,8 @@ test {
     _ = parse;
     _ = ulid;
     _ = cursor;
+    _ = email;
+    _ = secret;
+    _ = cookie;
+    _ = form;
 }
