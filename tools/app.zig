@@ -111,6 +111,10 @@ pub fn main(init: std.process.Init) !u8 {
     defer emails.deinit();
     emails.rebuild(ctl);
 
+    const subs = try gpa.create(service.app.Subscribers);
+    defer gpa.destroy(subs);
+    subs.* = .{};
+
     var app_state: service.app.State = .{
         .gpa = gpa,
         .cfg = cfg,
@@ -119,6 +123,7 @@ pub fn main(init: std.process.Init) !u8 {
         .dummy = dummy,
         .queue = queue,
         .emails = emails,
+        .subscribers = subs,
     };
 
     var svc = service.Service.init(.{
@@ -135,6 +140,7 @@ pub fn main(init: std.process.Init) !u8 {
     const loop = try server.Loop.init(gpa, .{
         .address = addr,
         .handler = svc.handler(),
+        .stream = svc.streamSeam(),
         .clock = clk,
     });
     defer loop.deinit(gpa);

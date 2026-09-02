@@ -2524,6 +2524,13 @@ exercise `Full (strict)`, Authenticated Origin Pulls, or an origin firewall rest
 Cloudflare ranges, because with a tunnel none of those three exist. Reporting that as the
 production shape verified would be false. It is recorded as a partial result instead.
 
+**Amendment — the zone verification does not choose which transport ships (D87).** This
+decision said the probe "chooses which one is enabled", and building the seam showed that puts
+the choice in the wrong place: buffering is a property of the *network path*, not of the
+deployment, so an intermediary in front of one user does not justify taking the live view away
+from everyone. Both transports ship on one path and the **client's `Accept` header** picks. The
+probe still decides whether SSE works through Cloudflare, which is what it was always for.
+
 **Accepted consequence: M2 closes with two of three exit conditions met and the third
 explicitly rescheduled**, rather than silently carried. The roadmap says so in both places.
 
@@ -3329,6 +3336,249 @@ as a bug forever after.
 **Accepted consequence: a fresh account has a session and no key until the dashboard asks.**
 Until M4 exists, a caller drives the second step itself — which is what the harness does, and
 what any script automating signup would do anyway.
+
+---
+
+# Live feed decisions
+
+M2's SSE slice, which D68 kept in M2's scope and deferred the *verification* of to the end of
+M5. These settle the code, which was never what was blocked.
+
+---
+
+## D84 — Streaming is a third disposition, and the request slot is released once the head is out · locked
+
+The transport renders exactly one response per request: `render` writes a `Content-Length`,
+`onSend` sees the write complete and returns the connection to `.head`. Nothing in it can hold a
+response open, and D44 has been publishing to a change-feed ring that nothing consumes since M2.
+
+Resolution: **`Disposition.streaming`, a `Conn.State.streaming`, and a `Reply.open_ended` flag
+that suppresses `Content-Length`.**
+
+- `render` omits `Content-Length` when `open_ended` is set. That is the whole change to it: an
+  SSE body is not chunked — raw framing on an unbounded body is normal for
+  `text/event-stream` — so this is an omission rather than a new encoding. The transport still
+  refuses `Transfer-Encoding` on the way *in*, which is untouched.
+- `onSend` gains a `.streaming` arm that does **not** call `finishRequest` and does not return
+  to `.head`. The connection stays parked, which is the point.
+- `sweepIdle` needs no change at all, and that is worth stating rather than discovering: it
+  already skips every state but `.head`, so a parked stream is exempt for the same reason a
+  request awaiting an I/O worker is.
+
+**The request slot is released as soon as the head has been written, and this is the load-bearing
+part.** A `Request` is 260 KiB (D51). A streaming connection that kept one would cost 260 KiB
+for its whole life, so 1,000 live views would be 260 MB — against a transport whose entire
+reservation is 107 MB and whose 256 slots are sized for *concurrent requests*, not for
+concurrent viewers (D28). Holding a slot per subscriber would quietly convert a fixed ceiling
+into a per-viewer slope, which is the exact failure D28 exists to prevent.
+
+So the head is rendered into the request's own buffer, written, and the slot goes back to the
+pool. Everything after that comes out of the subscriber's own small buffer (D86). The head's
+bytes are safe to release because the send has already completed — that is what `onSend` means.
+
+**A dedicated 100 ms timer, armed only while someone is subscribed.** The existing tick is 1 s
+and must stay there: it drives idle sweeps and the `Date` refresh, and shortening it would make
+every connection in the table pay for a feature nobody may be using. But 1 s is too slow for
+`00-vision.md`'s promise that a write and the dashboard updating are "visibly simultaneous" — a
+second of lag reads as a page that refreshes, not as data arriving.
+
+A second `timeout` SQE at 100 ms, re-armed only when the subscriber count is non-zero, costs
+exactly nothing when the dashboard is closed and gives a tenth of a second when it is open.
+
+Rejected: **one timer at 100 ms.** It multiplies the idle sweep's full table scan by ten for
+the benefit of a feature that is idle most of the time.
+
+Rejected: **waking the loop from the write path.** Publishing happens under the global write
+lock (D44), and signalling a loop from inside it is the re-entrancy hazard D44 explicitly moved
+the ring into the engine to avoid.
+
+Rejected: **keeping the request slot and shrinking it.** The slot is one size because a read
+must hold a whole record (D51); a second size is a second pool and a second thing to exhaust.
+
+---
+
+## D85 — A frame is a change notification, not the change · locked
+
+A feed `Event` is 24 bytes: `seq`, a packed `Location`, `account_id`, and `op` (D44). It
+deliberately holds no name and no body — the name is not in the index either (D11).
+
+So a frame that named the entry would require reading the record at that location, and a read is
+disk. On the event loop that is forbidden outright (D57); handed to an I/O worker it means a
+worker per batch, a completion path back to the loop, and a rendered result that has to land in
+a buffer the loop can then send — for every event, for every subscriber.
+
+Resolution: **the frame carries `seq` and `op`, and the dashboard refetches.**
+
+```
+event: put
+data: {"seq":41293}
+```
+
+The argument for this being *right* rather than merely cheap:
+
+- **A body can be 256 KB.** Nothing would push entry contents down a live stream anyway, so the
+  stream was always going to be a notification and the only question was how much metadata rode
+  along with it.
+- The dashboard already has a listing endpoint and is already showing a tag's entries. On an
+  event it re-runs the query it already has, which is one free `GET` (reads are free, D8) and
+  produces a view that is *correct* rather than one assembled from stream fragments — a client
+  that patched its list from frames would drift the moment it missed one.
+- It keeps disk off the loop with no worker involvement, so a subscriber costs no I/O at all.
+- Coalescing becomes trivially safe (D86): if two events arrive while a send is in flight, the
+  later `seq` subsumes the earlier one, because the client's response to either is the same
+  refetch.
+
+**Events are filtered to the subscriber's own account** before framing, using the `account_id`
+the event already carries. That is the whole of the isolation requirement here, and it happens
+on the loop where the session's account is already known.
+
+**A lapped subscriber gets `event: resync`.** `Feed.poll` reports `resync` when a consumer's
+position has been overwritten, and the honest thing to send is "reload", not a gap dressed up as
+continuity. The dashboard's response is the same refetch it already does, which is why this
+costs no extra client code.
+
+Rejected: **widening the feed event to carry the name.** It makes events variable-length up to
+~280 bytes, takes the ring from the 1.5 MB `04-storage.md` budgets to roughly 20 MB, and changes
+a format D44 locked — to save a `GET` that is free by design.
+
+Rejected: **rendering names on an I/O worker.** Costed above. It puts disk in the path of a
+feature whose whole appeal is that it is instant, and it does so per subscriber.
+
+Rejected: **sending the body for small entries.** A size-dependent frame shape means the client
+needs both paths anyway, so it buys nothing and doubles what can go wrong.
+
+**Accepted consequence: the dashboard does one extra request per burst of activity.** Debounced
+client-side, and free (D8). Stated because it is a real trade and not a free lunch.
+
+---
+
+## D86 — Subscribers are a fixed pool with their own small buffers · locked
+
+D84 releases the request slot, so a parked stream needs somewhere to build frames. M0 measured
+4.33 KB per subscriber at 5,000 concurrent (D30), so the shape is known to be affordable — what
+was never decided is where it comes from.
+
+Resolution: **no new memory at all. A parked stream builds its frames in the connection's own
+idle read buffer**, and the subscriber count is capped at 1,024.
+
+The idle read buffer is 512 bytes per connection, already reserved, and sized by D28's
+measurement of resident cost at 10,000 idle connections. It exists so an idle keep-alive
+connection has just enough room to notice a request beginning — and **a parked stream is never
+going to read another request.** Its buffer is dead space for the whole life of the stream, and
+512 bytes is exactly the size a coalesced frame batch plus a heartbeat wants.
+
+So the per-subscriber cost is **zero bytes above what the connection already cost**, D28's
+figures stand entirely unchanged, and there is no second pool to size, exhaust or get wrong.
+
+This is a correction to what this decision first said, which was a separate pool of 1,024
+records each with its own 512-byte buffer — 512 KB of new reservation to hold what was already
+sitting unused a pointer away. Noticing it required looking at `Conn` rather than at the feature
+in isolation, which is the argument for reading the layer you are attaching to before sizing
+anything.
+
+**The cap of 1,024 stays**, for a different reason than memory. The feed timer scans the
+connection table looking for parked streams, exactly as `sweepIdle` does; the cap bounds how many
+of those scans find work, and it bounds how much of the connection table one feature may hold
+open. `sweepIdle` already establishes that a full 65,536-entry scan of one field is microseconds,
+and this runs ten times as often, which is still microseconds — but a bound on parked
+connections is worth having on its own.
+
+**Exhaustion is a `503`, refused at subscribe time.** At the cap the box is already serving a
+thousand live views; the honest answer is "not now" rather than parking a connection the feature
+has already promised more of than it can watch.
+
+**The D30 rule decides the concurrency, and it is why coalescing is safe.** A buffer handed to
+the ring belongs to the kernel until its completion arrives — measured, not theoretical (D30) —
+so a subscriber may not have a frame built in its buffer while a send from that buffer is in
+flight. Each subscriber therefore carries a `sending` flag and its cursor:
+
+- events arrive while a send is in flight → nothing is written, the cursor advances, and the
+  next batch is built when the completion lands;
+- because a frame is a notification (D85), the batch that eventually goes out says the same
+  thing the individual frames would have. No information is lost by coalescing, which is a
+  property of D85 rather than a coincidence.
+
+**The heartbeat is 15 seconds**, which was already a constant in `server/config.zig` with nothing
+reading it. It is a ceiling rather than a preference: Cloudflare's proxy read timeout on Free and
+Pro is 100 seconds and an origin that sends nothing in that window gets a `524` (D31). Sent as a
+comment (`: hb`), which every SSE client ignores by specification.
+
+Rejected: **a subscriber buffer sized for a burst.** Coalescing already bounds what one send
+carries, so a larger buffer buys nothing.
+
+Rejected: **queueing frames per subscriber.** A queue is state that can grow; the cursor already
+*is* the queue, and it cannot.
+
+Rejected: **a separate subscriber pool.** What this decision originally said. It reserves memory
+to duplicate a buffer the connection is already carrying and not using.
+
+---
+
+## D87 — One path, two framings, chosen by `Accept` · locked
+
+D68 required the live view to be written against a seam with two implementations behind it, and
+said the zone verification "chooses which one is enabled". Implementing it showed that phrasing
+puts the choice in the wrong place.
+
+A deployment-wide switch assumes the buffering problem is a property of the *deployment*. It is a
+property of the **network path**: an intermediary that buffers `text/event-stream` may sit in
+front of one user and not another — a corporate proxy, a mobile carrier, a browser extension.
+A global switch would take the live view away from everyone to fix it for some.
+
+Resolution: **`GET /app/stream` serves both, and the client's `Accept` header decides.**
+
+| `Accept` | framing |
+|---|---|
+| `text/event-stream` | SSE: open-ended, `event:`/`data:` frames, 15 s heartbeat comments |
+| anything else | one JSON batch, **answered immediately**, with a cursor to ask from next |
+
+**M3 amendment — the fallback is a plain poll, not a long poll, and implementing it is what
+settled that.** This decision first said the JSON branch waits for events or for a 20-second
+deadline. Writing it exposed why that is the wrong shape here.
+
+A response's head is written when the connection is parked, before any batch exists — so a
+delayed reply either announces `Content-Length: 0` and ends the response before it has said
+anything (which is what the first implementation did, and the harness caught immediately), or it
+has to hold its 260 KiB request slot for the whole wait so the head can be rendered later. The
+second is affordable only by exhausting the 256-slot request pool that the **data plane** shares:
+two hundred and fifty-six dashboards on the fallback transport would stop `/v1` serving anyone.
+A fallback that can starve the API is not a fallback.
+
+So the JSON branch is **stateless and immediate**: the client sends `?cursor=N`, gets everything
+after it plus the next cursor, and asks again when it likes. No parked connection, no subscriber
+slot, no server-held cursor, no deadline — and it works through any intermediary, which is the
+entire point of having it.
+
+What that costs is latency: a poll interval instead of a push. On the fallback path, on a
+beta-labelled single-box service, that is the right trade — and it is *why* it is the fallback
+rather than the default.
+
+The seam survives intact, and is smaller than planned: one path, one account filter, one feed
+poll, one frame vocabulary. SSE adds a parked connection and a server-held cursor on top of it;
+JSON adds nothing. A bug in the shared part still fails both.
+
+**No configuration variable**, which also means no way to have it set wrongly. The dashboard asks
+for SSE, and if no frame — not even a heartbeat — arrives within a bounded window, it reconnects
+asking for JSON. That is a decision the client is uniquely able to make correctly, because it is
+the only party that can observe its own path.
+
+Rejected: **two paths.** `/app/stream` and `/app/poll` would let the two drift, and the whole
+value of D68's seam is that they cannot.
+
+Rejected: **`DOOT_LIVE_TRANSPORT`.** Costed above, and it is a variable whose correct value
+differs per user.
+
+Rejected: **holding the request slot through a long wait.** Costed above: it spends the data
+plane's concurrency budget on the dashboard's fallback.
+
+Rejected: **rendering a delayed response from the 512-byte frame buffer.** It fits, barely —
+about 150 bytes of head leaves room for six events — but it means the handler writing a status
+line, which puts response framing on the wrong side of a seam that exists to keep it in one
+place.
+
+**D68 is amended accordingly:** the zone verification still decides whether SSE *works* through
+Cloudflare, and `ops/sseprobe.py` is still the instrument. What it no longer decides is which
+transport the product ships — both ship, and the client picks.
 
 ---
 

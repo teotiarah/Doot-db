@@ -227,7 +227,7 @@ Not public API, not versioned, may change freely.
 | `DELETE /app/account` | self-service deletion (see Account deletion below) |
 | `GET /app/keys` · `POST /app/keys` · `DELETE /app/keys/{id}` | key management |
 | `GET /app/entries` · `GET /app/entries/{name}` | read-only explorer |
-| `GET /app/stream` | SSE live feed |
+| `GET /app/stream` | live feed — SSE, or a JSON batch (see below) |
 
 `DELETE /app/account` was missing from this table until M3 built it. The Account deletion
 section below specified the flow in full and no endpoint reached it, which is a gap in the
@@ -251,6 +251,38 @@ Those are covered by the per-address limiter instead (D74).
 Accepted consequence: a user who writes a secret into an entry by accident must delete
 it via the API, or ask support. The alternative is a permanent second write path, which
 is a worse trade.
+
+## The live feed
+
+`GET /app/stream` serves two framings on one path, and the **client's `Accept` header** chooses
+(D87). Buffering by an intermediary is a property of the network path rather than of the
+deployment, so there is no server-side switch: a proxy in front of one user must not take the
+live view away from everyone.
+
+| `Accept` | behaviour |
+|---|---|
+| `text/event-stream` | Open-ended SSE. `event: put`/`delete`/`resync`, `data: {"seq":N}`, and a heartbeat comment every 15 seconds |
+| anything else | One JSON batch, answered immediately: `{"events":[{"seq":N,"op":"put"}],"cursor":M,"resync":false}` |
+
+**A frame is a change notification, not the change** (D85). It carries a sequence number and an
+operation, and nothing else — no name and no body. The change feed holds neither (a feed event is
+24 bytes), so naming the entry would mean a disk read per event per subscriber, and a body can be
+256 KB in any case. The dashboard's response to a frame is to re-run the listing it is already
+showing, which is free (reads are not metered) and produces a view that is *correct* rather than
+one patched together from frames it might have missed.
+
+Events are filtered to the session's own account. A subscriber joins at the present moment, not
+at the start of the ring: the feed is for watching, not for catching up.
+
+**`event: resync`** means the subscriber fell far enough behind to be lapped and should reload
+rather than assume continuity. The JSON framing says the same thing with `"resync": true`.
+
+The JSON framing is stateless: the client passes `?cursor=N` and gets the next cursor back, so
+nothing about the request outlives it. That is deliberate — a delayed reply would have to hold a
+request slot from the pool the data plane shares, and a fallback that can starve `/v1` is not a
+fallback.
+
+`503 capacity_exhausted` when the box is already serving its maximum number of live views.
 
 ## Errors on this surface
 

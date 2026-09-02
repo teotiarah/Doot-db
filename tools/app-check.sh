@@ -73,7 +73,9 @@ BASE="http://127.0.0.1:$PORT"
 # `after` is how many lines for that address already existed, so a *re*-signup waits for its
 # own code rather than picking up the previous one -- which is a race the first version of this
 # script lost, since the printer thread has a 20 ms tick.
-mail_count() { grep -cE "^MAIL $1 " "$LOG" 2>/dev/null || echo 0; }
+# `grep -c` already prints 0 when it matches nothing, and then exits 1 -- so a `|| echo 0`
+# prints a second zero and every arithmetic comparison downstream breaks on "0\n0".
+mail_count() { grep -cE "^MAIL $1 " "$LOG" 2>/dev/null | head -1; }
 
 otp_for() { # address [after]
   local after="${2:-0}"
@@ -112,8 +114,9 @@ equals "an unrouted control-plane path is 404" 404 "$(status "$BASE/app/nope")"
 # it existed (D52, 02-api.md). That is the same answer every unknown /v1 path gives.
 equals "/app itself falls to the data plane, which authenticates before routing" 401 \
   "$(status "$BASE/app")"
-# D82: routed-but-unimplemented would be a lie, so these are 404 until they are built.
-equals "the live feed is not routed yet (D82)" 404 "$(status "$BASE/app/stream")"
+# The live feed is routed now, so it answers like every other session-authenticated route:
+# 401 without a session rather than 404. Its own section below drives it properly.
+equals "the live feed needs a session" 401 "$(status "$BASE/app/stream")"
 # `--data ''` because the transport requires a Content-Length on a write before it routes
 # (411, 02-api.md); without it the answer would be about the missing header rather than about
 # the method. Read-only is a product boundary, so the answer must be 405 and not 404.
@@ -251,6 +254,112 @@ contains "the explorer lists by tag" "ci/last-green" \
   "$(body -b "$COOKIES" "$BASE/app/entries?tag=ci")"
 equals "the explorer reads one entry" 200 "$(status -b "$COOKIES" "$BASE/app/entries/ci/last-green")"
 equals "and returns the stored bytes" "deadbeef" "$(body -b "$COOKIES" "$BASE/app/entries/ci/last-green")"
+
+# ---------------------------------------------------------------------------
+hdr "the live feed (D84-D87)"
+CLIENT_IP="203.0.113.30"
+# ---------------------------------------------------------------------------
+
+# A second account, so cross-account isolation is testable rather than assumed.
+OTHER="watcher@example.com"
+curl -sS -o /dev/null -H "CF-Connecting-IP: $CLIENT_IP" -X POST "$BASE/app/auth/signup" \
+  --data-urlencode "email=$OTHER" --data-urlencode "password=$PW"
+OTHER_CODE="$(otp_for "$OTHER")"
+OTHER_BODY="$(curl -sS -H "CF-Connecting-IP: $CLIENT_IP" -c "$WORK/other_cookies" \
+  -X POST "$BASE/app/auth/verify" --data-urlencode "email=$OTHER" --data-urlencode "code=$OTHER_CODE")"
+OTHER_SYNC="$(printf '%s' "$OTHER_BODY" | json_field synchroniser)"
+OTHER_KEY="$(body -b "$WORK/other_cookies" -X POST "$BASE/app/keys" --data '' \
+  -H "X-Doot-Synchroniser: $OTHER_SYNC" | json_field api_key)"
+
+SESSION_COOKIE="$(grep -o '__Host-doot_session[[:space:]]*[^[:space:]]*' "$COOKIES" | awk '{print $2}')"
+
+# The head, before any event exists. A stream that only opened once it had something to say
+# would leave the dashboard unable to tell "connected and quiet" from "not connected".
+STREAM_HEAD="$(curl -sS -D- -o /dev/null --max-time 3 \
+  -H "CF-Connecting-IP: $CLIENT_IP" \
+  -H "Cookie: __Host-doot_session=$SESSION_COOKIE" \
+  -H 'Accept: text/event-stream' "$BASE/app/stream" 2>/dev/null || true)"
+contains "the stream answers text/event-stream" "text/event-stream" "$STREAM_HEAD"
+# The omission is the framing (D84): a body that is not finished has no length to announce.
+lacks "and declares no Content-Length" "Content-Length" "$STREAM_HEAD"
+lacks "and is not chunked either" "Transfer-Encoding" "$STREAM_HEAD"
+contains "and asks intermediaries not to transform it" "no-transform" "$STREAM_HEAD"
+contains "and sets X-Accel-Buffering" "X-Accel-Buffering: no" "$STREAM_HEAD"
+
+equals "the stream needs a session, like every other /app route" 401 \
+  "$(status -H 'Accept: text/event-stream' "$BASE/app/stream")"
+equals "a write to the stream is 405" 405 \
+  "$(status -X POST "$BASE/app/stream" --data '')"
+
+# ---- SSE, judged by ops/sseprobe.py: the artifact D31 named as the verification procedure ----
+#
+# Run against the local origin here. That is D68's "both are built and tested locally" -- the
+# run *through Cloudflare* is what moved to the end of M5, and it needs a reachable box.
+( for i in $(seq 1 12); do
+    sleep 0.25
+    curl -sS -o /dev/null -H "Authorization: Bearer $FRESH" \
+      -X PUT "$BASE/v1/entries/live/tick-$i" --data-binary "$i" 2>/dev/null || true
+  done ) &
+WRITER=$!
+
+if python3 ops/sseprobe.py "$BASE/app/stream" \
+     --expect-interval 250 --events 4 --timeout 20 \
+     --header "Cookie: __Host-doot_session=$SESSION_COOKIE" >"$WORK/probe.out" 2>&1; then
+  pass "ops/sseprobe.py judges the local stream as streaming, not buffered"
+else
+  fail "ops/sseprobe.py judges the local stream as streaming, not buffered" "$(tail -12 "$WORK/probe.out")"
+fi
+wait "$WRITER" 2>/dev/null || true
+sed -n 's/^/        /p' "$WORK/probe.out" | grep -E "mean inter-event|first event|frames:" || true
+
+# ---- the other framing on the same path (D87) ----
+#
+# Stateless and immediate: the client's cursor goes in the query string and the next one comes
+# back in the body. Nothing about the request outlives it, which is what stops the fallback
+# spending the data plane's concurrency budget.
+
+POLL_ONE="$(body -b "$COOKIES" -H 'Accept: application/json' "$BASE/app/stream")"
+contains "the same path answers JSON when JSON is asked for" '"events"' "$POLL_ONE"
+contains "and carries a cursor to ask from next" '"cursor"' "$POLL_ONE"
+contains "and reports whether the client was lapped" '"resync"' "$POLL_ONE"
+CURSOR="$(printf '%s' "$POLL_ONE" | grep -o '"cursor":[0-9]*' | cut -d: -f2)"
+[ -n "$CURSOR" ] && pass "the cursor is a number" || fail "the cursor is a number" "$POLL_ONE"
+
+# It answers at once rather than waiting, which is the whole point of the amendment.
+POLL_START=$(date +%s)
+_="$(body -b "$COOKIES" -H 'Accept: application/json' "$BASE/app/stream?cursor=$CURSOR")"
+POLL_ELAPSED=$(( $(date +%s) - POLL_START ))
+if [ "$POLL_ELAPSED" -le 2 ]; then
+  pass "an empty poll answers immediately rather than holding the connection"
+else
+  fail "an empty poll answers immediately rather than holding the connection" "took ${POLL_ELAPSED}s"
+fi
+
+# A write after that cursor shows up in the next poll.
+curl -sS -o /dev/null -H "CF-Connecting-IP: $CLIENT_IP" -H "Authorization: Bearer $FRESH" \
+  -X PUT "$BASE/v1/entries/live/polled" --data-binary 'x'
+POLL_TWO="$(body -b "$COOKIES" -H 'Accept: application/json' "$BASE/app/stream?cursor=$CURSOR")"
+contains "a write after the cursor appears in the next poll" '"op":"put"' "$POLL_TWO"
+# A notification, not the change: no name and no body, because a body can be 256 KB (D85).
+lacks "and the batch carries no entry name" "live/polled" "$POLL_TWO"
+lacks "and no body" '"body"' "$POLL_TWO"
+
+equals "a malformed cursor is refused" 400 \
+  "$(status -b "$COOKIES" -H 'Accept: application/json' "$BASE/app/stream?cursor=abc")"
+
+# ---- cross-account isolation ----
+
+curl -sS -o /dev/null -H "CF-Connecting-IP: $CLIENT_IP" -H "Authorization: Bearer $OTHER_KEY" \
+  -X PUT "$BASE/v1/entries/theirs/secret" --data-binary 'x'
+# A cursor taken *after* this account's own writes, so the only thing published beyond it is the
+# other account's -- which makes an empty array the whole assertion.
+ISO_CURSOR="$(body -b "$COOKIES" -H 'Accept: application/json' "$BASE/app/stream" | grep -o '"cursor":[0-9]*' | cut -d: -f2)"
+curl -sS -o /dev/null -H "CF-Connecting-IP: $CLIENT_IP" -H "Authorization: Bearer $OTHER_KEY" \
+  -X PUT "$BASE/v1/entries/theirs/secret-2" --data-binary 'x'
+ISO="$(body -b "$COOKIES" -H 'Accept: application/json' "$BASE/app/stream?cursor=$ISO_CURSOR")"
+contains "another account's writes never appear in this account's feed" '"events":[]' "$ISO"
+OTHER_FEED="$(body -b "$WORK/other_cookies" -H 'Accept: application/json' "$BASE/app/stream?cursor=$CURSOR")"
+contains "and the account that made the write does see it" '"op":"put"' "$OTHER_FEED"
 
 # ---------------------------------------------------------------------------
 hdr "enumeration resistance: identical answers"

@@ -124,6 +124,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(transport);
 
+    // ---- M3 control-plane harness ----
+    // The real control plane, with the mail transport replaced by printing what it would have
+    // sent -- the one substitution a check script cannot avoid, since it has no inbox.
+    const app_harness = b.addExecutable(.{
+        .name = "app",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/app.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "storage", .module = storage },
+                .{ .name = "control", .module = control },
+                .{ .name = "server", .module = server },
+                .{ .name = "service", .module = service },
+            },
+        }),
+    });
+
+    b.installArtifact(app_harness);
+
     // ---- M2 data-plane harness ----
     // The real service over a real store, so curl can exercise the endpoints.
     const dataplane = b.addExecutable(.{

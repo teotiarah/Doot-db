@@ -86,6 +86,8 @@ const Op = enum(u8) {
     tick = 4,
     /// A read on the `eventfd` an I/O worker writes to when a job finishes (D57).
     wake = 5,
+    /// The live feed's own timer, armed only while a connection is parked on it (D84).
+    feed = 6,
 };
 
 /// `user_data` layout: op in bits 32-39, generation in 40-47, descriptor in 0-31.
@@ -154,6 +156,10 @@ pub const Tick = struct {
 };
 
 pub const Options = struct {
+    /// The seam a parked stream is asked for bytes through (D84). Absent means the deployment
+    /// serves no live feed, and `Disposition.streaming` then cannot be reached because nothing
+    /// routes to it.
+    stream: ?handler_mod.Stream = null,
     /// Where to listen. Ignored when `listen_fd` is supplied.
     address: []const u8 = "127.0.0.1:0",
     /// An already-bound listener to adopt, for a caller that binds before dropping
@@ -183,6 +189,8 @@ pub const Loop = struct {
     clock: storage.clock.Clock,
     /// Woken once per tick, if a caller asked for it (D45).
     tick_cb: ?Tick = null,
+    /// The live feed seam (D84).
+    stream_cb: ?handler_mod.Stream = null,
 
     /// Formatted once per tick, borrowed by every response in between. A response
     /// never formats a timestamp.
@@ -191,6 +199,17 @@ pub const Loop = struct {
 
     /// The timeout SQE reads this asynchronously, so it outlives submission.
     tick_ts: linux.kernel_timespec = .{ .sec = config.tick_interval_s, .nsec = 0 },
+    /// The live feed's timer (D84). Milliseconds, so it is a nsec field rather than sec.
+    feed_ts: linux.kernel_timespec = .{
+        .sec = 0,
+        .nsec = @as(i64, config.feed_interval_ms) * 1_000_000,
+    },
+    /// How many connections are parked on the feed, and whether its timer is armed.
+    ///
+    /// The timer is armed only while this is non-zero, so a deployment with no dashboard open
+    /// pays nothing at all for the feature.
+    subscribers: u32 = 0,
+    feed_armed: bool = false,
 
     cqes: [config.cqe_batch]linux.io_uring_cqe = undefined,
     running: std.atomic.Value(bool) = .init(true),
@@ -270,6 +289,7 @@ pub const Loop = struct {
             .handler = options.handler,
             .clock = options.clock,
             .tick_cb = options.tick,
+            .stream_cb = options.stream,
             .io = io,
             .event_fd = event_fd,
         };
@@ -379,6 +399,7 @@ pub const Loop = struct {
         switch (opOf(cqe.user_data)) {
             .accept => self.onAccept(cqe),
             .tick => self.onTick(cqe),
+            .feed => self.onFeed(cqe),
             // Nothing to do but note that the read is spent. `iterate` drains the queue
             // and re-arms, whether or not a wake arrived.
             .wake => self.wake_posted = false,
@@ -526,6 +547,7 @@ pub const Loop = struct {
             &r.reply,
         )) {
             .complete => self.sendReply(c),
+            .streaming => self.parkStream(c),
             .deferred => {
                 // A handler that defers without naming the work would park the
                 // connection forever, so it is a bug rather than a slow reply.
@@ -546,6 +568,96 @@ pub const Loop = struct {
                 self.io.submit(&r.job);
             },
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The live feed (D84)
+    // -----------------------------------------------------------------------
+
+    /// Writes a streaming reply's head, releases its request slot, and parks the connection.
+    fn parkStream(self: *Loop, c: *conn_mod.Conn) void {
+        const index = c.req.?;
+        const r = self.requests.at(index);
+
+        if (self.stream_cb == null) return self.failTerminal(c, .internal_error);
+        if (r.reply.overflow) return self.failTerminal(c, .internal_error);
+        // Refused at subscribe time rather than accepted and starved: at the cap the box is
+        // already serving `max_subscribers` live views, and parking one more would promise a
+        // stream this loop has said it will not watch (D86).
+        if (self.subscribers >= config.max_subscribers) {
+            return self.failTerminal(c, .capacity_exhausted);
+        }
+
+        const out = self.render(r, true) catch return self.failTerminal(c, .internal_error);
+
+        // The head lives in the request's own `resp_head`, and the request slot is released in
+        // `onSend` once the write has completed rather than here — the kernel owns those bytes
+        // until then (D30). What makes this safe to *plan* now is that nothing else will touch
+        // the slot in between: the connection is parked and posts no reads.
+        c.out = out;
+        c.keep_alive = true;
+        c.state = .streaming;
+        c.stream_token = r.reply.stream_token;
+        c.stream_sending = true;
+
+        self.subscribers += 1;
+        self.armFeed();
+        self.postSend(c);
+    }
+
+    /// Arms the feed timer if it is not already armed.
+    ///
+    /// Idempotent, because both a new subscriber and the timer's own completion want to say
+    /// "there is work, keep going" without either having to know about the other.
+    fn armFeed(self: *Loop) void {
+        if (self.feed_armed) return;
+        _ = self.ring.timeout(pack(.feed, 0, 0), &self.feed_ts, 0, 0) catch return;
+        self.feed_armed = true;
+    }
+
+    /// Asks every parked stream for bytes.
+    ///
+    /// A full scan of the connection table, exactly as `sweepIdle` does and for the same
+    /// reason: the table spans the descriptor space, so this is a predictable read of one field
+    /// per entry. It runs ten times as often as the idle sweep, which is still microseconds —
+    /// and only while at least one connection is parked.
+    fn onFeed(self: *Loop, cqe: linux.io_uring_cqe) void {
+        _ = cqe; // -ETIME is the expected result.
+        self.feed_armed = false;
+
+        if (self.subscribers == 0) return; // Not re-armed: nothing to watch.
+        const sc = self.stream_cb orelse return;
+
+        for (0..config.max_connections) |i| {
+            const c = &self.table.conns[i];
+            if (c.state != .streaming) continue;
+            const token = c.stream_token orelse continue;
+            // A send from this connection's frame buffer is still in flight, so the buffer
+            // belongs to the kernel and must not be rewritten (D30). The cursor the handler
+            // keeps is what remembers the gap, and coalescing is lossless because a frame is a
+            // notification rather than the change itself (D85).
+            if (c.stream_sending) continue;
+
+            switch (sc.frames(token, &c.idle_buf)) {
+                .idle => {},
+                .send => |n| self.sendFrames(c, n),
+                .close => self.closeConn(c),
+            }
+        }
+
+        self.armFeed();
+    }
+
+    /// Sends bytes already written into the connection's frame buffer.
+    ///
+    /// A parked stream stays parked afterwards. There is deliberately no "send this and finish"
+    /// variant: D87's fallback transport answers immediately as an ordinary reply and never
+    /// parks, so a second shape here would be a code path with no caller.
+    fn sendFrames(self: *Loop, c: *conn_mod.Conn, n: usize) void {
+        if (n == 0) return;
+        c.out = .{ .head = c.idle_buf[0..n], .body = &.{} };
+        c.stream_sending = true;
+        self.postSend(c);
     }
 
     /// Renders and sends whatever is in the reply. The tail of both dispatch paths.
@@ -678,7 +790,13 @@ pub const Loop = struct {
         // A 204 cannot carry a body, so it does not describe one either. RFC 9110 ends it
         // at the first empty line; announcing a length of zero is tolerated everywhere but
         // says something about a body that is not there.
-        if (r.reply.status != 204) try w.headerInt("Content-Length", r.reply.body.len);
+        //
+        // An open-ended body has no length to announce either, and for a better reason: it is
+        // not finished. Omitting the header is the whole of SSE's framing on this side — the
+        // body is raw frames on a connection that stays open (D84), not a chunked encoding.
+        if (r.reply.status != 204 and !r.reply.open_ended) {
+            try w.headerInt("Content-Length", r.reply.body.len);
+        }
         try w.header("Connection", if (keep_alive) "keep-alive" else "close");
         return .{ .head = try w.finish(), .body = if (r.reply.status == 204) &.{} else r.reply.body };
     }
@@ -741,6 +859,29 @@ pub const Loop = struct {
                 self.readBodyOrDispatch(c);
             },
             .closing => self.closeConn(c),
+            .streaming => {
+                // The frame buffer is ours again now that the write has completed (D30).
+                c.stream_sending = false;
+
+                // The **head** has just gone out, so the request slot has done its job and goes
+                // back to the pool. This is D84's load-bearing half: a slot is 260 KiB, and a
+                // parked stream that kept one would turn D28's fixed ceiling into a per-viewer
+                // slope. Everything after this comes out of `idle_buf`, which a parked stream
+                // was never going to read into anyway.
+                if (c.req) |i| {
+                    self.requests.release(i);
+                    c.req = null;
+                }
+                if (c.escalated) |i| {
+                    self.heads.release(i);
+                    c.escalated = null;
+                }
+                c.buffered = 0;
+
+                // Deliberately no return to `.head`: the connection stays parked, and the next
+                // batch comes from the feed timer.
+                self.stats.responses += 1;
+            },
             .send => {
                 self.stats.responses += 1;
                 const consumed = if (c.req) |i| self.requests.at(i).consumed else c.buffered;
@@ -857,6 +998,16 @@ pub const Loop = struct {
     fn closeConn(self: *Loop, c: *conn_mod.Conn) void {
         if (c.state == .free) return;
 
+        // A parked stream's token is the handler's, and it is released here because this is the
+        // one place every ending funnels through -- an idle sweep, a peer disconnect, a failed
+        // write and a deliberate close all arrive here. Releasing it anywhere else would mean
+        // finding all four.
+        if (c.stream_token) |token| {
+            c.stream_token = null;
+            if (self.subscribers > 0) self.subscribers -= 1;
+            if (self.stream_cb) |sc| sc.release(token);
+        }
+
         // A worker still owns this request's memory, so the slot must not go back to the
         // pool here — handing it to a new request would let two requests share one body
         // buffer. Ownership transfers to the completion, which releases it and replies to
@@ -881,7 +1032,7 @@ pub const Loop = struct {
 const testing = std.testing;
 
 test "user_data survives a round trip for every field" {
-    inline for (.{ Op.accept, Op.recv, Op.send, Op.tick }) |op| {
+    inline for (.{ Op.accept, Op.recv, Op.send, Op.tick, Op.feed }) |op| {
         const ud = pack(op, 12_345, 7);
         try testing.expectEqual(op, opOf(ud));
         try testing.expectEqual(@as(Fd, 12_345), fdOf(ud));
@@ -1073,6 +1224,29 @@ const Client = struct {
         c.len -= n;
     }
 
+    /// Reads until `delim` appears, and returns everything up to and including it.
+    ///
+    /// Needed because a streaming response has no `Content-Length` (D84), so `readResponse`
+    /// has nothing to tell it where the response ends -- which is the point. This reads a
+    /// frame at a time instead, and because it stops at the delimiter it also proves the
+    /// frames arrived *separately*: a buffered stream would not satisfy the first call until
+    /// everything showed up at once.
+    fn readUntil(c: *Client, out: []u8, delim: []const u8) ![]u8 {
+        while (true) {
+            if (std.mem.indexOf(u8, c.buf[0..c.len], delim)) |at| {
+                const total = at + delim.len;
+                if (total > out.len) return error.StreamTooLong;
+                @memcpy(out[0..total], c.buf[0..total]);
+                c.consume(total);
+                return out[0..total];
+            }
+            if (c.len == c.buf.len) return error.StreamTooLong;
+            const n = try c.readSocket(c.buf[c.len..]);
+            if (n == 0) return error.PeerClosed;
+            c.len += n;
+        }
+    }
+
     /// Reads exactly one HTTP response — the head, then `Content-Length` bytes — and
     /// keeps whatever followed it for the next call.
     fn readResponse(c: *Client, out: []u8) ![]u8 {
@@ -1112,6 +1286,32 @@ const Fixture = struct {
     /// Touched from worker threads, so it is atomic while `requests` need not be.
     worked: std.atomic.Value(u32) = .init(0),
 
+    /// How many frames each parked stream has been asked for, keyed by token.
+    frames_asked: [8]u32 = @splat(0),
+    /// Tokens whose `release` has been called, so a leak is visible.
+    released: [8]bool = @splat(false),
+    next_token: u64 = 0,
+
+    fn stream(self: *Fixture) handler_mod.Stream {
+        return .{ .ctx = self, .framesFn = frames, .releaseFn = release };
+    }
+
+    fn frames(ctx: *anyopaque, token: u64, buf: []u8) handler_mod.StreamAction {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        const i: usize = @intCast(token);
+        self.frames_asked[i] += 1;
+        // One frame per ask, so a test can count arrivals against asks.
+        const n = (std.fmt.bufPrint(buf, "event: put\ndata: {{\"seq\":{d}}}\n\n", .{
+            self.frames_asked[i],
+        }) catch return .idle).len;
+        return .{ .send = n };
+    }
+
+    fn release(ctx: *anyopaque, token: u64) void {
+        const self: *Fixture = @ptrCast(@alignCast(ctx));
+        self.released[@intCast(token)] = true;
+    }
+
     /// Fills a reply from an I/O worker thread, the way a storage-backed endpoint will.
     fn slowWork(ctx: *anyopaque, in: handler_mod.Incoming, out: *handler_mod.Reply) void {
         const self: *Fixture = @ptrCast(@alignCast(ctx));
@@ -1139,6 +1339,15 @@ const Fixture = struct {
         }
 
         const path = in.path();
+        if (std.mem.eql(u8, path, "/stream")) {
+            const token = self.next_token;
+            self.next_token += 1;
+            out.header("Content-Type", "text/event-stream");
+            out.header("Cache-Control", "no-cache, no-store, no-transform");
+            out.open_ended = true;
+            out.stream_token = token;
+            return .streaming;
+        }
         if (std.mem.eql(u8, path, "/fixed")) {
             out.header("Content-Type", "text/plain");
             out.body = "ok\n";
@@ -1204,6 +1413,7 @@ const Server = struct {
             .address = "127.0.0.1:0",
             .handler = fixture.handler(),
             .clock = clock.clock(),
+            .stream = fixture.stream(),
         });
         const port = try loop.port();
         const thread = try std.Thread.spawn(.{}, Loop.run, .{loop});
@@ -1964,4 +2174,147 @@ test "the tick still does its own housekeeping when a seam is attached" {
     loop.onTick(std.mem.zeroes(linux.io_uring_cqe));
     try testing.expectEqual(clock.clock().now(), loop.date_second);
     try testing.expectEqual(@as(u32, 1), counter.calls);
+}
+
+// ---------------------------------------------------------------------------
+// The live feed (D84, D86, D87)
+// ---------------------------------------------------------------------------
+
+test "a streaming response has no Content-Length, and stays open" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    var c = try s.connect();
+    defer c.close();
+    try c.send("GET /stream HTTP/1.1\r\nHost: doot.run\r\nAccept: text/event-stream\r\n\r\n");
+
+    // The head, up to the blank line. `readResponse` cannot be used: it wants a
+    // Content-Length to know where the response ends, and the whole point here is that
+    // there is not one.
+    var buf: [4096]u8 = undefined;
+    const head = try c.readUntil(&buf, "\r\n\r\n");
+
+    try testing.expect(std.mem.startsWith(u8, head, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, head, "text/event-stream") != null);
+    // The omission *is* the framing (D84). A body that is not finished has no length to
+    // announce, and announcing one would tell the client where to stop reading.
+    try testing.expect(std.mem.indexOf(u8, head, "Content-Length") == null);
+    // And not chunked either: raw frames on an open connection is what SSE is.
+    try testing.expect(std.mem.indexOf(u8, head, "Transfer-Encoding") == null);
+    try testing.expect(std.mem.indexOf(u8, head, "Connection: keep-alive") != null);
+}
+
+test "frames arrive incrementally, one send at a time" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    var c = try s.connect();
+    defer c.close();
+    try c.send("GET /stream HTTP/1.1\r\nHost: doot.run\r\n\r\n");
+
+    var buf: [4096]u8 = undefined;
+    _ = try c.readUntil(&buf, "\r\n\r\n");
+
+    // Three separate frames, each its own read. A buffering implementation would deliver
+    // them together or not at all, which is exactly what D68 measured Cloudflare doing.
+    for (1..4) |i| {
+        var fbuf: [256]u8 = undefined;
+        const frame = try c.readUntil(&fbuf, "\n\n");
+        var expect: [64]u8 = undefined;
+        const want = try std.fmt.bufPrint(&expect, "data: {{\"seq\":{d}}}", .{i});
+        try testing.expect(std.mem.indexOf(u8, frame, want) != null);
+        try testing.expect(std.mem.startsWith(u8, frame, "event: put\n"));
+    }
+}
+
+test "a parked stream gives its request slot back (D84)" {
+    // The load-bearing half of D84. A slot is 260 KiB, so a stream that kept one would turn
+    // D28's fixed ceiling into a per-viewer slope -- and this is the assertion that would
+    // fail if the release were ever removed.
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    var c = try s.connect();
+    defer c.close();
+    try c.send("GET /stream HTTP/1.1\r\nHost: doot.run\r\n\r\n");
+
+    var buf: [4096]u8 = undefined;
+    _ = try c.readUntil(&buf, "\r\n\r\n");
+    // Wait until a frame has arrived, which proves the head's send completed and therefore
+    // that `onSend` has run.
+    var fbuf: [256]u8 = undefined;
+    _ = try c.readUntil(&fbuf, "\n\n");
+
+    try testing.expectEqual(@as(u16, 0), s.loop.requests.inUse());
+    // It was used, so this is a release rather than a slot that was never taken.
+    try testing.expect(s.loop.requests.peak >= 1);
+    try testing.expectEqual(@as(u32, 1), s.loop.subscribers);
+}
+
+test "a parked stream is not swept as idle" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    var c = try s.connect();
+    defer c.close();
+    try c.send("GET /stream HTTP/1.1\r\nHost: doot.run\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    _ = try c.readUntil(&buf, "\r\n\r\n");
+
+    // Push the clock far past the idle timeout and let the sweep run. A parked stream is not
+    // idle -- it is doing exactly what it was asked to do -- and `sweepIdle` skipping every
+    // state but `.head` is what makes that true without a special case.
+    s.clock.advance(config.idle_timeout_s * 10);
+    var fbuf: [256]u8 = undefined;
+    _ = try c.readUntil(&fbuf, "\n\n");
+    _ = try c.readUntil(&fbuf, "\n\n");
+    try testing.expectEqual(@as(u32, 1), s.loop.subscribers);
+}
+
+test "closing a stream releases the handler's token, once" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    {
+        var c = try s.connect();
+        defer c.close();
+        try c.send("GET /stream HTTP/1.1\r\nHost: doot.run\r\n\r\n");
+        var buf: [4096]u8 = undefined;
+        _ = try c.readUntil(&buf, "\r\n\r\n");
+        var fbuf: [256]u8 = undefined;
+        _ = try c.readUntil(&fbuf, "\n\n");
+        try testing.expect(!s.fixture.released[0]);
+    }
+
+    // The peer went away. Every ending funnels through `closeConn`, which is why the release
+    // lives there rather than in four places.
+    for (0..100) |_| {
+        if (s.fixture.released[0]) break;
+        sleepMs(20);
+    }
+    try testing.expect(s.fixture.released[0]);
+    try testing.expectEqual(@as(u32, 0), s.loop.subscribers);
+}
+
+test "the feed timer is armed only while someone is subscribed" {
+    const s = try Server.start(testing.allocator);
+    defer s.stop();
+
+    // Nothing parked, so nothing to poll: the feature costs a closed deployment nothing (D84).
+    try testing.expectEqual(@as(u32, 0), s.loop.subscribers);
+
+    var c = try s.connect();
+    try c.send("GET /stream HTTP/1.1\r\nHost: doot.run\r\n\r\n");
+    var buf: [4096]u8 = undefined;
+    _ = try c.readUntil(&buf, "\r\n\r\n");
+    var fbuf: [256]u8 = undefined;
+    _ = try c.readUntil(&fbuf, "\n\n");
+    try testing.expect(s.loop.feed_armed or s.loop.subscribers == 1);
+
+    c.close();
+    for (0..100) |_| {
+        if (s.loop.subscribers == 0) break;
+        sleepMs(20);
+    }
+    try testing.expectEqual(@as(u32, 0), s.loop.subscribers);
 }

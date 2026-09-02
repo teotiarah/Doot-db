@@ -59,6 +59,44 @@ pub const Disposition = enum {
     complete,
     /// `Reply.work` is set and must run on an I/O worker first.
     deferred,
+    /// The `Reply` is a **head only**, and the connection stays open afterwards (D84).
+    ///
+    /// The transport writes the head, releases the request slot, and parks the connection.
+    /// From then on it calls `Handler.stream` on its feed timer to ask for bytes. Set
+    /// `Reply.open_ended` alongside this to suppress `Content-Length`.
+    streaming,
+};
+
+/// What a parked stream wants done, each time the transport asks it for bytes (D84, D87).
+pub const StreamAction = union(enum) {
+    /// Nothing to send. Stay parked.
+    idle,
+    /// Send these bytes, which live in the connection's frame buffer, and stay parked.
+    send: usize,
+    /// Close the connection. Used when the subscriber's session has gone.
+    close,
+};
+
+/// The seam the transport asks a parked stream for bytes through.
+///
+/// Separate from `respondFn` because it is a different question: `respond` turns a request into
+/// a reply, this turns *elapsed time* into bytes. It runs on the loop, so it must not touch a
+/// disk — which is exactly why a frame is a notification rather than the change itself (D85).
+pub const Stream = struct {
+    ctx: *anyopaque,
+    /// `token` is whatever the handler put in `Reply.stream_token` when it parked the
+    /// connection; the transport treats it as opaque. `buf` is the connection's frame buffer.
+    framesFn: *const fn (ctx: *anyopaque, token: u64, buf: []u8) StreamAction,
+    /// Called once when a parked connection goes away, however it goes away, so the handler
+    /// can release whatever the token named.
+    releaseFn: *const fn (ctx: *anyopaque, token: u64) void,
+
+    pub fn frames(self: Stream, token: u64, buf: []u8) StreamAction {
+        return self.framesFn(self.ctx, token, buf);
+    }
+    pub fn release(self: Stream, token: u64) void {
+        self.releaseFn(self.ctx, token);
+    }
 };
 
 /// One request, as the handler sees it.
@@ -122,6 +160,15 @@ pub const Reply = struct {
 
     /// Ask for the connection to close after this response.
     close: bool = false,
+
+    /// Suppress `Content-Length`, because the body has no length yet (D84).
+    ///
+    /// An SSE body is not chunked — raw framing on an unbounded body is what
+    /// `text/event-stream` is — so this is an omission rather than a second encoding.
+    open_ended: bool = false,
+
+    /// Opaque handle the handler gets back on every `Stream.frames` call for this connection.
+    stream_token: u64 = 0,
 
     /// Writable space for a response body too large for `scratch`, supplied by the
     /// transport. Set `body` to a sub-slice of this after filling it.
@@ -203,6 +250,8 @@ pub const Reply = struct {
         r.error_message = null;
         r.retry_after_s = null;
         r.allow = null;
+        r.open_ended = false;
+        r.stream_token = 0;
         r.count = 0;
         r.scratch_len = 0;
         r.overflow = false;

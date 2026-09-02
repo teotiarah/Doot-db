@@ -177,6 +177,13 @@ pub const State = enum {
     awaiting,
     /// Writing a response.
     send,
+    /// Parked on the live feed (D84).
+    ///
+    /// The request slot has been released and the connection is waiting for the feed timer to
+    /// hand it bytes. Deliberately not swept for idleness — a parked stream is not idle, it is
+    /// doing exactly what it was asked to do — and `sweepIdle` already skips every state but
+    /// `.head`, so that falls out rather than needing a case.
+    streaming,
     /// Response written; the connection closes when the send completes.
     closing,
 };
@@ -207,6 +214,15 @@ pub const Conn = struct {
 
     /// Tier 3, held from head completion until the response is written.
     req: ?u16 = null,
+
+    /// The handler's opaque token while this connection is parked on the live feed (D84).
+    ///
+    /// Null means "not a subscriber", which is what `release` is keyed on: exactly the
+    /// connections carrying a token get one release call, however they end.
+    stream_token: ?u64 = null,
+    /// A send from the frame buffer is in flight, so the buffer belongs to the kernel and must
+    /// not be rewritten (D30, D86).
+    stream_sending: bool = false,
 
     out: response.Outbound = .{},
     /// The `iovec`s the ring reads asynchronously, so they live as long as the send

@@ -83,7 +83,8 @@ edge:
 | M1 — storage engine | complete, five exit conditions measured |
 | M2 — data plane | endpoints, credits, rate limit, idempotency: **complete and verified over HTTP** |
 | M2 — origin binary | **complete.** `zig build` produces `doot`: configuration from the environment, the maintenance thread, and a graceful shutdown that keeps credit balances exact across a deploy (D63) |
-| M2 — SSE and the edge | **outstanding.** The change feed ring is built and published to; nothing consumes it. Origin TLS and the Cloudflare zone gate on infrastructure that does not exist yet |
+| M2 — the live feed | **built.** `GET /app/stream`, SSE or JSON on one path, over the D44 ring. Passes `ops/sseprobe.py` over loopback in CI; the run through the zone is scheduled with M5 (D68) |
+| M2 — origin TLS and the edge | **outstanding.** Both gate on infrastructure that does not exist yet |
 | M3 — accounts | **complete.** Signup, verification, login, sessions, password reset, account and key management, the read-only explorer, and GitHub OAuth. Both exit conditions verified over the wire by `tools/app-check.sh`, including enumeration resistance as a *timing* property |
 | M4–M6 | not started |
 
@@ -103,9 +104,11 @@ cookies and a synchroniser token. That closed D63's one recorded open question �
 account comes into being — without the operator subcommand it warned would be built to be
 replaced.
 
-The **live feed** is the one part of the dashboard's surface deliberately not yet routed,
-because a route that cannot complete is a worse answer than no route (D82). It waits on the
-transport seam D68 describes.
+The **live feed** is built: `GET /app/stream` serves SSE or an immediate JSON batch on one path,
+and the client's `Accept` header chooses (D87). `ops/sseprobe.py` — the probe written in M0 for
+exactly this question — judges it streaming against the real endpoint in CI. What is still
+outstanding is running that probe *through the Cloudflare zone*, which needs a reachable origin
+and is scheduled with M5.
 
 | | measured on one 8-core box |
 |---|---|
@@ -120,17 +123,17 @@ Recovery is a warm-page-cache figure and says so: it moves with the filesystem, 
 number the operational lever derives from gets re-measured on the deployed volume in M5
 (D48).
 
-**612 unit tests plus seven harnesses, all run by CI on every push:**
+**618 unit tests plus seven harnesses, all run by CI on every push:**
 
 ```bash
 tools/vocab-check.sh                                    # D2 vocabulary rule
-zig build test                                          # 612 unit tests
+zig build test                                          # 618 unit tests
 zig build verify && ./zig-out/bin/m1 all /dev/shm/doot-m1  # 5 M1 exit conditions
 tools/transport-check.sh                                # 52 curl checks
 tools/dataplane-check.sh                                # 158 curl checks
 tools/boot-check.sh                                     # 30 checks against the real binary
 tools/exactness-check.sh                                # 28 concurrency and capacity checks
-tools/app-check.sh                                      # 60 control-plane checks
+tools/app-check.sh                                      # 79 control-plane and live-feed checks
 ```
 
 `m1 all` runs the recovery check at its 300,000-record default, which measures the replay

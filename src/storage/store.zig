@@ -697,6 +697,15 @@ pub const Store = struct {
         return self.feed.poll(from, out);
     }
 
+    /// The position a consumer that wants only *future* events should start from.
+    ///
+    /// A subscriber joining the live view has no interest in what happened before it arrived,
+    /// and starting at zero would hand it the whole ring as history -- which `feed.zig` already
+    /// refuses to fill with history for the same reason.
+    pub fn feedCursor(self: *Store) feed_mod.Cursor {
+        return feed_mod.Cursor.now(&self.feed);
+    }
+
     pub fn snapshot(self: *Store) Error!void {
         // Flush first: a snapshot claims its watermark is durable.
         try self.com.flush();

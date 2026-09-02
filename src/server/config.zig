@@ -140,6 +140,26 @@ pub const io_workers: u16 = 8;
 /// 100 seconds and an origin that sends nothing inside that window earns a 524 (D31).
 pub const heartbeat_interval_s: u32 = 15;
 
+/// How often the loop polls the change feed for parked streams (D84).
+///
+/// Its own timer rather than the one-second tick: `00-vision.md` promises a write and the
+/// dashboard updating are "visibly simultaneous", and a second of lag reads as a page
+/// refreshing rather than as data arriving. Shortening the main tick instead would make every
+/// connection in the table pay the idle sweep ten times as often for a feature that is idle
+/// whenever no dashboard is open — so this timer is armed only while someone is subscribed.
+pub const feed_interval_ms: u32 = 100;
+
+/// How many connections may be parked on the live feed at once (D86).
+///
+/// Not a memory bound — a parked stream builds frames in the idle read buffer it already has and
+/// costs nothing extra. This bounds how much of the connection table one feature may hold open,
+/// and how many entries the feed scan can find work in.
+pub const max_subscribers: u32 = 1024;
+
+// There is deliberately no long-poll wait constant. D87's fallback answers immediately and
+// stateless -- a delayed reply would have to hold a 260 KiB request slot so its head could be
+// rendered later, spending the data plane's concurrency budget on the dashboard's fallback.
+
 // ---------------------------------------------------------------------------
 // Invariants
 // ---------------------------------------------------------------------------

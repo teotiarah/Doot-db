@@ -314,6 +314,7 @@ pub const Service = struct {
             // implementation is the divergence `00-vision.md` made it read-only to prevent.
             .entries => self.beginList(in, out, self.sessionAsAuth(session)),
             .entry => |raw| self.beginEntry(out, self.sessionAsAuth(session), raw, .read),
+            .stream => self.beginStream(in, out, session),
             else => failPlain(out, .internal_error),
         };
     }
@@ -507,6 +508,175 @@ pub const Service = struct {
 
             out.ok(status, reason);
             out.header("Content-Type", "application/json");
+            out.body = out.dupe(w.done()) orelse return failPlain(out, .internal_error);
+            return .complete;
+        }
+        return failPlain(out, .internal_error);
+    }
+
+    // ---- GET /app/stream: the live feed (D84-D87) ----
+
+    /// How many events one batch may carry.
+    ///
+    /// Bounded by the frame buffer, not by policy: 512 bytes holds about fifteen SSE frames or
+    /// eight JSON entries. Anything beyond that stays in the ring and goes out on the next
+    /// tick, which the cursor remembers for free.
+    const max_batch_events: usize = 16;
+
+    pub fn streamSeam(self: *Service) server.handler.Stream {
+        return .{ .ctx = self, .framesFn = streamFrames, .releaseFn = streamRelease };
+    }
+
+    /// Parks the connection on the feed.
+    ///
+    /// The framing is the client's choice, not the deployment's (D87): buffering is a property
+    /// of the network path, so a global switch would take the live view away from everyone to
+    /// fix it for the users behind one bad proxy.
+    fn beginStream(self: *Service, in: Incoming, out: *Reply, s: Session) Disposition {
+        const st = self.app.?;
+
+        const wants_sse = if (in.header("accept")) |a|
+            std.mem.indexOf(u8, a, "text/event-stream") != null
+        else
+            false;
+
+        // The fallback is stateless and answers at once (D87 amendment): it holds no connection,
+        // no subscriber slot and no server-side cursor, so it cannot spend the data plane's
+        // concurrency budget however many dashboards use it.
+        if (!wants_sse) return self.pollBatch(in, out, s);
+
+        const token = st.subscribers.acquire() orelse
+            return failPlain(out, .capacity_exhausted);
+        const sub = st.subscribers.at(token).?;
+        sub.account_id = s.auth.account_id;
+        // Only what happens next. A subscriber joining has no interest in the ring's history,
+        // and `feed.zig` refuses to fill the ring with history for the same reason.
+        sub.cursor = self.store.feedCursor();
+        sub.due_s = self.clock.now() +| server.config.heartbeat_interval_s;
+
+        out.header("Content-Type", "text/event-stream");
+        // `no-transform` matters as much as `no-cache`: an intermediary that "helpfully"
+        // compresses this would have to buffer it to do so (D31).
+        out.header("Cache-Control", "no-cache, no-store, no-transform");
+        // Not a standard, but the one hint nginx-shaped proxies actually honour.
+        out.header("X-Accel-Buffering", "no");
+        out.open_ended = true;
+        out.stream_token = token;
+        return .streaming;
+    }
+
+    /// Called on the loop's feed timer. **Never touches a disk** — which is the whole reason a
+    /// frame is a notification rather than the change itself (D85).
+    fn streamFrames(ctx: *anyopaque, token: u64, buf: []u8) server.handler.StreamAction {
+        const self: *Service = @ptrCast(@alignCast(ctx));
+        const st = self.app orelse return .close;
+        const sub = st.subscribers.at(token) orelse return .close;
+
+        // The session may have been revoked, the account deleted, or the plan changed while the
+        // stream was parked. Checked every tick rather than once at subscribe time, because
+        // "revocation takes effect immediately" has to mean immediately for a parked connection
+        // too — otherwise a live view would outlive the logout that ended it.
+        if (self.control.account(sub.account_id) == null) return .close;
+
+        var events: [max_batch_events]storage.feed.Event = undefined;
+        const polled = self.store.pollFeed(sub.cursor, &events);
+        sub.cursor = polled.next;
+        if (polled.resync) sub.resync = true;
+
+        return self.sseFrames(sub, polled.events, buf, self.clock.now());
+    }
+
+    fn streamRelease(ctx: *anyopaque, token: u64) void {
+        const self: *Service = @ptrCast(@alignCast(ctx));
+        const st = self.app orelse return;
+        st.subscribers.release(token);
+    }
+
+    /// SSE framing: events for this account, then a heartbeat if one is due.
+    fn sseFrames(
+        self: *Service,
+        sub: *app.Subscriber,
+        events: []const storage.feed.Event,
+        buf: []u8,
+        now: u32,
+    ) server.handler.StreamAction {
+        _ = self;
+        var n: usize = 0;
+
+        if (sub.resync) {
+            // A gap dressed up as continuity would be worse than saying so: the client's
+            // response is the refetch it already does (D85).
+            const written = std.fmt.bufPrint(buf[n..], "event: resync\ndata: {{}}\n\n", .{}) catch
+                return .idle;
+            n += written.len;
+            sub.resync = false;
+        }
+
+        for (events) |ev| {
+            if (ev.account_id != sub.account_id) continue;
+            const written = std.fmt.bufPrint(buf[n..], "event: {s}\ndata: {{\"seq\":{d}}}\n\n", .{
+                @tagName(ev.op),
+                ev.seq,
+            }) catch break; // Full: the rest stays in the ring and the cursor remembers.
+            n += written.len;
+        }
+
+        if (n > 0) {
+            sub.due_s = now +| server.config.heartbeat_interval_s;
+            return .{ .send = n };
+        }
+
+        // A comment, which every SSE client ignores by specification. It exists because
+        // Cloudflare's proxy read timeout is 100 seconds and silence past it earns a 524 (D31).
+        if (now >= sub.due_s) {
+            const written = std.fmt.bufPrint(buf, ": hb\n\n", .{}) catch return .idle;
+            sub.due_s = now +| server.config.heartbeat_interval_s;
+            return .{ .send = written.len };
+        }
+        return .idle;
+    }
+
+    /// The fallback framing: one JSON batch, answered immediately (D87).
+    ///
+    /// Stateless. The client's cursor is in the query string and the next one comes back in the
+    /// body, so nothing about this request outlives it — which is what makes it safe to use
+    /// however many dashboards fall back to it.
+    fn pollBatch(self: *Service, in: Incoming, out: *Reply, s: Session) Disposition {
+        var cur: storage.feed.Cursor = .{};
+        if (query.get(in.query(), "cursor")) |text| {
+            cur.pos = std.fmt.parseInt(u64, text, 10) catch
+                return failPlain(out, .invalid_cursor);
+        } else {
+            // No cursor means "start from now", the same place a new SSE subscriber starts.
+            cur = self.store.feedCursor();
+        }
+
+        var events: [max_batch_events]storage.feed.Event = undefined;
+        const polled = self.store.pollFeed(cur, &events);
+
+        var buf: [640]u8 = undefined;
+        var w = json.Writer.init(&buf);
+        blk: {
+            w.beginObject() catch break :blk;
+            w.key("events") catch break :blk;
+            w.beginArray() catch break :blk;
+            for (polled.events) |ev| {
+                // The account filter, which is the whole of the isolation requirement here.
+                if (ev.account_id != s.auth.account_id) continue;
+                w.beginObject() catch break :blk;
+                w.numberMember("seq", ev.seq) catch break :blk;
+                w.stringMember("op", @tagName(ev.op)) catch break :blk;
+                w.endObject() catch break :blk;
+            }
+            w.endArray() catch break :blk;
+            w.numberMember("cursor", polled.next.pos) catch break :blk;
+            w.key("resync") catch break :blk;
+            // Says so rather than handing back a gap dressed as continuity (D85).
+            w.boolean(polled.resync) catch break :blk;
+            w.endObject() catch break :blk;
+
+            out.header("Content-Type", "application/json");
+            out.header("Cache-Control", "no-store");
             out.body = out.dupe(w.done()) orelse return failPlain(out, .internal_error);
             return .complete;
         }
