@@ -307,7 +307,7 @@ left for an implementation diff to decide. Two came from measurement rather than
 | **D77** | account deletion cannot delete entries eagerly, because the index holds no names (D11). Deletion makes data permanently inaccessible at once and the bytes go with their expiry — which only works because lifetime is mandatory |
 | D78 | M3's five environment variables, all required and none defaulted, and the mail queue thread two of them configure |
 
-### Pass 2 — implementation · **MOSTLY COMPLETE**
+### Pass 2 — implementation · **COMPLETE**
 
 Built and covered by unit tests: the control log's eight new event types and the state they
 rebuild, Argon2id passwords on the I/O worker pool, credential generation, the two forms of an
@@ -322,7 +322,7 @@ peer capture would have cost a syscall per connection for a fallback the product
 reaches.
 
 GitHub OAuth is built: the authorize redirect with its `state` binding, and the token exchange
-on an I/O worker. `tools/app-check.sh` drives the whole surface with `curl` — 60 checks.
+on an I/O worker. `tools/app-check.sh` drives the whole surface with `curl` — 79 checks.
 
 - GitHub OAuth with `state` binding
 - Email + password, Argon2id, OTP verification, queued outbound mail via ZeptoMail
@@ -346,7 +346,7 @@ to be measured from outside: a 5 ms "unknown" turned out to be a `429`, not a fa
 
 ---
 
-## M4 — Dashboard
+## M4 — Dashboard · **IN PROGRESS**
 
 The adoption driver. Plain HTML/CSS/JS, `@embedFile`d.
 
@@ -359,19 +359,41 @@ choice reversible at configuration time instead of by waiting.
 
 This is no longer a hedge against something unlikely. The edge's *default* behaviour is
 measured and it breaks SSE (D68), so the fallback sits on the likely branch until the
-Configuration Rule is applied and verified.
+Configuration Rule is applied and verified. **The seam itself is already built** (D84–D87):
+`GET /app/stream` serves both framings and the client's `Accept` header picks.
+
+### Pass 1 — decisions · **COMPLETE**
+
+D88–D94 in `07-decisions.md`. Nothing about the dashboard is left for an implementation diff
+to decide. **Three of the seven exist because reading the built control plane as the
+dashboard's first caller found questions the specification never had to answer** — which is
+the two-pass rule earning its keep for the fourth milestone running.
+
+| decision | what it settled |
+|---|---|
+| **D88** | the dashboard is a **third plane**, decided by prefix before any credential. Nothing in the tree could serve an unauthenticated byte: `GET /` was `401` because the data plane authenticates before it routes, and the control plane demands a session for everything outside `/app/auth/*`. A fixed comptime table of exact paths, so traversal is unrepresentable rather than validated |
+| D89 | the digest goes in the asset filename and assets are `immutable`; the two HTML documents are `no-store`. **No `ETag`, no `304`** — content-addressing caches better and keeps conditional requests out of the transport. Plus the CSP, which forbids inline script and style |
+| D90 | the shell carries **no identity**: one `GET /app/account` is the whole bootstrap, `401` is a state rather than an error, and it is one of only two sources of the synchroniser token |
+| **D91** | the first key is created **only when the account holds none**. "A key is issued on first landing" read literally posts a key per load, which exhausts the five-key cap in five reloads and then greets the user with `409` on their own dashboard |
+| **D92** | `GET /app/tags`, because `GET /v1/entries` requires a tag and **nothing enumerates them**. Control plane only, so `/v1` stays at seven endpoints. It names tags that are *known*, not non-empty, because `TagHeads` is never pruned |
+| D93 | the client asks for SSE and falls back after a **20-second** first-frame deadline; a frame triggers a refetch coalesced to one per 500 ms, because the control-plane bucket is 300 ops/min and an uncoalesced refetch rate-limits the dashboard out of its own live view |
+| D94 | the exit condition splits: `tools/dashboard-check.sh` asserts the surface in CI, and the 60 seconds is a timed manual drill recorded like every other measured figure |
+
+### Pass 2 — implementation
 
 - Signup and login
 - **First-run screen: the API key beside a paste-ready `curl` command.** This screen is
   the conversion moment and gets disproportionate attention
 - Entry explorer: list by tag, read one entry, content-type-aware rendering
-- Live view over SSE
+- Live view over the D87 seam, with D93's client-side fallback
 - Credit counter with the mail-us-for-credits button
 - API key management
 
 **Exit:** a new user goes from landing page to a written entry visible in the live view in
 **under 60 seconds**, timed, on a cold browser. This is the product thesis and it is a
-pass/fail test.
+pass/fail test. Split by D94 into a `curl` harness for the surface and a timed drill for the
+claim, because a shell script cannot answer a stopwatch — and re-run at the end of M5 on the
+deployed box, where the number finally includes the edge and a real network.
 
 ---
 

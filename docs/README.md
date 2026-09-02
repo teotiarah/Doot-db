@@ -34,6 +34,7 @@ anywhere durable.
 | **M3 decisions** | D68–D78 | settled before any control-plane code. D68 and D69 are measurements taken while M2's edge slice was stood up; the rest settle where M3's state lives, which thread it runs on, and what the log format permits |
 | **M3 findings** | D79–D83 | what building the control plane forced. D70, D72 and D74 also gained amendments, two of which corrected a rule that could not have worked |
 | **live feed** | D84–D87 | M2's SSE slice, whose *verification* D68 deferred to M5. D68 gains an amendment: the probe no longer chooses which transport ships |
+| **M4 decisions** | D88–D94 | settled before any dashboard code. Three exist because reading the built control plane as the dashboard's first caller found questions the specification never had to answer: nothing could serve an unauthenticated byte, nothing could enumerate an account's tags, and "a key on first landing" read literally exhausts the five-key cap |
 
 Earlier decisions carry **amendments pointing forward** rather than being silently
 rewritten — D11, D18, D20 and D38 each gained one during M2's decision pass, and D28

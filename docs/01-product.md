@@ -103,6 +103,12 @@ than the feature the product is betting on.
 | unauthenticated `/app/auth/*`, per client address | 20 ops/min |
 | unauthenticated `/app/auth/*`, global ceiling | 600 ops/min |
 
+**The dashboard's own documents are unmetered** and draw on no bucket at all (D88). They are a
+few kilobytes of static, compiled-in bytes with no storage call behind them — the same cost
+profile as `/healthz`. Metering them on the per-address bucket above would be actively harmful:
+one page load is four requests, so at 20/min the sign-in page would rate-limit its own users,
+and that bucket is deliberately lossy, so users behind one NAT share it.
+
 The global ceiling is not redundant: the per-address limit depends on believing the client
 address, which behind Cloudflare means believing a header, and that is only sound once the
 origin refuses connections that did not come through Cloudflare. Reasoning and the dependency
