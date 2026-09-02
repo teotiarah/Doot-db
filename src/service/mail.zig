@@ -464,3 +464,87 @@ test "the endpoint matches the region this zone's DKIM points at" {
     try testing.expect(std.mem.indexOf(u8, endpoint, "zeptomail.in") != null);
     try testing.expect(std.mem.startsWith(u8, endpoint, "https://"));
 }
+
+// ---------------------------------------------------------------------------
+// The mail thread (D78)
+// ---------------------------------------------------------------------------
+
+/// Owns the thread that drains the queue.
+///
+/// It lives here rather than in `boot.zig` for a structural reason: `boot` deliberately does
+/// not import `service` (D63), and the queue and the ZeptoMail call are both here. So the
+/// thread sits with the code it runs, and `main.zig` — the one place that already knows about
+/// both layers — starts and stops it in the right order.
+///
+/// **Separate from the maintenance thread, not sharing it.** Maintenance blocks on local disk
+/// for a bounded time; this blocks on a third party for an unbounded one. Sharing would let a
+/// slow provider stop expiry sweeps and snapshots, and by D63 no snapshots means D38's
+/// recovery bound stops holding.
+pub const Sender = struct {
+    gpa: std.mem.Allocator,
+    queue: *Queue,
+    cfg: Config,
+    clock: storage.clock.Clock,
+
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+    failures: u64 = 0,
+
+    /// How long the thread sleeps between passes when the queue is empty.
+    ///
+    /// A plain sleep rather than a condition variable: the queue is almost always empty, a
+    /// second of latency on a verification mail is invisible next to the time a human takes to
+    /// read it, and a sleep cannot deadlock against a shutdown that is trying to join.
+    pub const idle_interval_ms: u64 = 1_000;
+
+    pub fn start(self: *Sender) !void {
+        std.debug.assert(self.thread == null);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Drains what it can and drops the rest, with a bounded wait.
+    ///
+    /// A deploy does not wait on a third party's mail API, and an undelivered code degrades to
+    /// a resend that `06-auth.md` already budgets three of per hour.
+    pub fn stop(self: *Sender) void {
+        if (self.thread) |t| {
+            self.stopping.store(true, .release);
+            t.join();
+            self.thread = null;
+        }
+    }
+
+    fn run(self: *Sender) void {
+        while (!self.stopping.load(.acquire)) {
+            const sent = drainOnce(self.gpa, self.queue, self.cfg, self.clock.now());
+            if (sent == 0) sleepMs(idle_interval_ms);
+        }
+    }
+};
+
+/// `std.Thread.sleep` no longer exists in Zig 0.16. Same wrapper `boot.zig` carries, for the
+/// same reason.
+fn sleepMs(ms: u64) void {
+    const req: std.os.linux.timespec = .{
+        .sec = @intCast(ms / 1_000),
+        .nsec = @intCast((ms % 1_000) * 1_000_000),
+    };
+    _ = std.os.linux.nanosleep(&req, null);
+}
+
+test "a sender starts and stops without sending anything" {
+    // The thread's own lifecycle, separately from the sending: an empty queue must not spin,
+    // and a stop must join rather than hang.
+    var q: Queue = .{};
+    var manual: storage.clock.Manual = .init(1_700_000_000);
+    var sender: Sender = .{
+        .gpa = testing.allocator,
+        .queue = &q,
+        .cfg = test_cfg,
+        .clock = manual.clock(),
+    };
+    try sender.start();
+    sender.stop();
+    try testing.expectEqual(@as(u64, 0), q.sent);
+    try testing.expect(sender.thread == null);
+}

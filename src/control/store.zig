@@ -753,6 +753,51 @@ pub const Control = struct {
         return account_id;
     }
 
+    /// Visits every live key on an account, newest id last.
+    ///
+    /// The dashboard lists a user's keys, and the map is keyed on digest — so without this a
+    /// caller would have to know every digest to find the keys belonging to one account,
+    /// which is exactly the property that makes the digest a safe map key in the first place.
+    ///
+    /// Revoked keys are skipped: `06-auth.md` shows the dashboard a list of keys that work,
+    /// and revocation is irreversible, so a revoked one is history rather than state.
+    ///
+    /// Runs with the mutex held, so the callback must not re-enter `Control`.
+    pub fn forEachKey(
+        self: *Control,
+        account_id: u32,
+        ctx: anytype,
+        comptime visit: fn (@TypeOf(ctx), ApiKey) void,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.keys.valueIterator();
+        while (it.next()) |k| {
+            if (k.account_id != account_id or k.revoked) continue;
+            visit(ctx, k.*);
+        }
+    }
+
+    /// Revokes a key only if it belongs to `account_id`.
+    ///
+    /// Separate from `revokeKey` because the control plane must not let a session revoke
+    /// another account's key, and an ownership check the caller performs is an ownership
+    /// check the caller can forget. Returns false when the key is unknown, already revoked,
+    /// or someone else's — one answer, so this is not an oracle for which ids exist.
+    pub fn revokeOwnedKey(self: *Control, account_id: u32, key_id: u32) Error!bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var it = self.keys.valueIterator();
+        const target: *ApiKey = while (it.next()) |k| {
+            if (k.id == key_id and !k.revoked and k.account_id == account_id) break k;
+        } else return false;
+
+        try self.appendLocked(.{ .key_revoked = .{ .key_id = key_id } });
+        target.revoked = true;
+        return true;
+    }
+
     /// Visits every account, so a caller can build an index this module cannot.
     ///
     /// Login has to find an account from an email address, and the normalisation that makes
@@ -2754,4 +2799,62 @@ test "a deleted account is not visited" {
     // Deletion removes the account outright, so an index rebuilt from this cannot resurrect
     // a login for it (D77).
     try testing.expectEqual(@as(usize, 1), counter.n);
+}
+
+
+test "an account's live keys can be listed, and revoked ones are not" {
+    var h = try H.init(84);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const a = try c.createAccount("a@b.co", .trial, .active, 10);
+    const b = try c.createAccount("b@b.co", .trial, .active, 10);
+    const k1 = try c.issueKey(a, "one", "doot_live_1111111111111111111111111111111111");
+    _ = try c.issueKey(a, "two", "doot_live_2222222222222222222222222222222222");
+    _ = try c.issueKey(b, "other", "doot_live_3333333333333333333333333333333333");
+    _ = try c.revokeKey(k1);
+
+    const Seen = struct {
+        n: usize = 0,
+        labels: [8][]const u8 = undefined,
+        fn visit(s: *@This(), k: ApiKey) void {
+            if (s.n == s.labels.len) return;
+            s.labels[s.n] = k.label;
+            s.n += 1;
+        }
+    };
+    var seen: Seen = .{};
+    c.forEachKey(a, &seen, Seen.visit);
+
+    // Only the live key on *this* account. The dashboard shows keys that work, and revocation
+    // is irreversible, so a revoked one is history rather than state.
+    try testing.expectEqual(@as(usize, 1), seen.n);
+    try testing.expectEqualStrings("two", seen.labels[0]);
+}
+
+test "one account cannot revoke another's key" {
+    // The check lives in Control rather than at the call site, because a check the caller
+    // performs is a check the caller can forget -- and forgetting this one lets a session
+    // revoke a stranger's credential.
+    var h = try H.init(85);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const a = try c.createAccount("a@b.co", .trial, .active, 10);
+    const b = try c.createAccount("b@b.co", .trial, .active, 10);
+    const victim = try c.issueKey(b, "victim", "doot_live_4444444444444444444444444444444444");
+
+    try testing.expect(!(try c.revokeOwnedKey(a, victim)));
+    // Still working, which is the property that matters.
+    try testing.expect(c.resolveKey("doot_live_4444444444444444444444444444444444") != null);
+
+    // And the owner can.
+    try testing.expect(try c.revokeOwnedKey(b, victim));
+    try testing.expect(c.resolveKey("doot_live_4444444444444444444444444444444444") == null);
+    // Twice is not an error, and an unknown id is the same answer as someone else's -- so
+    // this is not an oracle for which ids exist.
+    try testing.expect(!(try c.revokeOwnedKey(b, victim)));
+    try testing.expect(!(try c.revokeOwnedKey(b, 9_999)));
 }

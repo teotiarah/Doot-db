@@ -11,9 +11,9 @@
 //!
 //! What it deliberately does not do:
 //!
-//!   - **Create accounts.** M3 owns signup, and an operator subcommand here would be
-//!     scaffolding built to be replaced. A fresh deployment therefore answers `401` to
-//!     everything, which is recorded as an accepted consequence in D63.
+//!   - **Create accounts directly.** Signup does it, over HTTP, which is what closed D63's
+//!     one recorded open question. There is still no operator subcommand, because there is
+//!     no longer anything for one to do.
 //!   - **Log requests.** Boot and lifecycle diagnostics only; the structured per-request log
 //!     carries a redaction contract and belongs to M5.
 //!   - **Serve TLS.** The origin sits behind Cloudflare and the edge half of M2 is what
@@ -102,6 +102,77 @@ pub fn main(init: std.process.Init) !u8 {
     defer gpa.destroy(replays);
     replays.init();
 
+    // ---- the control plane (M3) ----
+    //
+    // Heap-allocated for the same reason the idempotency table is: a `Service` is copied by
+    // value into a handler vtable, and none of these belong in it.
+
+    const challenges = gpa.create(service.challenge.Table) catch |err| {
+        boot.fatalError("challenge table", err);
+        return 1;
+    };
+    defer gpa.destroy(challenges);
+    challenges.* = service.challenge.Table.init() catch |err| {
+        boot.fatalError("challenge table", err);
+        return 1;
+    };
+
+    const unauth = gpa.create(service.ratelimit.Unauthenticated) catch |err| {
+        boot.fatalError("rate limiter", err);
+        return 1;
+    };
+    defer gpa.destroy(unauth);
+    unauth.* = service.ratelimit.Unauthenticated.init() catch |err| {
+        boot.fatalError("rate limiter", err);
+        return 1;
+    };
+
+    // Generated, never hardcoded: a constant in our source is a constant an attacker
+    // recognises, which is the reasoning D63 applied to a default signing secret (D75).
+    const dummy = gpa.create(service.password.Dummy) catch |err| {
+        boot.fatalError("password hasher", err);
+        return 1;
+    };
+    defer gpa.destroy(dummy);
+    dummy.* = service.password.Dummy.init(gpa) catch |err| {
+        boot.fatalError("password hasher", err);
+        return 1;
+    };
+
+    const queue = gpa.create(service.mail.Queue) catch |err| {
+        boot.fatalError("mail queue", err);
+        return 1;
+    };
+    defer gpa.destroy(queue);
+    queue.* = .{};
+
+    // Derived state, rebuilt from the control log rather than stored in it: the normalisation
+    // login needs lives in `api`, which `control` may not import (D72).
+    const emails = gpa.create(service.app.EmailIndex) catch |err| {
+        boot.fatalError("email index", err);
+        return 1;
+    };
+    defer gpa.destroy(emails);
+    emails.* = service.app.EmailIndex.init(gpa);
+    defer emails.deinit();
+    emails.rebuild(ctl);
+
+    var app_state: service.app.State = .{
+        .gpa = gpa,
+        .cfg = .{
+            .public_origin = cfg.app.public_origin,
+            .support_email = cfg.app.support_email,
+            .github_client_id = cfg.app.github_client_id,
+            .github_client_secret = cfg.app.github_client_secret,
+            .zeptomail_token = cfg.app.zeptomail_token,
+        },
+        .challenges = challenges,
+        .unauth = unauth,
+        .dummy = dummy,
+        .queue = queue,
+        .emails = emails,
+    };
+
     var svc = service.Service.init(.{
         .store = store,
         .control = ctl,
@@ -111,9 +182,20 @@ pub fn main(init: std.process.Init) !u8 {
         .max_ttl_s = cfg.options.max_ttl_s,
         .idempotency = idem,
         .replays = replays,
+        .app = &app_state,
     });
 
     // ---- maintenance, and the loop that wakes it ----
+
+    // Its own thread, not maintenance's: maintenance blocks on local disk for a bounded time
+    // and this blocks on a third party for an unbounded one, so sharing would let a slow mail
+    // provider stop snapshots (D78).
+    var sender: service.mail.Sender = .{
+        .gpa = gpa,
+        .queue = queue,
+        .cfg = app_state.cfg.mailConfig(),
+        .clock = clk,
+    };
 
     var maint: boot.Maintenance = .{ .store = store, .ctl = ctl, .clock = clk };
 
@@ -133,6 +215,15 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     defer maint.stop();
+
+    // Started after the loop so it inherits the blocked signal mask, exactly as the
+    // maintenance thread does: a thread mid-TLS-handshake is no better a place to take a
+    // SIGTERM than one mid-fsync (D63).
+    sender.start() catch |err| {
+        boot.fatalError("mail thread", err);
+        return 1;
+    };
+    defer sender.stop();
 
     // ---- run ----
 

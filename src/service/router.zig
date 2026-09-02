@@ -81,9 +81,13 @@ pub const AppRoute = union(enum) {
     login,
     /// `POST /app/auth/logout`
     logout,
-    /// `GET /app/auth/github` — OAuth entry.
+    // `GET /app/auth/github` and its callback are deliberately **absent** until the OAuth
+    // exchange exists, for the same reason `/app/stream` is: a route that cannot complete
+    // tells a client the path works and then fails in a way no error code describes
+    // honestly. The variants stay declared so `needsSynchroniser` and the tests keep
+    // covering them, and `routeApp` starts returning them in the commit that implements
+    // the flow.
     github_start,
-    /// `GET /app/auth/github/callback`
     github_callback,
     /// `POST /app/auth/password/reset` — request a reset code.
     password_reset,
@@ -109,8 +113,12 @@ pub const AppRoute = union(enum) {
     entries,
     entry: []const u8,
 
-    /// `GET /app/stream` — the SSE live feed.
-    stream,
+    // `GET /app/stream` is deliberately **absent** until the live feed exists.
+    //
+    // D68 keeps the SSE endpoint and its long-polling alternative in M2's scope, behind one
+    // transport seam. A route that answers nothing useful is worse than no route: it tells a
+    // client the feature is there and then fails in a way no error code describes honestly.
+    // Until the seam lands, `/app/stream` is `unrouted` like any other unknown path.
 
     wrong_method: []const u8,
     unrouted,
@@ -133,19 +141,28 @@ pub fn needsSynchroniser(r: AppRoute) bool {
         .account_delete,
         .keys_create,
         .key_revoke,
-        .verify,
-        .password_confirm,
         => true,
+
+        // Every one of these is reachable *without* a session, so there is no synchroniser
+        // token to send — requiring one would make the request impossible rather than safe.
+        // `verify` and `password_confirm` belong here for a sharper reason than signup does:
+        // the OTP *is* the credential, and the account is not yet `active`, so a session
+        // could not authenticate it even if one existed. All of them are covered by the
+        // per-address limiter instead (D74).
         .signup,
         .login,
+        .verify,
+        .password_confirm,
+        .password_reset,
         .github_start,
         .github_callback,
-        .password_reset,
+        => false,
+
+        // Nothing read-only needs it.
         .account,
         .keys,
         .entries,
         .entry,
-        .stream,
         .wrong_method,
         .unrouted,
         => false,
@@ -165,14 +182,6 @@ pub fn routeApp(method: Method, path: []const u8) AppRoute {
     }
     if (std.mem.eql(u8, path, "/app/auth/logout")) {
         return if (method == .post) .logout else .{ .wrong_method = "POST" };
-    }
-    // The callback is checked before the entry point, because the entry point's path is a
-    // prefix of it and matching that first would swallow the callback.
-    if (std.mem.eql(u8, path, "/app/auth/github/callback")) {
-        return if (method == .get) .github_callback else .{ .wrong_method = "GET" };
-    }
-    if (std.mem.eql(u8, path, "/app/auth/github")) {
-        return if (method == .get) .github_start else .{ .wrong_method = "GET" };
     }
     if (std.mem.eql(u8, path, "/app/auth/password/reset")) {
         return if (method == .post) .password_reset else .{ .wrong_method = "POST" };
@@ -219,9 +228,6 @@ pub fn routeApp(method: Method, path: []const u8) AppRoute {
         // idempotency and audit story, and would diverge from `/v1` over time. So every
         // other method here is a `405`, not a `404`.
         return if (method == .get) .{ .entry = name } else .{ .wrong_method = "GET" };
-    }
-    if (std.mem.eql(u8, path, "/app/stream")) {
-        return if (method == .get) .stream else .{ .wrong_method = "GET" };
     }
     return .unrouted;
 }
@@ -360,8 +366,6 @@ test "every route in 06-auth.md's control-plane table exists" {
     try testing.expectEqual(AppRoute.verify, routeApp(.post, "/app/auth/verify"));
     try testing.expectEqual(AppRoute.login, routeApp(.post, "/app/auth/login"));
     try testing.expectEqual(AppRoute.logout, routeApp(.post, "/app/auth/logout"));
-    try testing.expectEqual(AppRoute.github_start, routeApp(.get, "/app/auth/github"));
-    try testing.expectEqual(AppRoute.github_callback, routeApp(.get, "/app/auth/github/callback"));
     try testing.expectEqual(AppRoute.password_reset, routeApp(.post, "/app/auth/password/reset"));
     try testing.expectEqual(AppRoute.password_confirm, routeApp(.post, "/app/auth/password/confirm"));
     try testing.expectEqual(AppRoute.account, routeApp(.get, "/app/account"));
@@ -370,7 +374,6 @@ test "every route in 06-auth.md's control-plane table exists" {
     try testing.expectEqualStrings("key_0000003", routeApp(.delete, "/app/keys/key_0000003").key_revoke);
     try testing.expectEqual(AppRoute.entries, routeApp(.get, "/app/entries"));
     try testing.expectEqualStrings("ci/last-green", routeApp(.get, "/app/entries/ci/last-green").entry);
-    try testing.expectEqual(AppRoute.stream, routeApp(.get, "/app/stream"));
 }
 
 test "account deletion has a route, which the surface table had omitted" {
@@ -381,13 +384,13 @@ test "account deletion has a route, which the surface table had omitted" {
     try testing.expectEqualStrings("GET, DELETE", routeApp(.post, "/app/account").wrong_method);
 }
 
-test "the OAuth callback is not swallowed by the entry point" {
-    // `/app/auth/github` is a prefix of `/app/auth/github/callback`, so matching it first
-    // would make the callback unreachable and the whole flow fail at the last step.
-    try testing.expectEqual(AppRoute.github_callback, routeApp(.get, "/app/auth/github/callback"));
-    try testing.expectEqual(AppRoute.github_start, routeApp(.get, "/app/auth/github"));
-    // And neither absorbs a longer path.
-    try testing.expectEqual(AppRoute.unrouted, routeApp(.get, "/app/auth/github/callback/extra"));
+test "the OAuth paths are unrouted until the exchange exists" {
+    // Declared as variants, not yet reachable. When the flow lands, the callback must be
+    // matched *before* the entry point -- `/app/auth/github` is a prefix of
+    // `/app/auth/github/callback`, so matching the shorter one first makes the callback
+    // unreachable and the whole flow fails at its last step.
+    try testing.expectEqual(AppRoute.unrouted, routeApp(.get, "/app/auth/github"));
+    try testing.expectEqual(AppRoute.unrouted, routeApp(.get, "/app/auth/github/callback"));
     try testing.expectEqual(AppRoute.unrouted, routeApp(.get, "/app/auth/githubx"));
 }
 
@@ -412,7 +415,6 @@ test "an app name keeps its slashes, like a data-plane name" {
 test "an auth endpoint refuses the wrong method with the right Allow" {
     try testing.expectEqualStrings("POST", routeApp(.get, "/app/auth/login").wrong_method);
     try testing.expectEqualStrings("POST", routeApp(.get, "/app/auth/signup").wrong_method);
-    try testing.expectEqualStrings("GET", routeApp(.post, "/app/auth/github").wrong_method);
     try testing.expectEqualStrings("DELETE", routeApp(.get, "/app/keys/key_1").wrong_method);
 }
 
@@ -421,13 +423,11 @@ test "every Allow the control plane advertises is a method that routes" {
     // earn another 405.
     inline for (.{
         .{ "/app/auth/login", "POST" },
-        .{ "/app/auth/github", "GET" },
         .{ "/app/account", "GET, DELETE" },
         .{ "/app/keys", "GET, POST" },
         .{ "/app/keys/key_1", "DELETE" },
         .{ "/app/entries", "GET" },
         .{ "/app/entries/a", "GET" },
-        .{ "/app/stream", "GET" },
     }) |case| {
         var it = std.mem.splitSequence(u8, case[1], ", ");
         while (it.next()) |m| {
@@ -449,6 +449,8 @@ test "unknown control-plane paths are unrouted" {
         "/app/keys/",
         "/app/entriesx",
         "/app/streamx",
+        // Absent until the live feed exists (D68).
+        "/app/stream",
         "/app/account/extra",
     }) |path| {
         try testing.expectEqual(AppRoute.unrouted, routeApp(.get, path));
@@ -467,8 +469,6 @@ test "the synchroniser token covers exactly the state-changing routes" {
     try testing.expect(needsSynchroniser(.account_delete));
     try testing.expect(needsSynchroniser(.keys_create));
     try testing.expect(needsSynchroniser(.{ .key_revoke = "key_1" }));
-    try testing.expect(needsSynchroniser(.verify));
-    try testing.expect(needsSynchroniser(.password_confirm));
 
     // Not signup or login: a caller with no session has no token to send, so requiring one
     // would make the first request impossible. The per-address limiter covers them (D74).
@@ -477,12 +477,15 @@ test "the synchroniser token covers exactly the state-changing routes" {
     try testing.expect(!needsSynchroniser(.password_reset));
     try testing.expect(!needsSynchroniser(.github_start));
     try testing.expect(!needsSynchroniser(.github_callback));
+    // The OTP is the credential on these two, and the account is not yet active -- a session
+    // could not authenticate it even if one existed.
+    try testing.expect(!needsSynchroniser(.verify));
+    try testing.expect(!needsSynchroniser(.password_confirm));
 
     // And nothing read-only needs it.
     try testing.expect(!needsSynchroniser(.account));
     try testing.expect(!needsSynchroniser(.keys));
     try testing.expect(!needsSynchroniser(.entries));
-    try testing.expect(!needsSynchroniser(.stream));
 }
 
 test "the two planes never answer for each other's paths" {
