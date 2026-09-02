@@ -2779,6 +2779,25 @@ plus-suffix**, each with its own delivery address, but only the first receives c
 `06-auth.md` says a non-first anchor match activates with zero credits and that the reason
 is logged for support, which is the intended handling rather than an edge case.
 
+**M3 amendment — `googlemail.com` is folded onto `gmail.com`, and leaving it out was a
+hole.** The rule above names both domains as dot-normalising, which is correct and
+insufficient: they are not two providers, they are **two spellings of one mailbox**.
+`some.one@googlemail.com` and `someone@gmail.com` are the same person's inbox, so an anchor
+that keeps the domains distinct produces two identities for one mailbox — and a second trial
+grant for anyone who notices. That is precisely the farming vector the anchor exists to
+close, so the dot rule without the domain fold defends the harder half and leaves the easy
+half open.
+
+The anchor therefore rewrites the domain `googlemail.com` to `gmail.com` before hashing.
+Found by a test asserting the farming variants collapse onto one identity, which they did
+not.
+
+**The fold stays exactly as narrow as the dot rule, and for the same reason.** It applies to
+this one pair, because this one pair is documented by the provider as aliases of each other.
+A general table of provider aliases would be a maintenance burden that fails silently the
+moment it is out of date — and failing silently here means merging two strangers' identities
+and denying one of them a grant, which is worse than the leakage it would prevent.
+
 ---
 
 ## D73 — The control plane lives in the service layer, behind one `Handler` · locked

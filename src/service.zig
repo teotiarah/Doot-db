@@ -30,6 +30,7 @@ pub const query = @import("service/query.zig");
 pub const json = @import("service/json.zig");
 pub const ids = @import("service/ids.zig");
 pub const idempotency = @import("service/idempotency.zig");
+pub const password = @import("service/password.zig");
 
 const Incoming = server.handler.Incoming;
 const Reply = server.handler.Reply;
@@ -900,6 +901,7 @@ test {
     _ = json;
     _ = ids;
     _ = idempotency;
+    _ = password;
 }
 
 
