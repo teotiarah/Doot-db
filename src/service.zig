@@ -33,6 +33,7 @@ pub const idempotency = @import("service/idempotency.zig");
 pub const password = @import("service/password.zig");
 pub const ratelimit = @import("service/ratelimit.zig");
 pub const challenge = @import("service/challenge.zig");
+pub const mail = @import("service/mail.zig");
 
 const Incoming = server.handler.Incoming;
 const Reply = server.handler.Reply;
@@ -906,6 +907,7 @@ test {
     _ = password;
     _ = ratelimit;
     _ = challenge;
+    _ = mail;
 }
 
 
