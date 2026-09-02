@@ -2447,6 +2447,641 @@ emergent.
 
 ---
 
+# M3 decisions
+
+Settled before any control-plane code, per sequencing rule 2. Two of them (D68, D69) are
+findings from measurements taken while M2's edge slice was being stood up, and they are
+here rather than under M2 because what they change is M3's shape.
+
+Everything below concerns the control plane: accounts, sessions, passwords, OAuth, mail and
+the `/app/*` surface. `06-auth.md` describes the product behaviour and is the reference for
+*what* each flow does; these decisions settle *where the state lives, which thread it runs
+on, and what the record format permits* — the questions an implementation cannot avoid and
+a prose specification did not answer.
+
+---
+
+## D68 — Cloudflare SSE verification moves to the end of M5, and M4's gate becomes a seam requirement · locked
+
+M2's third exit condition is `ops/sseprobe.py` passing through the real Cloudflare zone.
+It has not been met and, at the time of writing, cannot be: it needs a publicly reachable
+origin, and the only box available is a sandbox with no inbound connectivity.
+
+**What was measured instead, and it matters more than the schedule.** A synthetic SSE
+origin was exposed through a real Cloudflare edge and probed:
+
+| stream | result |
+|---|---|
+| local, no proxy — the control | **PASS.** Headers in 1 ms, clean 250 ms inter-event gaps |
+| through the edge at ~160 B/s (one 40-byte event per 250 ms) | headers in 189 ms, then **zero body frames in 90 s** |
+| through the edge at ~200 KB/s (1 KB events every 5 ms) | **eight events all arriving at +945 ms**, in a single ~8 KB chunk |
+
+So **D31's hazard is real, and it is byte-threshold accumulation at roughly 8 KB** rather
+than a fixed delay. The high-rate stream punching through in one batch while the low-rate
+stream never arrives at all is what identifies the mechanism: the edge is waiting for a
+buffer to fill, not for a timer to expire.
+
+This converts D31 from a literature-based worry into a measurement, and it settles the
+question D31 left open in the worst direction. At Doot's real event rate — a few writes a
+minute, tens of bytes each — the live view would lag by **minutes to hours**. The
+Configuration Rule setting `response_body_buffering: none` is therefore not a precaution.
+It is the feature's load-bearing dependency, and until it is applied and verified the live
+view does not work at all.
+
+**Resolution: the verification run is deferred to the end of M5**, where the deployed box
+and the zone both exist as part of that milestone's own work. The code it verifies still
+ships in M2, because the code is not what was blocked.
+
+**M4's gate changes rather than disappearing.** The roadmap gated M4's live view on the
+probe passing, for a good reason: discovering at the end of the most user-visible milestone
+that the transport does not work is the failure D31 was written to prevent. Deferring the
+probe past M4 would forfeit that protection — so the gate is replaced by a requirement that
+is checkable *without* the zone:
+
+**M4's live view consumes a transport seam with two implementations behind it, and the
+dashboard is written against the seam.** SSE is one; the D31 fallback, long-polling on the
+same path, is the other. Both are built and both are tested locally. The zone verification
+then chooses which one is enabled in production rather than deciding whether M4's central
+feature exists.
+
+That is a stronger position than the original gate. The original gate protected against
+building on an unverified transport by *waiting*; this protects against it by making the
+choice reversible at configuration time. And the measurement above means the fallback is no
+longer hypothetical — the default edge behaviour is known to break SSE, so the fallback path
+is on the likely branch and deserves to be real code rather than a paragraph.
+
+Rejected: **taking the fallback now and dropping SSE.** Long-polling degrades the one
+feature meant to drive adoption, and there is a documented first-class fix that has simply
+not been applied yet. D31 already rejected this pre-emptively and the reasoning is unchanged.
+
+Rejected: **holding M3 and M4 until the zone exists.** It makes every remaining milestone
+wait on infrastructure that is orthogonal to all of them. Nothing in accounts or the
+dashboard's account management depends on the streaming question.
+
+Rejected: **verifying against a tunnel and calling the condition met.** A tunnel would prove
+the buffering behaviour, and it is how the measurement above was taken — but it cannot
+exercise `Full (strict)`, Authenticated Origin Pulls, or an origin firewall restricted to
+Cloudflare ranges, because with a tunnel none of those three exist. Reporting that as the
+production shape verified would be false. It is recorded as a partial result instead.
+
+**Accepted consequence: M2 closes with two of three exit conditions met and the third
+explicitly rescheduled**, rather than silently carried. The roadmap says so in both places.
+
+---
+
+## D69 — `std.http.Client` is viable on the pinned toolchain, and D27's rejection is scoped to the server · locked
+
+`05-architecture.md` commits M3's two outbound calls — the GitHub OAuth token exchange and
+ZeptoMail — to `std.http.Client` with `std.crypto.tls`, stdlib only. On Zig 0.16.0 that
+client is written entirely against `std.Io`: its connection type holds an
+`Io.net.Stream`, its pool takes an `Io.Mutex`, and `Client` has an `io: Io` field it cannot
+work without.
+
+That is the same surface D26 and D27 found unusable. Taken at face value it would mean the
+architecture's outbound story does not compile, which would be a serious finding to
+discover inside an implementation diff.
+
+**It compiles and it works.** Measured on the pinned toolchain, with `std.Io.Threaded`
+supplying the `Io`: a GET to `https://api.github.com/zen` completed TLS 1.3, validated the
+chain against the system bundle, and returned a genuine `415` with GitHub's own JSON
+explaining the `Accept` header; a POST with a JSON payload to the same host returned `403`.
+Both are real answers from a real server, which is what proves the transport rather than a
+status code we would have preferred.
+
+**Why this does not contradict D27.** D27 rejected `std.Io.Threaded` for the *event loop*,
+and the reason was specific: every idle keep-alive connection owns a pool thread, so a
+server wedges permanently once `async_limit` connections are parked. That failure needs
+thousands of long-lived idle connections. The outbound path has at most a handful of
+short-lived requests, issued from a background thread, with nothing parked. The mechanism
+that made `std.Io.Threaded` unusable for the server is simply absent here.
+
+Resolution: **the outbound path uses `std.http.Client` over a `std.Io.Threaded` instance
+owned by the thread that makes the calls.** The event loop keeps its own hand-driven
+io_uring and never touches either. Two `Io` implementations coexist in one process because
+they serve two shapes of work, and D27's finding is narrowed in place rather than
+generalised into a ban it never argued for.
+
+Rejected: **vendoring an HTTP client.** We would be adding a dependency to avoid a stdlib
+path that demonstrably works, and `05-architecture.md`'s "stdlib only, no dependency" is a
+property worth keeping.
+
+Rejected: **hand-rolling HTTP/1.1 over the vendored TLS client from D29.** Plausible, and it
+would reuse code already pinned — but it means writing a client, a chunked-response reader
+and a redirect follower, all to replace something already tested upstream. D29's TLS is
+vendored because Zig ships no TLS *server*; it ships a working client.
+
+Rejected: **doing OAuth and mail on the event loop with the raw ring.** D57 already
+established that nothing which blocks belongs there, and an outbound HTTPS request blocks
+for as long as a third party takes to answer.
+
+**Accepted consequence: the process carries a second concurrency mechanism.** Stated
+plainly because it is the kind of thing that looks like drift later. It is confined to the
+outbound thread, it is what the stdlib client requires, and the alternative was writing a
+client of our own.
+
+---
+
+## D70 — Where each piece of M3 state lives, and the event numbers it takes · locked
+
+D40 put accounts, keys and credits in an append-only `CONTROL` log with a full in-RAM
+image. D41 made credit balances authoritative in RAM and checkpointed. D42 put idempotency
+in RAM and said so in the published docs. M3 adds seven kinds of state, and each one has to
+answer the same question those three answered separately.
+
+The rule the existing three imply, made explicit: **the log holds what must survive a
+restart and cannot be reconstructed; RAM holds what is cheap to lose.** Anything logged per
+request would make the log grow with traffic, which D41 already refused for credits.
+
+| state | where | why |
+|---|---|---|
+| password hash | **logged**, `password_set` | Unreconstructable, and losing it locks the owner out permanently |
+| GitHub identity link | **logged**, `github_linked` | Same. It is one of the two identity anchors |
+| identity anchors | **logged**, `anchor_claimed` | Must outlive the account itself (`06-auth.md`), so it cannot live anywhere else |
+| account activation | **logged**, `account_activated` | The `pending_verification` → `active` transition, and the moment credits are granted |
+| account deletion | **logged**, `account_deleted` | A tombstone. Replay must not resurrect a deleted account |
+| sessions | **logged on create and revoke; sliding expiry in RAM, checkpointed** | See below |
+| OTP challenges | **RAM only** | 10-minute lifetime. Logging a credential for a 10-minute window is churn, and losing one costs a resend |
+| OAuth `state` values | **RAM only** | Single-use, minutes-long, same reasoning |
+| key `last_used_at` | **RAM only, checkpointed** | Updated at most once a minute per key (`06-auth.md`); it is a display field, not a credential |
+| control-plane rate buckets | **RAM only** | D58's precedent for the data-plane bucket, unchanged |
+
+**Sessions are the one genuinely hard case, and they resolve opposite to credits.** A
+30-day session refreshed on every use cannot be logged per refresh — that is a log write
+per dashboard request. But RAM-only would log every user out on every deploy, and unlike a
+lost idempotency record that is directly visible to the person using the product.
+
+Resolution: `session_created` and `session_revoked` are logged; the sliding refresh lives in
+RAM and rides the same checkpoint mechanism credits use. On replay a session's expiry is the
+**earlier** of what the log says and what the last checkpoint says.
+
+That direction is deliberate and it is the mirror image of D41. Credits err in the
+customer's favour, so a crash can only under-charge. A session is a credential, so a crash
+may only ever **shorten** it, never extend it. The worst case is a user logging in again;
+the alternative worst case is a session outliving the revocation that was supposed to end
+it. When the safe direction differs, the rule follows the safe direction rather than the
+precedent.
+
+**Event numbers, permanent from here.** `control/event.zig` states that numbering is
+append-only and never reused, and that a type this build does not know is refused rather
+than guessed at. Values 1–4 are taken. M3 takes:
+
+| value | type | payload |
+|---|---|---|
+| 5 | `password_set` | account id, Argon2id encoded hash, set-at |
+| 6 | `session_created` | session id, account id, `SHA-256` of the token, created-at, expires-at |
+| 7 | `session_revoked` | session id |
+| 8 | `sessions_checkpoint` | session id, expires-at — the sliding refresh, batched |
+| 9 | `anchor_claimed` | anchor kind, `SHA-256` of the normalised anchor, account id |
+| 10 | `github_linked` | account id, GitHub numeric user id |
+| 11 | `account_activated` | account id, credits granted |
+| 12 | `account_deleted` | account id, deleted-at |
+
+`password_set` rather than a field on `account_created`, because a password changes and
+`account_created` happens once. Last-one-wins on replay, which is what an append-only log
+gives for free.
+
+`account_activated` carries the credit grant rather than leaving it implied, because the
+grant decision depends on anchor evaluation (D72) and a replay must reproduce the number
+that was actually granted, not re-derive it from anchors that have since changed.
+
+`sessions_checkpoint` is a separate type from `credits_checkpoint` rather than a generalised
+one. The two have different payloads, different cadences and opposite recovery directions,
+and a shared "checkpoint" type carrying a discriminator would be one type pretending to be
+two.
+
+**`max_event_bytes` grows.** It is currently `header + 45 + max_label + max_email`.
+An Argon2id encoded hash is the new widest payload; the constant is recomputed from
+whichever type is actually largest rather than being nudged, and `peekLength` keeps
+rejecting anything above it before the value is trusted.
+
+Rejected: **a second log for control-plane volatility.** Two logs means two recovery
+orders and two fsync disciplines for state that is already partitioned by these rules.
+
+Rejected: **logging session refreshes and rewriting the log more often.** It makes log
+growth a function of dashboard traffic, which is precisely what D41 refused.
+
+**Accepted consequence: an unclean restart can end sessions early and invalidate
+outstanding OTP codes and OAuth `state` values.** All three degrade to an action the user
+already knows how to take — log in again, request a new code, click the button again — and
+none of them can silently succeed when they should have failed.
+
+---
+
+## D71 — Argon2id parameters, and where password hashing runs · locked
+
+`06-auth.md` specifies Argon2id with a per-password random salt and parameters "tuned to
+roughly 100 ms on the production box and recorded alongside each hash". Two things are
+undecided in that sentence: the parameters, and the thread.
+
+**The thread is the more important half.** A 100 ms hash is 100 ms of CPU that cannot be
+interrupted. D57 established that nothing blocking runs on the event loop, and its argument
+was about disk; this is worse, because a storage call at least releases the thread while the
+kernel works. An Argon2id verification on the loop would stall every connection the loop is
+serving for a tenth of a second, and login is exactly where an attacker gets to choose how
+often that happens.
+
+Resolution: **password hashing and verification run on the I/O worker pool**, through the
+same deferred-work seam every storage call already uses. The pool is not only for I/O; it is
+where work that must not run on the loop goes, and D57's `Reply.work` mechanism already
+carries exactly this shape. No new thread, no new seam.
+
+**Parameters:** `m = 19456` KiB (19 MiB), `t = 2`, `p = 1`, 16-byte salt, 32-byte tag —
+the RFC 9106 second recommended option. Chosen over the first (`m = 2 GiB`) because 2 GiB
+per concurrent verification on a box whose entire memory budget is accounted for in
+`04-storage.md` would be self-inflicted denial of service: eight I/O workers verifying at
+once would ask for 16 GiB.
+
+19 MiB × 8 workers is 152 MiB of transient peak, which sits alongside the index and the
+transport reservation without disturbing either. That is the constraint that picks the
+parameter set, so it is recorded as the reason rather than the timing figure.
+
+**Parameters are stored with each hash, in the PHC string format** `std.crypto.pwhash`
+already emits and parses. That is what makes them raisable later without invalidating
+existing passwords — the promise `06-auth.md` makes and did not say how to keep.
+
+**The 100 ms figure is a target to measure, not a constant to trust.** It is a property of
+the deployed CPU, and the box does not exist yet. M5 measures it, and if the chosen
+parameters land far from 100 ms the parameters move rather than the promise. Same discipline
+as D48.
+
+Rejected: **a dedicated password-hashing thread.** It would idle almost always and add a
+queue, to duplicate what the pool already does.
+
+Rejected: **the RFC's first recommended option.** Costed above.
+
+Rejected: **bcrypt or PBKDF2.** Argon2id is memory-hard and is what `std.crypto.pwhash`
+offers as the default; the others exist for compatibility with hashes we do not have.
+
+---
+
+## D72 — Email normalisation is for matching only, and never for delivery · locked
+
+The trial grant is bound to a normalised email address (`01-product.md`, `06-auth.md`):
+lowercased, plus-addressing stripped, `@gmail.com` dot-normalised. The specification says
+what to normalise and not what the normalised form is *for*, and conflating the two is a
+bug with real consequences — mail sent to a dot-stripped Gmail address is fine, but mail
+sent to a plus-stripped address arrives somewhere the user did not choose, and mail sent to
+a lowercased address is not guaranteed to arrive at all, because the local part of an
+address is case-sensitive under RFC 5321.
+
+Resolution: **two forms, stored separately and used for exactly one purpose each.**
+
+| form | how | used for |
+|---|---|---|
+| **delivery address** | exactly as the user supplied it, byte for byte | every outbound mail, and the address shown in the dashboard and `whoami` |
+| **anchor** | lowercase; drop `+` and everything after it in the local part; if the domain is `gmail.com` or `googlemail.com`, also remove `.` from the local part; hash the result | anti-farming comparison only, and only ever as a hash |
+
+The anchor is never displayed, never mailed to, and never stored in the clear — the log
+holds `SHA-256` of it (D70). A hash is enough, because the only operation is equality, and
+storing normalised addresses in the clear would mean holding a second copy of everyone's
+email for no additional capability.
+
+Domain comparison for the Gmail rule is case-insensitive, and applies to those two domains
+only. A general "strip dots" rule would be wrong: at most providers `a.b@` and `ab@` are
+different people.
+
+Rejected: **normalising the stored address.** Costed above. It breaks delivery and it
+discards information the user typed on purpose.
+
+Rejected: **normalising the domain beyond case.** Provider aliases change, and a table of
+them is a maintenance burden that fails silently when it is out of date.
+
+Rejected: **skipping plus-stripping.** It is the single cheapest way to farm a trial grant,
+and `01-product.md` already names it as a vector to defend.
+
+**Accepted consequence: two accounts may exist with addresses that differ only by case or
+plus-suffix**, each with its own delivery address, but only the first receives credits.
+`06-auth.md` says a non-first anchor match activates with zero credits and that the reason
+is logged for support, which is the intended handling rather than an edge case.
+
+---
+
+## D73 — The control plane lives in the service layer, behind one `Handler` · locked
+
+D58 created `src/service/` as "the composition layer, and the only place that imports
+`storage`, `control`, `api` and `server` together", because a request handler needs all four
+and no existing module was allowed to hold them. The control plane needs the same four, for
+the same reason.
+
+`06-auth.md` is emphatic that the two surfaces are strictly separate: different paths,
+different credentials, different rate buckets, one versioned and one not. The tempting
+reading is that separate surfaces want separate modules.
+
+**They do not, and the reason is the `Loop`.** `Loop.init` takes one `Handler` (D63 wires
+exactly one in `main.zig`), so something has to dispatch on the path prefix before either
+plane sees a request. Putting the control plane in a second top-level module would make two
+modules import all four — contradicting D58's "only place" — and would still need a third
+party to choose between them, or an arbitrary decision that one plane owns the other's
+routing.
+
+Resolution: **the control plane is new files inside `src/service/`, and `Service` remains
+the single `Handler`.** `Service.respond` splits on the path prefix first: `/healthz` and
+`/v1/*` take today's path, `/app/*` takes the control-plane path. D58 is amended in place —
+the service layer composes *both* planes.
+
+**Surface separation is enforced by code, not by module boundaries**, and it is enforced at
+exactly one place:
+
+- `/v1/*` reads `Authorization` and never reads a cookie.
+- `/app/*` reads the session cookie and never accepts a bearer token.
+
+Both halves are asserted by tests, because "an API key can never authenticate a dashboard
+request" is a security property and a property that is only true by convention is not true.
+This is what actually delivers `06-auth.md`'s separation; a module boundary would only have
+made it look delivered.
+
+**Prefix dispatch happens before authentication**, because the two planes authenticate
+differently and there is no credential to check until the plane is known. That reorders
+nothing observable: an unrouted path outside both prefixes is `404`, and D52's reasoning
+that an unauthenticated prober learns nothing from a `404` is unchanged.
+
+Rejected: **a second `Handler` and a second `Loop`.** Two loops means two rings and two
+listen sockets for one process, which is the model D57 rejected on memory grounds, applied
+to a surface that carries a fraction of the traffic.
+
+Rejected: **routing the control plane inside `src/server/`.** The transport is specified not
+to know about accounts or sessions, and the `Handler` seam exists to keep it that way (D58).
+
+Rejected: **a top-level `src/app/`.** Costed above. It duplicates D58's import surface
+without separating anything that is not already separated by the credential check.
+
+---
+
+## D74 — Control-plane rate limiting, and the client address it depends on · locked
+
+`01-product.md` requires a separate control-plane bucket per account, "tighter than the data
+plane", so exploring data can never exhaust the bucket a production script depends on. D58
+put the data-plane bucket on the `Account` in `Control`, behind the mutex that already
+serialises every per-account mutation. The second bucket goes in the same place for the same
+reasons and needs no new argument.
+
+**The hard part is the requests that have no account yet.** Signup, login, password reset
+and the OAuth entry point are unauthenticated by definition, and they are the surface
+`06-auth.md` defends with "per-account and per-IP backoff". There is no per-IP anything in
+the tree today, and a per-account bucket cannot rate-limit a request that has not
+established which account it concerns — or whether that account exists, which enumeration
+resistance (D75) forbids revealing.
+
+Resolution: **two mechanisms, because they defend different things.**
+
+| mechanism | scope | bounds |
+|---|---|---|
+| per-account control bucket | authenticated `/app/*` | 300 ops/min, capacity 300 |
+| per-address bucket | unauthenticated `/app/auth/*` | 20 ops/min, capacity 20, over a fixed table of 4,096 buckets keyed by a hash of the address |
+| global unauthenticated ceiling | all unauthenticated `/app/auth/*` | one bucket, 600 ops/min |
+
+The per-address table is fixed-size and lossy on collision — two addresses hashing together
+share a bucket. That is acceptable in the direction it fails: a collision makes the limit
+*stricter* for both, never looser, and a fixed table cannot be grown without bound by an
+attacker rotating addresses. The alternative, a map that allocates per address, is a
+memory-exhaustion vector on the one surface that must survive being attacked.
+
+**The global ceiling exists because the per-address bucket is only as trustworthy as the
+address**, and that is the part worth being careful about.
+
+Behind Cloudflare the origin sees Cloudflare's address on every connection, so the real
+client address is only available in `CF-Connecting-IP`. Trusting that header is sound
+**only if nothing but Cloudflare can reach the origin** — which is precisely what `Full
+(strict)`, Authenticated Origin Pulls and the Cloudflare-ranges firewall establish, and
+precisely what D68 has just deferred to the end of M5. Until those exist, the header is an
+attacker-supplied string, and an attacker who can vary it at will has an unlimited number
+of per-address buckets.
+
+So: **the header is used when present and the socket peer address otherwise, and the global
+ceiling bounds the total cost of unauthenticated control-plane work regardless of whether
+either is trustworthy.** The per-address bucket becomes a real defence when AOP lands; the
+global ceiling is what makes the surface safe before then. Recording this dependency is the
+point — a per-IP limit that silently depends on an unbuilt firewall is worse than no per-IP
+limit, because it looks like a defence.
+
+Rejected: **trusting `CF-Connecting-IP` unconditionally.** It is a header. Until the origin
+refuses connections that did not come through Cloudflare, so is the address in it.
+
+Rejected: **account lockout after N failures.** `06-auth.md` already rejected it: lockout
+converts a guessing attack into a denial of service against the real owner. Escalating
+delay, which the bucket already produces, is the chosen behaviour.
+
+Rejected: **one bucket for both planes.** The whole point of the separation is that
+dashboard use cannot starve a production script.
+
+**Accepted consequence: before AOP exists, an attacker varying `CF-Connecting-IP` sees only
+the global ceiling.** Named, bounded, and it expires when M5 completes.
+
+---
+
+## D75 — Enumeration resistance requires equalising work, not just responses · locked
+
+M3's exit condition includes "enumeration probes on signup, login and reset return identical
+responses". `06-auth.md` specifies identical responses on all three. Identical *responses*
+are necessary and not sufficient, and the gap is measurable.
+
+An account that exists has a password hash to verify, which by D71 costs a deliberate ~100
+ms. An address that does not exist has nothing to verify, and returning early is
+indistinguishable from a correct implementation until someone times it. The response bodies
+match perfectly and the endpoint is still an oracle.
+
+Resolution: **the work is equalised, not only the answer.**
+
+- **Login against an unknown address performs a full Argon2id verification against a fixed
+  dummy hash**, generated once at startup with the same parameters, and discards the result.
+  The failure path costs what the success path costs.
+- **Signup with an existing address performs the same hashing work a new signup performs**,
+  and returns the same `202`. It sends no mail to the existing account and creates nothing.
+- **Password reset always returns the same `202`**, and performs the same enqueue-shaped
+  work whether or not an address is known.
+
+The dummy hash is generated rather than hardcoded so that no build ships a constant an
+attacker can recognise from our source, which is the same reasoning D63 applied to refusing
+a default `DOOT_HMAC_SECRET`.
+
+**These are asserted by tests that compare timing distributions, not just status codes**,
+because a property nothing checks is a property that decays. The assertion is coarse — the
+two paths must be within a wide band of each other — because a tight timing assertion on
+shared CI hardware is D53's flaky-by-construction shape, and D53 already settled how to
+handle a property that depends on scheduling.
+
+Rejected: **a constant-time comparison and nothing else.** It defends the hash comparison
+and not the branch that decides whether to compare at all.
+
+Rejected: **a random delay on the failure path.** Randomness widens the distribution; it
+does not move its mean, and an attacker with many samples reads the mean.
+
+Rejected: **returning `404` for an unknown address on login.** It is the oracle, stated
+outright.
+
+**Accepted consequence: an unknown address costs the server a full Argon2id verification.**
+That is a real cost on an unauthenticated endpoint, and it is why D74's per-address bucket
+and global ceiling exist. The two decisions are load-bearing for each other.
+
+---
+
+## D76 — API key plaintext generation, and the one moment it exists · locked
+
+`06-auth.md` publishes the format — `doot_live_` followed by 32 base62 characters, "~190
+bits of entropy" — and `control/store.zig` already stores only `SHA-256(key)` and compares
+in constant time. What has never existed is the code that produces the plaintext:
+`issueKey` takes it as a parameter, and its only caller is a test fixture that hardcodes
+five.
+
+Resolution: **32 characters drawn from `A–Z a–z 0–9` by rejection sampling over a
+CSPRNG.**
+
+Rejection sampling rather than `byte % 62`, because 62 does not divide 256: the modulo form
+makes the first 8 characters of the alphabet about 1.6% more likely than the rest. That is
+not an exploitable weakness at 190 bits, and it is also free to avoid — draw a byte, discard
+it if it is ≥ 248, otherwise take it modulo 62. Getting this right by construction costs
+three lines and removes a question a reader would otherwise have to reason about.
+
+32 × log₂(62) is 190.5 bits, which is where `06-auth.md`'s figure comes from; recording the
+derivation means a future change to the length has to confront the number it publishes.
+
+**The plaintext exists in exactly one place for exactly one response.** It is generated,
+hashed, the hash is logged, and the plaintext is written into the response body and then
+into nothing else. It is never logged, never stored, and never recoverable — which is what
+`06-auth.md` promises the user, and which is only true if no code path keeps it.
+
+**`doot_test_` is reserved and unissued.** `06-auth.md` names it as a future variant; the
+prefix is part of the parse so that adding it later does not change how an existing key is
+recognised.
+
+Rejected: **base64url.** It contains `-` and `_`, which survive a double-click selection
+differently across terminals and chat clients, and a credential a user copies by hand should
+be one alphanumeric token.
+
+Rejected: **a longer key.** 190 bits is beyond any margin that matters, and every extra
+character is one more the user has to paste correctly.
+
+Rejected: **an HMAC-derived checksum inside the key**, so a malformed key could be rejected
+without a lookup. The lookup is a hash-table hit on a credential we must check anyway, and a
+checksum would make the format harder to describe in the one line `06-auth.md` spends on it.
+
+---
+
+## D77 — Account deletion cannot delete entries eagerly, because the index holds no names · locked
+
+`06-auth.md` step 3 of account deletion: "All entries deleted immediately (tombstoned; bytes
+reclaimed with their segments)." Found while reading that step as an implementer: **it is not
+implementable, and the reason is a property the storage engine chose on purpose.**
+
+- The index is keyed on a hash of `(account_id, name)` and **stores no names** (D11). There
+  is no way to enumerate an account's entries from it.
+- `03-data-model.md` states the consequence approvingly: cross-account addressing is
+  "unrepresentable". The same property makes *own*-account enumeration unrepresentable.
+- Tag chains are per `(account_id, tag)` and reachable only if the tag is already known
+  (D12). An entry with no tags is reachable only by its name.
+
+So there is no operation, and no sequence of operations, that visits every entry belonging
+to an account. Deleting them all immediately would need either names in the index — 
+reversing D11 and its 29.4 bytes-per-entry measurement — or a full scan of all 64 index
+shards on the request path.
+
+Resolution: **deletion makes an account's data permanently inaccessible immediately, and
+the bytes are reclaimed by the expiry machinery that already exists.**
+
+- `account_deleted` is logged, and from that instant `resolveKey` refuses every key on the
+  account, exactly as it already refuses a non-`active` account. No request can reach the
+  data again, through any credential, including a key issued a moment earlier.
+- The entries expire on their own schedule and their segments are reclaimed wholesale by the
+  maintenance thread, which is the same path every expiry already takes.
+- **The window is bounded by the plan's maximum lifetime** — 14 days on trial, 30 on paid —
+  because every entry has a mandatory enforced expiry.
+
+That last point is why this resolution is acceptable rather than a compromise. Doot's
+central constraint is that nothing accumulates forever, and here it pays for itself: on a
+store with unbounded lifetimes "reclaim it later" would mean "keep it indefinitely", and the
+guarantee would be empty. Mandatory expiry is what makes lazy reclamation a complete answer.
+
+**`06-auth.md` is corrected** to say what actually happens, rather than keeping a promise the
+engine cannot honour. The user-visible difference is nil — no request can read the data
+either way — and the difference that does exist is about when bytes leave the disk, which is
+the kind of thing a privacy statement should not misdescribe.
+
+Rejected: **storing names in the index to make enumeration possible.** It reverses D11,
+inflates the index by the length of every name, and invalidates M1's measured
+29.4 B/entry — all to serve one rare administrative operation.
+
+Rejected: **scanning all 64 shards on delete.** It is a full index walk on a request, and
+D57 would put it on a worker where it would hold shard locks against live traffic.
+
+Rejected: **an account-scoped tag chain that every entry joins.** It would make every write
+touch a chain that grows without bound for the account's whole life, to serve deletion. The
+write path is not the place to pay for it.
+
+Rejected: **a maintenance-time sweep that walks the index for deleted accounts.** Defensible,
+and genuinely tempting since maintenance already walks shards to sweep expired slots. Left
+out because it buys only *earlier* reclamation of bytes that are already unreachable and
+already scheduled for removal, at the cost of new code on the one thread whose correctness
+M1's fourth exit condition depends on. It goes in the Deferred table with a trigger.
+
+**Accepted consequence: a deleted account's bytes remain on disk, unreachable, until they
+expire.** Up to 14 or 30 days depending on plan. It is disclosed in the privacy statement
+alongside the anchor-hash retention that `06-auth.md` already discloses, because the honest
+version of "we deleted your data" has to include when.
+
+---
+
+## D78 — M3's environment variables, and the mail queue that two of them configure · locked
+
+D63 settled the rule: a variable is required by the milestone that gains the code which
+reads it, and nothing is defaulted where a default would be a hazard. M3 gains the code for
+five.
+
+| variable | required | notes |
+|---|---|---|
+| `DOOT_PUBLIC_ORIGIN` | yes | e.g. `https://doot.run`. Builds the OAuth `redirect_uri` and the links in outbound mail |
+| `DOOT_GITHUB_CLIENT_ID` | yes | |
+| `DOOT_GITHUB_CLIENT_SECRET` | yes | |
+| `DOOT_ZEPTOMAIL_TOKEN` | yes | |
+| `DOOT_SUPPORT_EMAIL` | yes | Already published in `402` bodies and the credits button (`01-product.md`) |
+
+All required, none defaulted, and the binary keeps naming the variable at fault rather than
+starting degraded. **`DOOT_PUBLIC_ORIGIN` must be an absolute `https://` origin with no
+path**, validated at boot: an OAuth `redirect_uri` that does not match the one registered
+with GitHub fails at the moment a user tries to sign up, and a boot-time check moves that
+discovery to the deploy.
+
+There is no "disable email signup" or "disable OAuth" switch. A half-configured control
+plane is a product with one broken signup button, and `06-auth.md` specifies two paths that
+both land in the same place. Refusing to start is the honest behaviour, and it is what D63
+already chose for every other secret.
+
+**The outbound queue is a thread, and it is the mail thread rather than a general one.**
+D63 established the pattern — one thread for maintenance, signalled by the loop's tick, with
+failures logged and never fatal. Mail takes a second thread of the same shape, and it is
+where D69's `std.Io.Threaded` and `std.http.Client` live.
+
+- **Bounded queue**, and a full queue fails the *enqueue*, which is a `503` on the signup
+  request rather than an unbounded backlog. A user retrying in a moment is a better outcome
+  than a queue that grows until the box dies.
+- **Retries with backoff**, a bounded attempt count, then the message is dropped and
+  counted. A dropped OTP is a resend, which `06-auth.md` already budgets three of per hour.
+- **A request never blocks on delivery.** `06-auth.md` requires the signup response to
+  return as soon as the code is persisted, and D75 requires the timing not to depend on
+  whether an address exists — both of which an inline send would break.
+- **Signals stay blocked on it**, per D63's amendment: only the thread that runs the loop
+  may receive `SIGTERM`, and a thread mid-TLS-handshake is no better a place to take one
+  than a thread mid-`fsync`.
+- **Shutdown drains what it can and drops the rest**, with a bounded wait. A deploy does not
+  wait on a third party's mail API, and an undelivered OTP degrades to a resend.
+
+GitHub's token exchange is **not** queued. It is synchronous inside the OAuth callback,
+because the user is waiting on that redirect and there is no outcome to deliver later — so
+it runs on an I/O worker, like every other thing that blocks (D57, D71), with a request
+timeout that turns a hung third party into an error page rather than a stuck connection.
+
+Rejected: **one background thread for mail and maintenance together.** Maintenance blocks on
+local disk for bounded time; mail blocks on a third party for unbounded time. Sharing a
+thread lets a slow mail provider stop expiry sweeps and snapshots, and D63 already
+established that no snapshots means D38's recovery bound does not hold.
+
+Rejected: **defaulting `DOOT_SUPPORT_EMAIL`.** It is published to users in `402` bodies. A
+default would be a real address in our source receiving other deployments' mail.
+
+Rejected: **queueing the OAuth exchange.** There is nobody to hand the result to; the user
+is mid-redirect.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
@@ -2466,7 +3101,8 @@ emergent.
 | Implementing the segment compactor | a segment actually meeting the escape-hatch trigger in production. Over a 24 h soak none did (D10) |
 | Widening the index slot to carry `seq` | a need to arbitrate replay order without the class merge. Would cost 8 B/entry, a 40% memory increase (D38) |
 | Revisiting `std.Io` as the concurrency layer | a Zig release where the io_uring backend implements networking. Would be a large rewrite of the event loop for no measured gain, so it needs a reason beyond tidiness (D27) |
-| Long-polling instead of SSE for the live view | only if `sseprobe.py` fails against the real Cloudflare zone after the D31 configuration is applied |
+| Long-polling instead of SSE for the live view | **no longer speculative.** The default edge behaviour is now measured and it buffers SSE in ~8 KB batches (D68), so this is built as the second implementation behind M4's transport seam and enabled if `sseprobe.py` cannot be made to pass against the real zone after the D31 configuration is applied |
+| A maintenance-time index sweep reclaiming a deleted account's entries early | disk pressure from deleted accounts becoming measurable. The bytes are already unreachable and already scheduled for removal within the plan's maximum lifetime, so this buys earlier reclamation only — at the cost of new code on the thread M1's fourth exit condition depends on (D77) |
 | One ring per core via `SO_REUSEPORT` | measured single-ring throughput becoming a constraint. At 2.9M req/s on one thread this is far off (D27) |
 | Chunked request bodies | a real caller unable to send `Content-Length` |
 | 90-day retention | usage behaviour justifying it, **and** a proven restore drill (D16). Retention is a config value, not a code change |

@@ -31,6 +31,7 @@ anywhere durable.
 | **M1 findings** | D32–D39 | what building the storage engine forced, four of which corrected the specification |
 | **M2 decisions** | D40–D51 | settled before any data-plane code, per the two-pass rule below |
 | **M2 findings** | D52–D67 | what building the data plane forced, each settled in its own pass before the code it governs |
+| **M3 decisions** | D68–D78 | settled before any control-plane code. D68 and D69 are measurements taken while M2's edge slice was stood up; the rest settle where M3's state lives, which thread it runs on, and what the log format permits |
 
 Earlier decisions carry **amendments pointing forward** rather than being silently
 rewritten — D11, D18, D20 and D38 each gained one during M2's decision pass, and D28

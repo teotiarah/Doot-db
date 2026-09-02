@@ -207,6 +207,23 @@ Origin CA certificate and a reachable box. The code can be written and tested wi
 the verification cannot, and D31's entire point is that unverified is the failure mode. So
 the edge work gates on that infrastructure being real, and everything above it does not.
 
+**The verification run is rescheduled to the end of M5 (D68).** The zone exists and
+`doot.run` is live, but no reachable origin does — so the probe was run through a tunnel
+against a synthetic origin instead, which answered the buffering question and cannot answer
+the production-shape one. What it found:
+
+| stream | result |
+|---|---|
+| local, no proxy — the control | **PASS.** Clean 250 ms inter-event gaps |
+| through the edge at ~160 B/s | headers in 189 ms, then **zero body frames in 90 s** |
+| through the edge at ~200 KB/s | **eight events all at +945 ms**, one ~8 KB chunk |
+
+So the edge buffers by byte threshold, not by timer, and at Doot's real event rate the live
+view would lag by minutes to hours without the D31 Configuration Rule. A tunnel cannot
+exercise `Full (strict)`, Authenticated Origin Pulls or the origin firewall — with a tunnel
+none of the three exist — so this is recorded as a partial result rather than the condition
+met.
+
 **Exit:** every row of the error table reproducible by a `curl` invocation, held in a
 script that runs in CI. Credits and rate limits verified to be exact under concurrent
 load, not approximately right. **And the SSE probe passes through Cloudflare** — if it
@@ -219,7 +236,7 @@ decided here, not during M4.
 |---|---|
 | every error row reproducible by `curl` in CI | **met — all 25 codes.** D65 settled how each of the last five is reached; `invalid_content_type` is the twenty-fifth, added by D64 |
 | credits and rate limits exact under concurrent load | **met.** Exact partitions under real concurrency, with the rate limit asserted against a stopped clock so no token can refill mid-burst (D66) |
-| SSE probe passes through Cloudflare | **not met, and not yet possible.** Needs the live zone |
+| SSE probe passes through Cloudflare | **not met. Rescheduled to the end of M5 (D68)**, where the deployed box and the zone both exist. The buffering question itself is no longer open: measured through a real edge, Cloudflare withholds `text/event-stream` and flushes it in ~8 KB batches, so D31's fix is load-bearing rather than precautionary |
 
 The first two are closed by `tools/exactness-check.sh` (28 checks) plus strengthened
 assertions in the two existing scripts, and cost more than expected: reaching them turned up
@@ -247,7 +264,31 @@ request can provoke one. A row whose cause is a bug cannot have a script that ca
 
 ---
 
-## M3 — Accounts
+## M3 — Accounts · **IN PROGRESS**
+
+This is where D63's one recorded open question gets answered: **how the first account comes
+into being.** Signup does it, and nothing else needs to.
+
+### Pass 1 — decisions · **COMPLETE**
+
+D68–D78 in `07-decisions.md`, with an amendment on D58. Nothing about the control plane is
+left for an implementation diff to decide. Two came from measurement rather than reading:
+
+| decision | what it settled |
+|---|---|
+| **D68** | the Cloudflare SSE verification moves to the end of M5, and M4's gate becomes a transport seam with two implementations instead of a wait. Backed by a measurement: the edge buffers SSE in ~8 KB batches |
+| **D69** | `std.http.Client` does work on the pinned toolchain, over `std.Io.Threaded`. D27 rejected that `Io` for the *server*, and the mechanism it rejected is absent on an outbound client — so the architecture's stdlib-only outbound story stands |
+| D70 | where each of M3's seven kinds of state lives, and the permanent event numbers 5–12. Sessions resolve *opposite* to credits: a crash may only ever shorten a credential |
+| D71 | Argon2id parameters, chosen by the memory budget rather than the timing target, and the rule that password hashing runs on the I/O worker pool and never on the loop |
+| D72 | an email address has a delivery form and an anchor form, and normalising the wrong one misdelivers mail |
+| D73 | the control plane lives in the service layer behind one `Handler`; surface separation is enforced by the credential check and asserted by tests, not by a module boundary |
+| D74 | control-plane rate limiting, including the per-address bucket — and the fact that it depends on an origin firewall that does not exist yet, so a global ceiling carries the surface until it does |
+| D75 | enumeration resistance needs equalised *work*, not just equal responses: an unknown address pays a full Argon2id verification against a generated dummy hash |
+| D76 | API key plaintext generation, by rejection sampling, and the single moment the plaintext exists |
+| **D77** | account deletion cannot delete entries eagerly, because the index holds no names (D11). Deletion makes data permanently inaccessible at once and the bytes go with their expiry — which only works because lifetime is mandatory |
+| D78 | M3's five environment variables, all required and none defaulted, and the mail queue thread two of them configure |
+
+### Pass 2 — implementation
 
 - GitHub OAuth with `state` binding
 - Email + password, Argon2id, OTP verification, queued outbound mail via ZeptoMail
@@ -258,7 +299,8 @@ request can provoke one. A row whose cause is a bug cannot have a script that ca
 - Separate control-plane rate-limit bucket
 
 **Exit:** both signup paths reach an issued API key. Revocation takes effect on the next
-request. Enumeration probes on signup, login and reset return identical responses.
+request. Enumeration probes on signup, login and reset return identical responses — and the
+timing of those three is asserted, not only their bodies (D75).
 
 ---
 
@@ -266,9 +308,16 @@ request. Enumeration probes on signup, login and reset return identical response
 
 The adoption driver. Plain HTML/CSS/JS, `@embedFile`d.
 
-**Gate: the SSE probe must already pass through the real Cloudflare zone (M2, D31).**
-Building the live view before that is confirmed risks discovering at the end of the
-most user-visible milestone that the transport does not work.
+**Gate, restated by D68: the live view is written against a transport seam with two
+implementations behind it — SSE and long-polling on the same path — and both are built and
+tested locally.** The original gate was the probe passing through the real zone, which has
+moved to the end of M5; waiting for it would have put M4 after M5, and dropping it would have
+reintroduced exactly the risk D31 named. A seam protects against that risk by making the
+choice reversible at configuration time instead of by waiting.
+
+This is no longer a hedge against something unlikely. The edge's *default* behaviour is
+measured and it breaks SSE (D68), so the fallback sits on the likely branch until the
+Configuration Rule is applied and verified.
 
 - Signup and login
 - **First-run screen: the API key beside a paste-ready `curl` command.** This screen is
@@ -298,6 +347,18 @@ best-effort promise is unbacked.
 - `/admin/stats`, structured JSON logs with no bodies, names, keys or codes
 - `systemd` unit, boot-time secret validation
 - Threshold alerting on index utilisation, disk, backup lag, recovery time
+
+**And M2's last exit condition is closed here (D68): `ops/sseprobe.py` run against
+`doot.run` through the real Cloudflare zone until it exits zero.** It lands in M5 because
+this is the milestone that produces a deployed, publicly reachable origin — which is the one
+thing the probe needs and the one thing M2 could not supply. The D31 zone configuration is
+applied as code first, and if the probe still cannot be made to pass, M4's transport seam
+switches to long-polling and that is the decision taken rather than discovered.
+
+The Cloudflare-facing half of `05-architecture.md` is verified in the same pass, because a
+tunnel could not: `Full (strict)`, Authenticated Origin Pulls, and the firewall restricted to
+Cloudflare ranges. D74's per-address rate limit is only trustworthy once those three exist,
+so this is where it stops depending on a header an attacker could set.
 
 **Exit:** a full restore from R2 onto a clean machine, entry-for-entry verified, timed and
 written down. Recovery point measured against the claim published in `01-product.md`.

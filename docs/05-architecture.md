@@ -251,6 +251,20 @@ and all at once.
 Two, both plain HTTPS via `std.http.Client` with `std.crypto.tls` — stdlib only, no
 dependency.
 
+**This works on the pinned toolchain, and it was worth checking** (D69). On 0.16.0
+`std.http.Client` is written entirely against `std.Io` — the surface D26 and D27 found
+unusable — so the architecture's outbound story looked like it might not compile at all.
+Measured: with `std.Io.Threaded` supplying the `Io`, a GET to `api.github.com` completed
+TLS 1.3, validated the chain against the system bundle and returned a real response, and a
+POST with a JSON payload did the same.
+
+D27's rejection of `std.Io.Threaded` was specific to the **event loop**: every idle
+keep-alive connection owns a pool thread, so a server wedges at `async_limit`. That needs
+thousands of parked connections. An outbound client makes a handful of short-lived requests
+from one background thread and never parks anything, so the mechanism is absent. The process
+therefore carries two `Io` implementations for two shapes of work — stated plainly, because
+it is the kind of thing that looks like drift later.
+
 | target | purpose |
 |---|---|
 | ZeptoMail REST API | OTP codes, credit-threshold notifications |
@@ -260,6 +274,18 @@ dependency.
 Outbound calls never block a request: OTP sends are queued to a background worker, and
 the request returns as soon as the code is persisted. Retries with backoff, bounded
 queue, failures logged and counted.
+
+**Mail is its own thread, not maintenance's** (D78). Maintenance blocks on local disk for a
+bounded time; mail blocks on a third party for an unbounded one, and sharing a thread would
+let a slow provider stop expiry sweeps and snapshots — which by D63 means D38's recovery
+bound stops holding. A full queue fails the *enqueue*, surfacing as a `503` on the signup
+request rather than an unbounded backlog, and a dropped message degrades to the resend
+`06-auth.md` already budgets. Signals stay blocked on this thread for D63's reason: a thread
+mid-TLS-handshake is no better a place to take a `SIGTERM` than a thread mid-`fsync`.
+
+**GitHub's token exchange is not queued.** The user is waiting on the redirect and there is
+no outcome to deliver later, so it runs on an I/O worker with a request timeout — which turns
+a hung third party into an error page instead of a stuck connection.
 
 SigV4 signing for R2 is HMAC-SHA256 — `std.crypto` covers it.
 
@@ -277,6 +303,7 @@ DOOT_R2_ACCESS_KEY_ID       DOOT_R2_SECRET_ACCESS_KEY
 DOOT_GITHUB_CLIENT_ID       DOOT_GITHUB_CLIENT_SECRET
 DOOT_ZEPTOMAIL_TOKEN        DOOT_SUPPORT_EMAIL
 DOOT_HMAC_SECRET            DOOT_ADMIN_TOKEN
+DOOT_PUBLIC_ORIGIN
 ```
 
 The binary refuses to start if a secret it uses is missing or a path is unwritable. Failing
@@ -289,7 +316,17 @@ and a variable becomes required in the milestone that gains the code reading it 
 the binary would refuse to start over R2, GitHub and mail credentials for subsystems that do
 not exist yet, which is failing loudly about the wrong thing. As of M2 the required set is
 `DOOT_LISTEN_ADDR`, `DOOT_DATA_DIR`, `DOOT_MAX_INDEX_BYTES` and `DOOT_HMAC_SECRET`; the
-storage-shape variables keep the defaults `04-storage.md` documents. Nothing is defaulted
+storage-shape variables keep the defaults `04-storage.md` documents.
+
+**M3 adds five, all required and none defaulted** (D78): `DOOT_PUBLIC_ORIGIN`,
+`DOOT_GITHUB_CLIENT_ID`, `DOOT_GITHUB_CLIENT_SECRET`, `DOOT_ZEPTOMAIL_TOKEN` and
+`DOOT_SUPPORT_EMAIL`. There is no switch to disable one signup path: `06-auth.md` specifies
+two that both land in the same place, and a half-configured control plane is a product with
+one broken button. `DOOT_PUBLIC_ORIGIN` is validated at boot as an absolute `https://` origin
+with no path, because an OAuth `redirect_uri` that does not match the one registered with
+GitHub otherwise fails at the moment a real user first tries to sign up. `DOOT_SUPPORT_EMAIL`
+is not defaulted for a sharper reason than most: it is published to users in `402` bodies, so
+a default would be a real address in our source receiving other deployments' mail. Nothing is defaulted
 where a default would be a hazard: `DOOT_HMAC_SECRET` signs pagination cursors (D46), and a
 fallback value would be a signing secret no operator ever sets and anyone can read in our
 source.
