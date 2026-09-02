@@ -190,6 +190,25 @@ credit balance exactly, a `SIGKILL` restart rewinds it to the last checkpoint �
 D41's accepted crash shape, and the contrast is what shows the shutdown path is load-bearing
 rather than decorative.
 
+### Pass 2 — the live feed · **COMPLETE**
+
+Decisions D84–D87, with amendments on D68, D86 and D87 — two of which corrected a shape that
+could not have worked. Built:
+
+- a third `Disposition`, a parked connection state, and a head with no `Content-Length`; the
+  request slot goes back to the pool as soon as that head is written, because a 260 KiB slot per
+  viewer would turn D28's fixed ceiling into a per-viewer slope (D84)
+- a 100 ms feed timer armed **only while someone is subscribed**, so a deployment with no
+  dashboard open pays nothing
+- frames as change notifications rather than changes, which is what keeps disk off the loop
+  entirely (D85)
+- subscribers costing **no additional memory**: a parked stream builds frames in the idle read
+  buffer it was never going to read into (D86)
+- both framings on one path, chosen by `Accept`, with the fallback stateless and immediate (D87)
+
+Verified by 132 transport tests and 21 `curl` checks, including `ops/sseprobe.py` — the artifact
+D31 named — run against the real endpoint over loopback.
+
 ### Pass 2 — the edge
 
 This is the first milestone with something deployable, so it is where the edge gets stood
@@ -236,7 +255,7 @@ decided here, not during M4.
 |---|---|
 | every error row reproducible by `curl` in CI | **met — all 25 codes.** D65 settled how each of the last five is reached; `invalid_content_type` is the twenty-fifth, added by D64 |
 | credits and rate limits exact under concurrent load | **met.** Exact partitions under real concurrency, with the rate limit asserted against a stopped clock so no token can refill mid-burst (D66) |
-| SSE probe passes through Cloudflare | **not met. Rescheduled to the end of M5 (D68)**, where the deployed box and the zone both exist. The buffering question itself is no longer open: measured through a real edge, Cloudflare withholds `text/event-stream` and flushes it in ~8 KB batches, so D31's fix is load-bearing rather than precautionary |
+| SSE probe passes through Cloudflare | **the endpoint is built and passes the probe locally** — `ops/sseprobe.py` judges it streaming at a 269 ms mean gap against a 250 ms emit interval. The run *through the zone* is **rescheduled to the end of M5 (D68)**, where the deployed box and the zone both exist. The buffering question itself is no longer open: measured through a real edge, Cloudflare withholds `text/event-stream` and flushes it in ~8 KB batches, so D31's fix is load-bearing rather than precautionary |
 
 The first two are closed by `tools/exactness-check.sh` (28 checks) plus strengthened
 assertions in the two existing scripts, and cost more than expected: reaching them turned up

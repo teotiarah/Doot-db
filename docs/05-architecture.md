@@ -211,8 +211,12 @@ framework, no bundler, no build step, no separate deployment.
 - Assets embedded at compile time with `@embedFile`, served from memory with strong
   `ETag`s derived from the build hash. The binary is genuinely self-contained.
 - Session cookie authentication, `HttpOnly; Secure; SameSite=Lax`.
-- **Live view over SSE** on the control plane, filtered to the session's account from
-  the change feed ring (`04-storage.md`).
+- **Live view on the control plane**, filtered to the session's account from the change feed
+  ring (`04-storage.md`). Two framings on one path, chosen by the client's `Accept` header
+  (D87): SSE, or an immediate JSON batch for a client whose network path buffers streams.
+  A parked stream costs **no additional memory** — it builds frames in the idle read buffer its
+  connection already has and gives its 260 KiB request slot back as soon as the head is written
+  (D84, D86).
 - Rendering keys off the stored `Content-Type`: JSON as a collapsible tree, text as
   text, anything else as a hex/size summary. The server never parses bodies.
 

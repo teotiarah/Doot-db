@@ -124,6 +124,60 @@ pub const EmailIndex = struct {
     }
 };
 
+/// One connection parked on the live feed (D84, D86, D87).
+///
+/// Carries no buffer of its own: frames are built in the connection's idle read buffer, which a
+/// parked stream is never going to read into (D86). What lives here is the *meaning* — whose
+/// events these are, and where in the ring the subscriber has got to.
+pub const Subscriber = struct {
+    in_use: bool = false,
+    /// Whose events. The filter is the whole of the isolation requirement here, and it happens
+    /// on the loop where the session's account is already known.
+    account_id: u32 = 0,
+    /// Position in the ring. This *is* the queue, which is why no queue is needed (D86).
+    cursor: storage.feed.Cursor = .{},
+    /// When the next heartbeat is due.
+    due_s: u32 = 0,
+    /// Set once `Feed.poll` reports the subscriber was lapped, so the next frame says so.
+    resync: bool = false,
+};
+
+/// A fixed table of parked streams.
+///
+/// Fixed because this is the one surface held open by definition, so a structure that grew per
+/// subscriber would make a connection spike an out-of-memory risk (D86). At 1,024 entries of a
+/// few dozen bytes it is tens of kilobytes, and the frame buffers cost nothing at all.
+pub const Subscribers = struct {
+    slots: [server.config.max_subscribers]Subscriber = @splat(.{}),
+    live: u32 = 0,
+    peak: u32 = 0,
+
+    pub fn acquire(self: *Subscribers) ?u64 {
+        for (&self.slots, 0..) |*s, i| {
+            if (s.in_use) continue;
+            s.* = .{ .in_use = true };
+            self.live += 1;
+            if (self.live > self.peak) self.peak = self.live;
+            return @intCast(i);
+        }
+        return null;
+    }
+
+    pub fn at(self: *Subscribers, token: u64) ?*Subscriber {
+        if (token >= self.slots.len) return null;
+        const s = &self.slots[@intCast(token)];
+        return if (s.in_use) s else null;
+    }
+
+    pub fn release(self: *Subscribers, token: u64) void {
+        if (token >= self.slots.len) return;
+        const s = &self.slots[@intCast(token)];
+        if (!s.in_use) return;
+        s.* = .{};
+        if (self.live > 0) self.live -= 1;
+    }
+};
+
 /// Everything the control plane needs that the data plane does not.
 ///
 /// One struct behind one pointer on `Service`, rather than eight more `Service` fields: a
@@ -138,6 +192,15 @@ pub const State = struct {
     emails: *EmailIndex,
     /// Guards `emails`, which the loop reads and a worker writes after a signup completes.
     emails_mutex: storage.os.Mutex = .{},
+
+    /// Parked live-feed connections (D86).
+    ///
+    /// **No mutex, deliberately.** Every access happens on the event loop: subscribing is part
+    /// of `respond`, framing is the `Stream` seam the loop calls on its feed timer, and
+    /// releasing is `closeConn`. A lock here would be a lock protecting a single thread from
+    /// itself — and adding one would invite a future caller to touch this from a worker, which
+    /// is exactly what must not happen, because framing may not touch a disk (D85).
+    subscribers: *Subscribers,
 
     pub fn lookupAccount(self: *State, anchor: [32]u8) ?u32 {
         self.emails_mutex.lock();

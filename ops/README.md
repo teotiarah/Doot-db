@@ -17,10 +17,14 @@ would indicate buffering, and exits non-zero when buffered.
 python3 ops/sseprobe.py https://doot.run/app/stream --expect-interval 250
 ```
 
-**This must pass against the real zone before M4 builds the live view on the assumption
-that streaming works.** It is part of M2's exit condition. If it cannot be made to pass
-after the D31 configuration is applied, the live view falls back to long-polling — and that
-call gets made at M2, not discovered at the end of the most user-visible milestone.
+**It already passes against the origin over loopback**, which is what proves our side is
+correct: `tools/app-check.sh` runs exactly this probe against `GET /app/stream` on every push,
+and CI would go red if the endpoint ever stopped streaming.
+
+What remains is the run **through the real zone**, which needs a publicly reachable origin and
+is scheduled with M5's deployment work (D68). The fallback is no longer a decision that waits on
+it: both framings ship on one path and the client chooses (D87), so a buffering intermediary
+costs the users behind it latency rather than costing everyone the feature.
 
 ## Arriving in M2
 

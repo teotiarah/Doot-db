@@ -109,12 +109,11 @@ pub const AppRoute = union(enum) {
     entries,
     entry: []const u8,
 
-    // `GET /app/stream` is deliberately **absent** until the live feed exists.
-    //
-    // D68 keeps the SSE endpoint and its long-polling alternative in M2's scope, behind one
-    // transport seam. A route that answers nothing useful is worse than no route: it tells a
-    // client the feature is there and then fails in a way no error code describes honestly.
-    // Until the seam lands, `/app/stream` is `unrouted` like any other unknown path.
+    /// `GET /app/stream` — the live feed.
+    ///
+    /// One path, two framings, chosen by the `Accept` header (D87): `text/event-stream` gets
+    /// SSE, anything else gets one JSON batch when events arrive or the wait expires.
+    stream,
 
     wrong_method: []const u8,
     unrouted,
@@ -159,6 +158,7 @@ pub fn needsSynchroniser(r: AppRoute) bool {
         .keys,
         .entries,
         .entry,
+        .stream,
         .wrong_method,
         .unrouted,
         => false,
@@ -222,6 +222,9 @@ pub fn routeApp(method: Method, path: []const u8) AppRoute {
             .delete => .{ .key_revoke = id },
             else => .{ .wrong_method = "DELETE" },
         };
+    }
+    if (std.mem.eql(u8, path, "/app/stream")) {
+        return if (method == .get) .stream else .{ .wrong_method = "GET" };
     }
     if (std.mem.eql(u8, path, "/app/entries")) {
         return if (method == .get) .entries else .{ .wrong_method = "GET" };
@@ -379,6 +382,7 @@ test "every route in 06-auth.md's control-plane table exists" {
     try testing.expectEqual(AppRoute.keys, routeApp(.get, "/app/keys"));
     try testing.expectEqual(AppRoute.keys_create, routeApp(.post, "/app/keys"));
     try testing.expectEqualStrings("key_0000003", routeApp(.delete, "/app/keys/key_0000003").key_revoke);
+    try testing.expectEqual(AppRoute.stream, routeApp(.get, "/app/stream"));
     try testing.expectEqual(AppRoute.entries, routeApp(.get, "/app/entries"));
     try testing.expectEqualStrings("ci/last-green", routeApp(.get, "/app/entries/ci/last-green").entry);
 }
@@ -437,6 +441,7 @@ test "every Allow the control plane advertises is a method that routes" {
         .{ "/app/keys/key_1", "DELETE" },
         .{ "/app/entries", "GET" },
         .{ "/app/entries/a", "GET" },
+        .{ "/app/stream", "GET" },
     }) |case| {
         var it = std.mem.splitSequence(u8, case[1], ", ");
         while (it.next()) |m| {
@@ -458,8 +463,6 @@ test "unknown control-plane paths are unrouted" {
         "/app/keys/",
         "/app/entriesx",
         "/app/streamx",
-        // Absent until the live feed exists (D68).
-        "/app/stream",
         "/app/account/extra",
     }) |path| {
         try testing.expectEqual(AppRoute.unrouted, routeApp(.get, path));
