@@ -753,6 +753,33 @@ pub const Control = struct {
         return account_id;
     }
 
+    /// Visits every account, so a caller can build an index this module cannot.
+    ///
+    /// Login has to find an account from an email address, and the normalisation that makes
+    /// that work — lowercasing, plus-stripping, the Gmail fold (D72) — lives in `api`, which
+    /// `control` does not and must not import. So the index is **derived state owned by the
+    /// layer that can compute it**: the service builds it at boot from this iteration and
+    /// maintains it on signup.
+    ///
+    /// Deriving it rather than logging it is what keeps the log unchanged. The alternative
+    /// was widening `account_created` with a 32-byte anchor and bumping its version — a
+    /// permanent wire change to serve an index that costs one pass over an in-RAM map at
+    /// startup, which D40 already establishes is single-digit megabytes at ten thousand
+    /// accounts.
+    ///
+    /// The callback runs **with the mutex held**, so it must not call back into `Control`.
+    /// It is given a copy rather than a pointer for the same reason.
+    pub fn forEachAccount(
+        self: *Control,
+        ctx: anytype,
+        comptime visit: fn (@TypeOf(ctx), Account) void,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.accounts.valueIterator();
+        while (it.next()) |a| visit(ctx, a.*);
+    }
+
     /// Who holds an anchor, without claiming it.
     pub fn anchorOwner(self: *Control, kind: AnchorKind, hash: [32]u8) ?u32 {
         self.mutex.lock();
@@ -2668,4 +2695,63 @@ test "session ids keep ascending across a reopen" {
         defer c.close();
         try testing.expect((try c.createSession(id, "two")) > first);
     }
+}
+
+
+test "every account can be visited, so a caller can derive an index" {
+    // Login needs email -> account, and the normalisation that makes it work lives in `api`,
+    // which `control` must not import. So the index is derived by the layer that can compute
+    // it, from this iteration -- which is what keeps the log format unchanged.
+    var h = try H.init(82);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const a = try c.createAccount("a@b.co", .trial, .active, 10);
+    const b = try c.createAccount("b@b.co", .trial, .pending_verification, 0);
+    _ = try c.createAccount("c@b.co", .paid, .active, 0);
+
+    const Seen = struct {
+        n: usize = 0,
+        found_a: bool = false,
+        found_pending: bool = false,
+        fn visit(s: *@This(), acct: Account) void {
+            s.n += 1;
+            if (std.mem.eql(u8, acct.email, "a@b.co")) s.found_a = true;
+            if (acct.state == .pending_verification) s.found_pending = true;
+        }
+    };
+    var seen: Seen = .{};
+    c.forEachAccount(&seen, Seen.visit);
+
+    try testing.expectEqual(@as(usize, 3), seen.n);
+    try testing.expect(seen.found_a);
+    // Pending accounts are visited too: a signup for an address that already has an
+    // unverified account must be recognised, or the second attempt would create a duplicate.
+    try testing.expect(seen.found_pending);
+    _ = a;
+    _ = b;
+}
+
+test "a deleted account is not visited" {
+    var h = try H.init(83);
+    defer h.deinit();
+    const c = try h.reopen();
+    defer c.close();
+
+    const id = try c.createAccount("gone@b.co", .trial, .active, 10);
+    _ = try c.createAccount("here@b.co", .trial, .active, 10);
+    _ = try c.deleteAccount(id);
+
+    const Counter = struct {
+        n: usize = 0,
+        fn visit(s: *@This(), _: Account) void {
+            s.n += 1;
+        }
+    };
+    var counter: Counter = .{};
+    c.forEachAccount(&counter, Counter.visit);
+    // Deletion removes the account outright, so an index rebuilt from this cannot resurrect
+    // a login for it (D77).
+    try testing.expectEqual(@as(usize, 1), counter.n);
 }
