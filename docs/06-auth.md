@@ -224,13 +224,29 @@ Not public API, not versioned, may change freely.
 | `POST /app/auth/password/reset` | request reset OTP |
 | `POST /app/auth/password/confirm` | complete reset |
 | `GET /app/account` | account state, credits, plan |
+| `DELETE /app/account` | self-service deletion (see Account deletion below) |
 | `GET /app/keys` · `POST /app/keys` · `DELETE /app/keys/{id}` | key management |
 | `GET /app/entries` · `GET /app/entries/{name}` | read-only explorer |
 | `GET /app/stream` | SSE live feed |
 
+`DELETE /app/account` was missing from this table until M3 built it. The Account deletion
+section below specified the flow in full and no endpoint reached it, which is a gap in the
+specification rather than a decision — a flow with no route cannot be exercised.
+
 **The explorer is strictly read-only.** No create, no edit, no delete. This is a product
 boundary (`00-vision.md`): a second write path would need its own validation, billing,
 idempotency and audit story, and would diverge from `/v1` over time.
+
+Because it is a boundary rather than an omission, the explorer answers a write attempt with
+**`405` and an `Allow: GET`**, not `404`. "No such thing" would read as a bug to anyone
+building against it; "that method is not allowed here" is the truth.
+
+**Which routes the synchroniser token covers** is a property of the route, not of the
+method, so that no handler decides it for itself: `logout`, `DELETE /app/account`,
+`POST /app/keys`, `DELETE /app/keys/{id}`, `verify` and `password/confirm`. Signup, login,
+the OAuth entry point and reset-request are deliberately **not** covered — a caller with no
+session has no token to send, so requiring one would make the first request impossible.
+Those are covered by the per-address limiter instead (D74).
 
 Accepted consequence: a user who writes a secret into an entry by accident must delete
 it via the API, or ask support. The alternative is a permanent second write path, which
