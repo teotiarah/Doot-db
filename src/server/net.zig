@@ -83,7 +83,60 @@ pub const Address = union(enum) {
             .in6 => |*v6| @ptrCast(v6),
         };
     }
+
+    /// The bytes that identify a *client*, for rate-limiting purposes (D74).
+    ///
+    /// Written into `out`, which must be at least `client_key_bytes`. The result is the
+    /// address family followed by the raw address, and is not human-readable — nothing
+    /// needs it to be, because its only use is as a hash input.
+    ///
+    /// **The port is deliberately excluded.** A client's source port differs on every
+    /// connection, so including it would give every connection a bucket of its own and
+    /// the per-address limit would not exist at all. That is the kind of mistake that
+    /// looks like working code, so it is stated here and asserted in a test.
+    pub fn clientKey(a: Address, out: []u8) []const u8 {
+        std.debug.assert(out.len >= client_key_bytes);
+        out[0] = switch (a) {
+            .in => 4,
+            .in6 => 6,
+        };
+        return switch (a) {
+            .in => |v4| blk: {
+                const bytes = std.mem.asBytes(&v4.addr);
+                @memcpy(out[1..][0..bytes.len], bytes);
+                break :blk out[0 .. 1 + bytes.len];
+            },
+            .in6 => |v6| blk: {
+                @memcpy(out[1..][0..16], &v6.addr);
+                break :blk out[0..17];
+            },
+        };
+    }
 };
+
+/// Longest `clientKey` output: a family byte plus a 16-byte IPv6 address.
+pub const client_key_bytes: usize = 17;
+
+/// The address at the far end of an accepted socket.
+///
+/// Read on demand rather than captured at accept, and D74's amendment explains why:
+/// `accept_multishot` has nowhere to return one, so it would cost a syscall on every
+/// connection and bytes in the `Conn` slab whose size D28 publishes — to serve a fallback
+/// that the production shape never reaches, because behind Cloudflare the client address
+/// arrives in a header.
+pub fn peerName(fd: Fd) Error!Address {
+    // Sized for the larger of the two, then discriminated on what the kernel filled in.
+    var raw: linux.sockaddr.in6 = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in6);
+    const rc = linux.getpeername(fd, @ptrCast(&raw), &len);
+    if (failed(rc)) return toError(rc);
+
+    return switch (raw.family) {
+        linux.AF.INET => .{ .in = @as(*const linux.sockaddr.in, @ptrCast(&raw)).* },
+        linux.AF.INET6 => .{ .in6 = raw },
+        else => error.AddressFamilyNotSupported,
+    };
+}
 
 /// Parses `host:port`, accepting IPv4 (`0.0.0.0:8080`) and bracketed IPv6
 /// (`[::]:8080`, `[::1]:8080`).
@@ -279,4 +332,85 @@ test "an IPv6 listener binds on its own family" {
     };
     defer storage.os.close(fd);
     try testing.expect(try boundPort(fd) != 0);
+}
+
+
+test "a client key excludes the port, which is the whole point of it" {
+    // A client's source port differs on every connection. A key that included it would give
+    // every connection a bucket of its own and the per-address rate limit would not exist —
+    // a mistake that looks exactly like working code, so it is asserted rather than trusted.
+    const a = try parseAddress("203.0.113.7:1024");
+    const b = try parseAddress("203.0.113.7:52345");
+
+    var ka: [client_key_bytes]u8 = undefined;
+    var kb: [client_key_bytes]u8 = undefined;
+    try testing.expectEqualSlices(u8, a.clientKey(&ka), b.clientKey(&kb));
+
+    // And a different address is a different client.
+    const c = try parseAddress("203.0.113.8:1024");
+    var kc: [client_key_bytes]u8 = undefined;
+    try testing.expect(!std.mem.eql(u8, a.clientKey(&ka), c.clientKey(&kc)));
+}
+
+test "the two address families cannot collide in a client key" {
+    // The family byte leads, so an IPv4 address can never produce the same bytes as an
+    // IPv6 one — including the v4-mapped forms, which share the trailing four octets.
+    const v4 = try parseAddress("127.0.0.1:80");
+    const v6 = parseAddress("[::ffff:127.0.0.1]:80") catch return;
+
+    var k4: [client_key_bytes]u8 = undefined;
+    var k6: [client_key_bytes]u8 = undefined;
+    const s4 = v4.clientKey(&k4);
+    const s6 = v6.clientKey(&k6);
+    try testing.expect(!std.mem.eql(u8, s4, s6));
+    try testing.expectEqual(@as(u8, 4), s4[0]);
+    try testing.expectEqual(@as(u8, 6), s6[0]);
+    try testing.expectEqual(@as(usize, 5), s4.len);
+    try testing.expectEqual(@as(usize, 17), s6.len);
+}
+
+test "the peer of a connected socket is readable, and names the other end" {
+    // The lazy read D74's amendment chose. Exercised against a real accepted socket rather
+    // than asserted, because `getpeername` on the wrong descriptor is the kind of mistake a
+    // unit test with a fake would not catch.
+    //
+    // `connect` and `accept` are done with raw syscalls here: this module deliberately holds
+    // only the setup path, because once a descriptor exists every read and write on it goes
+    // through io_uring instead.
+    const listen_fd = try listen(try parseAddress("127.0.0.1:0"), 8);
+    defer storage.os.close(listen_fd);
+    const port = try boundPort(listen_fd);
+
+    var buf: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{port});
+    const target = try parseAddress(text);
+
+    const client: Fd = @intCast(linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0));
+    try testing.expect(client >= 0);
+    defer storage.os.close(client);
+    try testing.expect(!failed(linux.connect(client, target.sockaddr(), target.sockLen())));
+
+    const accepted: Fd = @intCast(linux.accept4(listen_fd, null, null, 0));
+    try testing.expect(accepted >= 0);
+    defer storage.os.close(accepted);
+
+    const peer = try peerName(accepted);
+    try testing.expectEqual(linux.AF.INET, peer.family());
+    // The peer of the accepted socket is the client's ephemeral port, not the listener's.
+    try testing.expect(peer.port() != port);
+    try testing.expect(peer.port() != 0);
+
+    // And its client key matches the loopback address the connection came from.
+    var k: [client_key_bytes]u8 = undefined;
+    var expect_k: [client_key_bytes]u8 = undefined;
+    const loopback = try parseAddress("127.0.0.1:0");
+    try testing.expectEqualSlices(u8, loopback.clientKey(&expect_k), peer.clientKey(&k));
+}
+
+test "asking for the peer of something that is not a connected socket fails cleanly" {
+    // A handler treats this as "no address" rather than as an error, so the failure has to
+    // be an ordinary one and not a panic.
+    const listen_fd = try listen(try parseAddress("127.0.0.1:0"), 8);
+    defer storage.os.close(listen_fd);
+    try testing.expectError(error.Unexpected, peerName(listen_fd));
 }

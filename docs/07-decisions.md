@@ -2911,6 +2911,32 @@ dashboard use cannot starve a production script.
 **Accepted consequence: before AOP exists, an attacker varying `CF-Connecting-IP` sees only
 the global ceiling.** Named, bounded, and it expires when M5 completes.
 
+**M3 amendment — the socket peer is read lazily, not captured at accept.** The rule above
+says the peer address is used when the header is absent, and the obvious implementation is to
+record it as each connection is accepted. Two things make that the wrong shape.
+
+`accept_multishot` does not hand back a peer address — the multishot form has nowhere to put
+one — so the address has to come from a `getpeername` call regardless. Doing that on the
+accept path would add a syscall to every connection and about seventeen bytes to the
+descriptor-indexed `Conn` slab, whose size D28 publishes as a measured figure. Paying both on
+every connection, forever, to serve a fallback is the wrong trade.
+
+And the fallback is genuinely rare. In the production shape the request arrives through
+Cloudflare, so `CF-Connecting-IP` is always present; the peer is consulted only when
+something reached the origin directly, which the firewall is meant to make impossible. Even
+without the firewall it is bounded by the global ceiling at 600/min.
+
+So `Incoming` carries the socket and exposes `peer()`, which performs the `getpeername` at
+the moment a handler asks. **Cost is zero unless it is called**, nothing is added to `Conn`,
+and D28's memory figures stand unchanged. The service still performs no socket syscalls of
+its own: it calls a method on the transport's own type, which is what the `Handler` seam is
+for (D58).
+
+**The port is excluded from the bucket identity, and that is not a detail.** A client's
+source port differs on every connection, so a key that included it would give every
+connection its own bucket and the per-address limit would not exist at all. The identity is
+the address family and the address bytes, nothing more.
+
 ---
 
 ## D75 — Enumeration resistance requires equalising work, not just responses · locked
