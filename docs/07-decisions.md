@@ -3582,6 +3582,417 @@ transport the product ships — both ship, and the client picks.
 
 ---
 
+# M4 decisions
+
+Settled before any dashboard code, per sequencing rule 2. Three of the seven exist because
+reading the built control plane as the dashboard's *first caller* found something the
+specification had not needed to answer: nothing in the tree can serve an unauthenticated byte
+(D88), nothing can tell the explorer which tags exist (D92), and the naive reading of "a key is
+issued on first landing" exhausts the five-key cap in five reloads (D91).
+
+## D88 — The dashboard is a third plane, decided by prefix before any credential · locked
+
+Nothing in the tree can serve an unauthenticated byte, and the dashboard is entirely made of
+them. Three separate mechanisms each independently prevent it:
+
+- `plane("/")` is `.data` (`router.zig`), and `Service.respond` reads `Authorization` **before**
+  it routes — so `GET /` is `401 missing_credentials`, not `404`.
+- `plane("/app")` exactly is also `.data`, for a reason D73 recorded deliberately: treating it as
+  control plane would answer it in the control plane's error shape rather than as an unknown path.
+- Everything under `/app/` demands a session cookie unless it is one of the seven `/app/auth/*`
+  routes in `respondControl`'s unauthenticated switch.
+
+A sign-in screen that requires a session in order to load is a sign-in screen nobody can reach.
+
+Resolution: **a third plane — `document` — decided by the same pure prefix function, before any
+credential, serving only comptime-embedded bytes.**
+
+`Plane` becomes `{ data, control, document }`, and `plane()` returns `.document` for a **fixed
+comptime table of exact paths** and nothing else:
+
+| path | serves |
+|---|---|
+| `/` | the landing page |
+| `/app` | the dashboard shell |
+| `/app.<digest>.css` | stylesheet |
+| `/app.<digest>.js` | script |
+| `/favicon.svg` | icon |
+| `/favicon.ico` | `404` (see D89) |
+| `/robots.txt` | crawl policy |
+
+**The unauthenticated `/app/auth/*` bucket would lock users out of their own sign-in page, and
+this is what makes it a plane rather than an exception.** D74 sets that bucket at 20 requests per
+minute per address, over a fixed 4,096-bucket table that is deliberately lossy — two addresses
+hashing together share one. A single page load is the shell plus CSS plus JS plus icon: four
+requests. Five reloads, or a handful of users behind one NAT, and the sign-in page itself begins
+answering `429`. Static bytes must not draw on a credential-guessing budget.
+
+**A fixed table of exact paths, not a directory.** No prefix match and no filename parsing, so
+path traversal is not *validated* — it is unrepresentable. It also makes the entire document
+plane enumerable in a test, which is how D89's cache and security headers get asserted per path
+rather than per handler.
+
+**Two existing assertions change, and naming them here is the point of settling this before the
+code.** Both currently encode "there is nothing at this path", which stops being true:
+
+| where | today | after |
+|---|---|---|
+| `router.zig`, "the plane is decided by prefix" | `plane("/") == .data`, `plane("/app") == .data` | both `.document` |
+| `tools/app-check.sh`, "the surface exists" | `GET /app` is **401** — it fell to the data plane, which authenticates before routing | **200**, the shell |
+
+D73 made `/app` `.data` so it would 404 like any other unknown path. It is no longer unknown.
+Neither constant is edited quietly: the router test gains the reason, and the harness check
+becomes an assertion that the shell is served *without a cookie*, which is the property D88
+exists to create. A `401` on the dashboard's own front door would be the bug.
+
+**The document plane is gated on the same `app != null` capability boundary as the control
+plane** (D73). The assets are comptime and stateless, so serving them needs no state at all —
+but a shell whose every API call answers `404` is a broken page, and the dashboard is the
+control plane's front end rather than a thing that stands on its own. So an instance built
+without control-plane state has no document plane either, and `plane()` staying a pure function
+over the path means the gate lives in `respond`, where a `.document` path on such an instance
+falls through to the data plane exactly as it does today. `tools/dataplane.zig` therefore needs
+no change, and `tools/dataplane-check.sh` keeps every assertion it has.
+
+**Unauthenticated and unmetered, which is safe here in a way it is not for `/v1`.** These are a
+few kilobytes of `.rodata` served from RAM: no store call, no lock, no allocation, no I/O worker.
+That is the same cost profile as `/healthz`, which `02-api.md` already exempts from both
+authentication and the meter. The edge caches them (D89), so a deployed origin serves them rarely,
+and volumetric abuse is the edge's job (`05-architecture.md`).
+
+Rejected: **a third bucket in `respondControl`'s unauthenticated switch.** It is the wrong bucket,
+costed above, and it also puts static bytes behind a session-cookie parse and a route table that
+exists to answer a different question.
+
+Rejected: **the shell at `/app/shell`, unauthenticated inside the control plane.** Same bucket
+problem, and it makes the product's front door an implementation detail of the API surface.
+
+Rejected: **the dashboard at `/`, landing page elsewhere.** M6 owns the landing page and M4's exit
+condition times a user *from* it, so `/` is where a stranger arrives and the app is one click in.
+Putting the app at `/` would mean moving it in M6 — the temporary scaffolding this project's
+working rules exist to refuse.
+
+Rejected: **a separate static host, or serving assets from the edge.** `05-architecture.md`
+commits to one artifact and one process. A second deployment target for four hand-written files
+reintroduces exactly what the single binary exists to avoid.
+
+---
+
+## D89 — Assets are content-addressed and immutable; the shell is never cached · locked
+
+Two questions the dashboard cannot be written without: how a deploy invalidates a cached
+stylesheet, and what a strict `Content-Security-Policy` costs inside a 2 KiB response head.
+
+Resolution: **the digest is in the filename, assets are `immutable`, and the two HTML documents
+are `no-store`.**
+
+- **One digest for every asset**: `SHA-256` over the concatenation of the embedded files, first 12
+  hex characters, computed at **comptime**. One token rather than four, because the assets change
+  exactly when the binary does.
+- `/app.<digest>.css` and `/app.<digest>.js` carry
+  `Cache-Control: public, max-age=31536000, immutable`. A deploy changes the digest, so the URL
+  changes, so nothing stale is reachable — cache invalidation with **no** revalidation round trip.
+- `/` and `/app` carry `Cache-Control: no-store` and reference the digest-bearing names. They are
+  the only documents a browser refetches, and they are small.
+- `/favicon.svg` is immutable but digest-free: it is referenced by `<link rel="icon">`, and an
+  icon one deploy behind is not worth a cache-busting URL.
+
+**No `ETag` and no `If-None-Match`, and that is a deliberate narrowing.** A revalidating cache
+needs the transport to learn conditional requests and a `304` — a response with no body, which
+today means either an incorrect `Content-Length: 0` or reusing `Reply.open_ended`, a flag that
+exists for SSE and means something else entirely. Content-addressed URLs give *better* caching
+than a cheap revalidation for none of that new surface. The Deferred table's `ETag` row concerns
+**entry** reads on `/v1`, where a content hash is not free; it is untouched.
+
+**`/favicon.ico` is in the table, answering `404`.** It is the one path a browser fetches without
+being asked, so it must answer in the document plane's shape. Left to the data plane it would be
+`401 missing_credentials` — which reads as a bug in our own product to anyone with devtools open.
+One row, and it completes the table's coverage of everything a browser requests unprompted.
+
+**Security headers, and what they cost.** Both HTML documents carry:
+
+```
+Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self';
+    connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self';
+    frame-ancestors 'none'
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+```
+
+`default-src 'none'` with every source named explicitly is what makes the policy readable: it
+lists exactly what the dashboard does and nothing else. **No `'unsafe-inline'` anywhere**, which
+is only affordable because there is no inline script and no inline style — a constraint on how
+the dashboard is *written*, recorded here so it is a rule rather than a CSP violation discovered
+later. `connect-src 'self'` covers both live-view transports including `EventSource`;
+`frame-ancestors 'none'` replaces `X-Frame-Options`.
+
+About 230 bytes of CSP. With `Content-Type`, `Cache-Control` and the three the transport always
+writes, an HTML response head is roughly 450 bytes against `max_response_head_bytes` of 2 KiB and
+`max_reply_headers` of 16 — comfortable, and `response.zig`'s existing worst-case-head test is
+extended to assert it rather than leaving it estimated.
+
+**No HSTS from the origin.** TLS terminates at the edge, so `Strict-Transport-Security` belongs in
+the zone configuration beside the rest of D31's rules, not in a response that passes through it.
+
+**Still no build step, and the digest is the thing that could have introduced one.** Hashing at
+comptime keeps `05-architecture.md`'s promise that `zig build` is the whole pipeline and
+`src/dashboard/*` are files an editor opens. If comptime hashing of embedded bytes proves
+impractical on the pinned toolchain, the recorded fallback is a digest computed once at startup
+with the paths assembled at boot — which costs the table its comptime-literal property, so it is
+confirmed in Pass 2 before anything is built on it.
+
+Rejected: **`?v=<digest>` query strings.** Some intermediaries decline to cache a URL carrying a
+query string at all, which would turn the best-cached responses into the worst.
+
+Rejected: **per-file digests.** Four values to compute and thread through two HTML documents, to
+avoid re-downloading one 3 KB file on a deploy that changed the other.
+
+Rejected: **`no-store` on everything, no digest.** Simplest, and it makes every visit
+re-download the CSS and JS through the edge for no reason.
+
+---
+
+## D90 — The shell holds no identity; `GET /app/account` is the whole bootstrap · locked
+
+The shell is static, cacheable, credential-free bytes (D88), so it ships knowing nothing about who
+is asking. Something has to tell it.
+
+Resolution: **one authenticated call, `GET /app/account`. `200` means signed in; `401` means
+render the sign-in screen. No new endpoint.**
+
+That endpoint already returns everything the authenticated view needs: `account_id`, the
+delivery-form `email` (D72), `plan`, `state`, `created_at`, `credits.remaining`,
+`credits.granted`, `max_ttl_seconds`, `rate_limit` — and the **synchroniser token**, re-derived
+per response rather than stored, precisely so a browser that reloads always holds a usable one
+(D76).
+
+Three consequences, recorded rather than rediscovered:
+
+- **The synchroniser token has exactly two sources and both are already built**: this bootstrap,
+  and the login and verify responses that create a session. There is no third, and in particular
+  no `GET /app/synchroniser` — an endpoint returning a CSRF token to anyone holding only the
+  cookie is a CSRF token an attacker can fetch.
+- **`401` is a state, not an error to surface.** The first call failing *is* the unauthenticated
+  path, so the shell renders sign-in and shows nothing resembling a fault. Every *later* `401`,
+  after a successful bootstrap, means the session ended underneath the page — logged out
+  elsewhere, expired, or the account deleted — and the shell returns to sign-in rather than
+  retrying.
+- **The credit counter and the plan limits come from here**, which is what makes
+  `01-product.md`'s "shows remaining credits prominently" true with no second endpoint, and what
+  lets the "Mail us for credits" `mailto:` be pre-filled with the account email and account id
+  that document requires.
+
+Rejected: **rendering the shell server-side with account state inlined.** It makes the shell
+uncacheable and session-dependent, undoing D88 and D89 together, to save a request that is needed
+anyway for the synchroniser token.
+
+Rejected: **a readable companion cookie signalling sign-in.** A non-`HttpOnly` cookie is a new
+credential-adjacent surface answering a question one authenticated call already answers exactly.
+
+---
+
+## D91 — The first API key is created only when the account holds none · locked
+
+`01-product.md` step 3 promises "an API key is issued immediately on first landing in the
+dashboard, with a ready-to-paste `curl` command beside it", and D83 settled that both signup paths
+end in a session with the first key coming from `POST /app/keys` — because a top-level OAuth
+redirect cannot carry a credential. Neither settles what the *shell* does, and the naive reading
+is a defect.
+
+The cap is five keys per account (`06-auth.md`) and revocation is the only way down. A shell that
+posts a key on load exhausts the account in five reloads and then greets the user with
+`409 key_limit_reached` on their own dashboard.
+
+Resolution: **the shell reads `GET /app/keys` first, and creates one only when the list is empty.**
+
+- Empty → `POST /app/keys`. That response is the one moment the plaintext exists (D76); render it
+  with the paste-ready command.
+- Non-empty → **no automatic creation, ever.** The panel lists what exists and offers explicit
+  creation up to the cap.
+
+**The plaintext lives in a JavaScript variable and nowhere else.** Not `localStorage`, not
+`sessionStorage`, not the URL. A credential that cannot be retrieved from the server (D76) must
+not be parked anywhere a later script or a shared machine can read it. The panel states that it is
+shown once *before* revealing it, which is what `06-auth.md` already requires of the dashboard.
+
+**A reload after dismissal shows no key, and that is correct rather than a gap.** The remedy is
+the one rotation already uses: create another, up to five, and revoke what you are not using.
+
+**The `curl` command is built from `location.origin`.** `DOOT_PUBLIC_ORIGIN` exists and is
+validated at boot (D78), but it is the OAuth `redirect_uri`'s origin — and the string a user
+pastes must be the host they are actually looking at, whether that is behind the edge, a preview
+hostname, or `localhost` during development. Taken from the page it cannot disagree with the
+address bar.
+
+The command is `00-vision.md`'s `PUT`, with the account's own key, an explicit `X-Doot-TTL`, and a
+name under a tag **the shell chose**. That last part is what makes the conversion moment work: the
+explorer does not have to guess which tag to watch, because it wrote the command that picked one
+(D92).
+
+Rejected: **issuing the key server-side during signup and returning it from verify.** D83 rejected
+this for OAuth, and the asymmetry is worse than an extra call: one signup path would deliver a
+credential the other could not.
+
+Rejected: **making `POST /app/keys` idempotent, returning the existing key.** It cannot. Only
+`SHA-256(key)` is stored (`06-auth.md`), so there is no plaintext left to return.
+
+---
+
+## D92 — `GET /app/tags`, because nothing else can tell the explorer what to list · locked
+
+`GET /v1/entries` requires a `tag` and answers `missing_tag` without one. Nothing anywhere
+enumerates an account's tags. So a returning user opening the explorer is shown a text box and
+asked to remember what they tagged things — which is not the "live data explorer" `00-vision.md`
+names as one of the four choices the product *is*.
+
+This is not a gap in the dashboard. It is a capability the API never needed and the explorer
+cannot work without.
+
+Resolution: **`GET /app/tags`, on the control plane only.**
+
+**Why it is cheap.** `tagchain.TagHeads` is an in-RAM map keyed on `(account_id, tag)` — the whole
+point of D12 is that RAM holds the chain heads while disk holds the postings. Answering this is a
+filtered scan of that map: no disk, no traversal, no segment read. It runs on an I/O worker like
+every other engine call (D57), which is the established pattern and avoids an argument about
+holding the engine's tag mutex on the event loop.
+
+**Why the control plane only, and why `/v1` stays at seven endpoints.** The control plane is
+explicitly not public API and not versioned (D73, `06-auth.md`), which is what makes adding to it
+cheap. `/v1` is a published contract that `02-api.md`, `00-vision.md` and the README all describe
+as seven endpoints, and "list my tags" would be the first query-shaped one on it — the exact
+erosion D1 refuses. Our own dashboard is not a third-party integration and needs no such promise.
+
+**Two properties the response states rather than implies:**
+
+- **It names tags that are *known*, not tags that are *non-empty*.** `TagHeads` is never pruned —
+  its only removal is an error rollback inside `push` — so a tag whose every entry has expired
+  keeps its map entry until the process restarts. The explorer must treat an empty listing for a
+  returned tag as ordinary. That is honest rather than defective: traversal validates every hop
+  against the index (D12), so an expired chain listing nothing is the mechanism working.
+- **Bounded, with the truncation visible.** Distinct tags per account is unbounded in principle —
+  10,000 trial writes at five tags each is up to 50,000 — so the response caps at 200 and carries
+  `"truncated": true` when it stopped early. Order is **unspecified and documented as such**: the
+  map yields what it yields and the client sorts the page it received. Sorting 50,000 borrowed
+  strings on a worker is not work this endpoint will do, and for the accounts the feature is
+  actually for — a handful of tags — the page is complete and client-side sorting is exact.
+
+Isolation is the whole of the correctness requirement: the scan filters on `account_id`, and the
+test that matters is that a second account's tags never appear.
+
+Rejected: **an eighth `/v1` endpoint.** Costed above.
+
+Rejected: **the explorer remembering tags in `localStorage`.** It would work on one browser, show
+nothing on a second, and disagree with reality after an expiry — a client-side cache of server
+state that nobody invalidates.
+
+Rejected: **deriving tags from the live feed.** A feed event is 24 bytes and carries no tags
+(D85), and a subscriber joins at the present moment by design — so this could only ever surface
+tags written while the page happened to be open.
+
+Rejected: **pruning `TagHeads` so the endpoint can promise non-empty tags.** New code on the
+maintenance thread that M1's fourth exit condition depends on, to improve a label. Recorded in
+Deferred instead.
+
+---
+
+## D93 — The live view asks for SSE and falls back on a deadline, in the client · locked
+
+D87 left this to the client in one sentence: the dashboard "asks for SSE, and if no frame — not
+even a heartbeat — arrives within a bounded window, it reconnects asking for JSON". M4 is where
+the window becomes a number and the fallback becomes code.
+
+Resolution:
+
+- **`EventSource('/app/stream')` first.** It sends `Accept: text/event-stream` unprompted, which
+  is exactly the discriminator D87 chose, and same-origin means the `__Host-` session cookie is
+  attached with no `withCredentials`.
+- **A 20-second first-frame deadline**, satisfied by anything at all — an `event:` frame or a
+  `: hb` comment. The heartbeat is 15 s (`server/config.zig`, itself ceilinged by Cloudflare's
+  100 s read timeout), so a working stream on a working path must produce something inside 20 s,
+  while a buffering path produces nothing. That is precisely what D68 measured through a real
+  edge: **zero body frames in 90 seconds** at Doot's actual event rate.
+- **On deadline, close the `EventSource` and poll** `/app/stream` with
+  `Accept: application/json` and `?cursor=N`, every 3 seconds. The server side is stateless (D87),
+  so the interval is the client's business alone.
+- **The switch is sticky for the page's lifetime.** A path that buffered once will buffer again,
+  and alternating transports would make the failure intermittent rather than merely slower.
+
+**A frame triggers a refetch, coalesced.** D85 settled that a frame carries `seq` and `op` and
+nothing else, and that the dashboard's response is to re-run the listing it is showing. Two bounds
+on that:
+
+- **At most one refetch in flight, and at most one per 500 ms.** The feed timer is 100 ms and a
+  batch is up to 16 events, so a busy account could otherwise request the same listing ten times a
+  second. Reads are free (`01-product.md`), but the control-plane bucket is 300 ops/min (D74) —
+  about five a second — so an uncoalesced refetch is a dashboard that rate-limits itself out of
+  its own live view.
+- **`event: resync` refetches too and is not otherwise special.** It means the subscriber was
+  lapped, and the correct response is the same refetch — which is why D85 could afford to make it
+  a one-line frame.
+
+**The credit counter refreshes on the same trigger**, from `GET /app/account`, because a `put`
+frame is the only thing that changes it. Polling it on a timer would be a request per interval for
+a number that mostly does not move.
+
+Rejected: **detecting the fallback with a server-side probe or a configuration variable.** D87
+rejected the variable and explained why the client is the only party able to observe its own path.
+
+Rejected: **a shorter deadline.** Under 15 s it can expire before the first heartbeat is even due
+on a perfectly healthy stream, which would put every user on the fallback.
+
+Rejected: **falling back permanently, remembered across visits.** The network path is a property
+of where the user is, not of who they are.
+
+---
+
+## D94 — What M4's exit condition measures, and what CI can actually assert · locked
+
+The exit condition is a stopwatch: "a new user goes from landing page to a written entry visible
+in the live view in under 60 seconds, timed, on a cold browser." That is the product thesis, and
+it is not something a shell script can answer.
+
+Resolution: **split it, and be explicit about which half proves what.**
+
+**`tools/dashboard-check.sh` in CI, driving the surface with `curl`.** It asserts what is
+mechanically checkable and would otherwise rot silently:
+
+- every path in D88's table is served **with no cookie**, with the right `Content-Type` and with
+  the `Cache-Control` D89 assigns it
+- the digest-bearing URLs match the digest the binary actually computed, so a stale reference in
+  the HTML is a failed check rather than a broken page
+- both HTML documents carry the CSP, `nosniff` and `Referrer-Policy`, and no response head
+  exceeds `max_response_head_bytes`
+- `/favicon.ico` is a `404` and **not** a `401`
+- `GET /app/account` with no cookie is `401`, and with one is `200` carrying a synchroniser
+  token — the bootstrap contract D90 rests on
+- `GET /app/tags` returns this account's tags, never another's, and reports truncation
+- `GET /app/stream` answers immediately with a cursor under `Accept: application/json`, and opens
+  a stream under `Accept: text/event-stream` — both branches of D93's fallback, from outside
+- a write through `/v1` appears in a subsequent `/app/entries` listing for its tag, which is the
+  server half of the conversion moment
+
+**The 60 seconds is a timed manual drill, written down.** A fresh browser profile, a real signup,
+the pasted `curl`, and the entry appearing — with the elapsed time and the browser recorded, the
+way every other measured figure in this project is. Run once at M4's close over loopback, and
+again at the end of M5 on the deployed box through the zone, where the number finally includes the
+edge, TLS and a real network. The loopback figure is an optimistic bound and will say so, for the
+same reason D48's recovery figure does.
+
+**What the drill is not automated into, and why that is accepted.** A headless browser could
+assert the *steps* happen, and would be worth having. It cannot assert that a stranger finds the
+button, which is the half of a 60-second onboarding claim that actually fails in practice. Adding
+a browser runtime to a CI job whose only dependency today is a pinned Zig tarball is a real cost,
+and it would measure the mechanism while the condition is about the experience.
+
+Rejected: **counting the condition met by the harness alone.** It converts a product claim into a
+surface check and quietly drops the thing being promised.
+
+Rejected: **deferring the timing to M6.** M6's exit condition is an unaided external user, which
+is strictly harder. Discovering there that the dashboard is a three-minute experience would be
+discovering it with nothing left to cut.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
@@ -3602,6 +4013,7 @@ transport the product ships — both ship, and the client picks.
 | Widening the index slot to carry `seq` | a need to arbitrate replay order without the class merge. Would cost 8 B/entry, a 40% memory increase (D38) |
 | Revisiting `std.Io` as the concurrency layer | a Zig release where the io_uring backend implements networking. Would be a large rewrite of the event loop for no measured gain, so it needs a reason beyond tidiness (D27) |
 | Long-polling instead of SSE for the live view | **no longer speculative.** The default edge behaviour is now measured and it buffers SSE in ~8 KB batches (D68), so this is built as the second implementation behind M4's transport seam and enabled if `sseprobe.py` cannot be made to pass against the real zone after the D31 configuration is applied |
+| Pruning `TagHeads` of tags whose entries have all expired | `GET /app/tags` naming empty tags becoming a real complaint, **or** the map's unbounded growth becoming measurable. It is never pruned today — the only removal in it is an error rollback inside `push` — so it holds every `(account, tag)` pair ever written until a restart. Both effects are cosmetic at trial scale, and the fix puts new code on the maintenance thread M1's fourth exit condition depends on (D92) |
 | A maintenance-time index sweep reclaiming a deleted account's entries early | disk pressure from deleted accounts becoming measurable. The bytes are already unreachable and already scheduled for removal within the plan's maximum lifetime, so this buys earlier reclamation only — at the cost of new code on the thread M1's fourth exit condition depends on (D77) |
 | One ring per core via `SO_REUSEPORT` | measured single-ring throughput becoming a constraint. At 2.9M req/s on one thread this is far off (D27) |
 | Chunked request bodies | a real caller unable to send `Content-Length` |

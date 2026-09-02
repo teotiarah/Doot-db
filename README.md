@@ -86,7 +86,8 @@ edge:
 | M2 — the live feed | **built.** `GET /app/stream`, SSE or JSON on one path, over the D44 ring. Passes `ops/sseprobe.py` over loopback in CI; the run through the zone is scheduled with M5 (D68) |
 | M2 — origin TLS and the edge | **outstanding.** Both gate on infrastructure that does not exist yet |
 | M3 — accounts | **complete.** Signup, verification, login, sessions, password reset, account and key management, the read-only explorer, and GitHub OAuth. Both exit conditions verified over the wire by `tools/app-check.sh`, including enumeration resistance as a *timing* property |
-| M4–M6 | not started |
+| M4 — dashboard | **decisions settled (D88–D94), no code yet.** Three of the seven exist because reading the built control plane as the dashboard's first caller found questions the specification never had to answer — starting with the fact that nothing in the tree could serve an unauthenticated byte |
+| M5–M6 | not started |
 
 **Two of M2's three exit conditions are now met**: every row of the error catalogue is
 reproduced by a `curl` invocation in CI, and credits and the rate limit are verified *exactly*
@@ -131,7 +132,7 @@ zig build test                                          # 618 unit tests
 zig build verify && ./zig-out/bin/m1 all /dev/shm/doot-m1  # 5 M1 exit conditions
 tools/transport-check.sh                                # 52 curl checks
 tools/dataplane-check.sh                                # 158 curl checks
-tools/boot-check.sh                                     # 30 checks against the real binary
+tools/boot-check.sh                                     # 33 checks against the real binary
 tools/exactness-check.sh                                # 28 concurrency and capacity checks
 tools/app-check.sh                                      # 79 control-plane and live-feed checks
 ```
@@ -152,8 +153,15 @@ including the discovery that the crash harness, in its first form, could not det
 missing `fsync` at all (D26–D39). M2 settled twelve before writing any data-plane code
 (D40–D51), one of which caught a silent, unrecoverable data-loss path while the index hash
 key was still a line in an environment-variable list. Building the data plane then forced
-twelve more (D52–D63), each settled in its own pass before the code it governs. See
-[`docs/07-decisions.md`](docs/07-decisions.md).
+twelve more (D52–D63), each settled in its own pass before the code it governs. M3 settled
+eleven before the control plane (D68–D78) and building it forced five more (D79–D83).
+
+**94 decisions now, and the pattern has held every time.** M4's pass (D88–D94) found three
+things the specification had never had to answer, before a line of dashboard code existed:
+nothing in the tree could serve an unauthenticated byte, so `GET /` was a `401` and a sign-in
+screen could not load; nothing could enumerate an account's tags, which the explorer cannot
+work without; and "an API key is issued on first landing" read literally exhausts the five-key
+cap in five reloads. See [`docs/07-decisions.md`](docs/07-decisions.md).
 
 Doot runs on a single machine and makes a best-effort durability promise, not a
 guarantee. Data is backed up off-box continuously with a recovery point of a few minutes.
@@ -164,7 +172,10 @@ Don't use Doot as the only copy of anything you cannot lose.
 A single statically linked [Zig](https://ziglang.org) binary. One process, one machine.
 The dashboard will be plain HTML, CSS and vanilla JavaScript embedded into the binary with
 `@embedFile` — no framework, no bundler, no build step, no separate deployment. **It is not
-built yet**; M4 owns it, and nothing in the tree embeds an asset today.
+built yet**; M4 owns it, and nothing in the tree embeds an asset today. Its decisions are
+settled (D88–D94): the documents are a **third plane** authenticating with nothing, served
+from a fixed table of exact paths, with the build digest in each asset filename so a deploy
+invalidates a cache without a revalidation round trip.
 
 ## Documentation
 

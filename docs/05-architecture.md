@@ -20,7 +20,7 @@ container orchestration.
   │  HTTP/1.1 + keep-alive                        │
   │  router → data plane  /v1/*   (API key)       │
   │         → control plane /app/* (session)      │
-  │         → dashboard assets (@embedFile)       │
+  │         → document plane  /, /app  (none)     │
   │  I/O worker pool (every storage call — D57)   │
   │  storage engine (04-storage.md)               │
   │  control-plane log + in-RAM image (D40)       │
@@ -208,15 +208,63 @@ Each of these is worth more than any storage micro-optimisation.
 Read-only explorer plus account management. Plain HTML, CSS and vanilla JS — no
 framework, no bundler, no build step, no separate deployment.
 
-- Assets embedded at compile time with `@embedFile`, served from memory with strong
-  `ETag`s derived from the build hash. The binary is genuinely self-contained.
+**The dashboard is a third plane** (D88). `/v1` authenticates with an API key and `/app/*`
+with a session cookie; the documents themselves authenticate with nothing, because a
+sign-in screen that needs a session in order to load cannot be reached. So `plane()`
+returns `.document` for a **fixed comptime table of exact paths**, decided before any
+credential is read — the same shape D73 gave the other two.
+
+| path | serves | `Cache-Control` |
+|---|---|---|
+| `/` | landing page | `no-store` |
+| `/app` | dashboard shell | `no-store` |
+| `/app.<digest>.css` | stylesheet | `public, max-age=31536000, immutable` |
+| `/app.<digest>.js` | script | `public, max-age=31536000, immutable` |
+| `/favicon.svg` | icon | `public, max-age=31536000, immutable` |
+| `/favicon.ico` | `404` — the one path a browser fetches unprompted | — |
+| `/robots.txt` | crawl policy | `public, max-age=31536000, immutable` |
+
+A table of exact paths rather than a directory, so path traversal is unrepresentable
+rather than validated. Unauthenticated **and unmetered**: these are a few kilobytes of
+`.rodata` with no store call, lock, allocation or I/O worker behind them — the same cost
+profile as `/healthz`. Routing them through the unauthenticated `/app/auth/*` bucket
+instead would be worse than untidy: at 20 requests/min per address (D74) and four requests
+per page load, the sign-in page would rate-limit its own users.
+
+- Assets embedded at compile time with `@embedFile`. **The digest is in the filename** —
+  `SHA-256` over every embedded file, first 12 hex characters, at comptime — so a deploy
+  changes the URL and nothing stale is reachable. No `ETag`, no `If-None-Match`, no `304`:
+  content-addressing gives better caching than a cheap revalidation, and it keeps
+  conditional requests out of the transport entirely (D89). The binary is genuinely
+  self-contained.
+- Both HTML documents carry `Content-Security-Policy` with `default-src 'none'` and every
+  source named, plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+  **No `'unsafe-inline'`**, which is a constraint on how the dashboard is written: no
+  inline script, no inline style. About 450 bytes of response head against the 2 KiB
+  ceiling. `Strict-Transport-Security` is deliberately absent — TLS terminates at the edge,
+  so it belongs in the zone configuration with the rest of D31's rules.
 - Session cookie authentication, `HttpOnly; Secure; SameSite=Lax`.
+- **The shell carries no identity.** It is static, cacheable and credential-free, so it
+  bootstraps from a single `GET /app/account`: `200` is signed in, `401` is the sign-in
+  screen, and the response already carries the credit balance, the plan limits and the
+  synchroniser token (D90).
 - **Live view on the control plane**, filtered to the session's account from the change feed
   ring (`04-storage.md`). Two framings on one path, chosen by the client's `Accept` header
   (D87): SSE, or an immediate JSON batch for a client whose network path buffers streams.
   A parked stream costs **no additional memory** — it builds frames in the idle read buffer its
   connection already has and gives its 260 KiB request slot back as soon as the head is written
   (D84, D86).
+- **The client chooses the transport, on a deadline** (D93). `EventSource` first; if nothing
+  at all arrives within **20 seconds** — not even a heartbeat, which is due at 15 — it
+  closes and polls the same path with `Accept: application/json` for the rest of the page's
+  life. A frame is a notification (D85), so the response is to re-run the current listing,
+  coalesced to at most one refetch in flight and one per 500 ms: the control-plane bucket is
+  300 ops/min, so an uncoalesced refetch would rate-limit the dashboard out of its own live
+  view.
+- **The explorer lists by tag, and `GET /app/tags` is what tells it which tags exist**
+  (D92). Listing requires a tag and nothing else in the tree enumerates them, so this is a
+  capability the explorer cannot work without — a filtered scan of the in-RAM `TagHeads`
+  map, on the control plane only, so `/v1` stays at seven endpoints.
 - Rendering keys off the stored `Content-Type`: JSON as a collapsible tree, text as
   text, anything else as a hex/size summary. The server never parses bodies.
 

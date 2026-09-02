@@ -1,15 +1,21 @@
 # Accounts, keys and sessions
 
-## Two planes, two credentials
+## Three planes, two credentials
 
-| | data plane | control plane |
-|---|---|---|
-| paths | `/v1/*` | `/app/*` |
-| credential | API key, `Authorization: Bearer` | session cookie |
-| audience | scripts, CI, automation, edge | browser |
-| rate limit bucket | pooled per account (`01-product.md`) | **separate** per account |
-| versioned | yes | no |
-| public API | yes | no |
+| | data plane | control plane | document plane |
+|---|---|---|---|
+| paths | `/v1/*` | `/app/*` | `/`, `/app`, the assets (D88) |
+| credential | API key, `Authorization: Bearer` | session cookie | **none** |
+| audience | scripts, CI, automation, edge | browser | browser |
+| rate limit bucket | pooled per account (`01-product.md`) | **separate** per account | unmetered |
+| versioned | yes | no | n/a |
+| public API | yes | no | no |
+
+The third plane holds the dashboard's own bytes and nothing else — a fixed table of exact
+paths, decided by prefix before any credential, serving comptime-embedded assets from
+`.rodata` (D88). It authenticates with nothing because a sign-in screen that requires a
+session in order to load cannot be reached. Full reasoning and the cache and security
+headers are in `05-architecture.md`.
 
 Strictly separate. An API key can never authenticate a dashboard request, and a session
 cookie can never authenticate a data-plane request. This removes CSRF as a concern for
@@ -227,7 +233,22 @@ Not public API, not versioned, may change freely.
 | `DELETE /app/account` | self-service deletion (see Account deletion below) |
 | `GET /app/keys` · `POST /app/keys` · `DELETE /app/keys/{id}` | key management |
 | `GET /app/entries` · `GET /app/entries/{name}` | read-only explorer |
+| `GET /app/tags` | the tags this account has written — what the explorer lists by |
 | `GET /app/stream` | live feed — SSE, or a JSON batch (see below) |
+
+**`GET /app/tags` exists because listing requires a tag and nothing else enumerates them**
+(D92). `GET /v1/entries` answers `missing_tag` without one, so without this the explorer is a
+text box asking the user to remember what they tagged things — which is not the live explorer
+`00-vision.md` counts as one of the four choices the product is. It is a filtered scan of the
+in-RAM `TagHeads` map: no disk, no traversal. Deliberately **not** an eighth `/v1` endpoint —
+that surface is a published contract described everywhere as seven endpoints, and this would be
+the first query-shaped addition to it.
+
+Two properties it states rather than implies. It names tags that are **known, not non-empty**:
+`TagHeads` is never pruned, so a tag whose entries have all expired keeps its entry until a
+restart, and an empty listing for a returned tag is ordinary. And it is **bounded at 200 with
+`"truncated": true`**, in unspecified order — distinct tags per account is unbounded in
+principle, and the client sorts the page it received.
 
 `DELETE /app/account` was missing from this table until M3 built it. The Account deletion
 section below specified the flow in full and no endpoint reached it, which is a gap in the
