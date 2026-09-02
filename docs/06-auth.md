@@ -252,6 +252,32 @@ Accepted consequence: a user who writes a secret into an entry by accident must 
 it via the API, or ask support. The alternative is a permanent second write path, which
 is a worse trade.
 
+## Errors on this surface
+
+Five codes belong to the control plane and appear nowhere in `02-api.md`'s catalogue, which is
+the published data-plane contract (D79). Bodies are the same uniform shape every Doot error
+uses.
+
+| status | code | meaning |
+|---|---|---|
+| 400 | `invalid_email` | not a usable address |
+| 400 | `password_too_short` | under 10 characters |
+| 400 | `invalid_challenge` | the one-time code is wrong, expired, or out of attempts |
+| 403 | `invalid_synchroniser` | missing or incorrect synchroniser token on a state-changing route |
+| 409 | `key_limit_reached` | the account already holds 5 keys |
+
+**`invalid_challenge` is one code for three outcomes on purpose.** Distinguishing "wrong" from
+"expired" would tell a caller whether a code had ever been issued for an address, which is the
+same oracle the identical signup and reset responses exist to close.
+
+A request with no session cookie is `401 missing_credentials`; one with a cookie that does not
+resolve is `401 invalid_credentials` — the same two codes the data plane uses for a bearer
+token, because they mean the same thing.
+
+Request bodies are `application/x-www-form-urlencoded` (D80). The control plane is not public
+API, so this is ours to choose; it parses without an allocator, which matters because the
+validation runs on the event loop.
+
 ## Brute force and enumeration
 
 | surface | defence |

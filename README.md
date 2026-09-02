@@ -84,7 +84,8 @@ edge:
 | M2 — data plane | endpoints, credits, rate limit, idempotency: **complete and verified over HTTP** |
 | M2 — origin binary | **complete.** `zig build` produces `doot`: configuration from the environment, the maintenance thread, and a graceful shutdown that keeps credit balances exact across a deploy (D63) |
 | M2 — SSE and the edge | **outstanding.** The change feed ring is built and published to; nothing consumes it. Origin TLS and the Cloudflare zone gate on infrastructure that does not exist yet |
-| M3–M6 | not started |
+| M3 — accounts | **control plane built.** Signup, verify, login, logout, password reset, account and key management, and the read-only explorer — which reuses the data plane's own read path rather than growing a second one. GitHub OAuth outstanding |
+| M4–M6 | not started |
 
 **Two of M2's three exit conditions are now met**: every row of the error catalogue is
 reproduced by a `curl` invocation in CI, and credits and the rate limit are verified *exactly*
@@ -96,9 +97,15 @@ a `Content-Type` carrying a control byte was stored and charged for and then fai
 read (D64), and an idempotent replay of any body over 3.3 KB silently re-executed and charged
 a credit, against the published promise that replays are free (D67).
 
-**It has no way to create an account yet.** M3 owns signup, so a fresh deployment answers
-`401` to everything — deliberately, rather than growing an operator subcommand built to be
-replaced (D63).
+**Accounts now exist.** M3's control plane is built: signup with email and a one-time code,
+login, sessions, API key management and self-service deletion, all under `/app/*` with session
+cookies and a synchroniser token. That closed D63's one recorded open question — how the first
+account comes into being — without the operator subcommand it warned would be built to be
+replaced.
+
+Two pieces of M3 are specified and deliberately not yet routed, because a route that cannot
+complete is a worse answer than no route (D82): **GitHub OAuth**, which needs its token
+exchange, and the **live feed**, which waits on the transport seam D68 describes.
 
 | | measured on one 8-core box |
 |---|---|
@@ -151,8 +158,9 @@ Don't use Doot as the only copy of anything you cannot lose.
 ## Built with
 
 A single statically linked [Zig](https://ziglang.org) binary. One process, one machine.
-Plain HTML, CSS and vanilla JavaScript for the dashboard, embedded into the binary at
-compile time — no framework, no bundler, no build step, no separate deployment.
+The dashboard will be plain HTML, CSS and vanilla JavaScript embedded into the binary with
+`@embedFile` — no framework, no bundler, no build step, no separate deployment. **It is not
+built yet**; M4 owns it, and nothing in the tree embeds an asset today.
 
 ## Documentation
 

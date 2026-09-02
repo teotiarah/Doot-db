@@ -288,7 +288,22 @@ left for an implementation diff to decide. Two came from measurement rather than
 | **D77** | account deletion cannot delete entries eagerly, because the index holds no names (D11). Deletion makes data permanently inaccessible at once and the bytes go with their expiry — which only works because lifetime is mandatory |
 | D78 | M3's five environment variables, all required and none defaulted, and the mail queue thread two of them configure |
 
-### Pass 2 — implementation
+### Pass 2 — implementation · **MOSTLY COMPLETE**
+
+Built and covered by unit tests: the control log's eight new event types and the state they
+rebuild, Argon2id passwords on the I/O worker pool, credential generation, the two forms of an
+email address, `__Host-` cookies, the derived synchroniser token, the unauthenticated rate
+limiter, RAM-only OTP and OAuth-state storage, the routing table and plane split, the client
+address, the mail queue and its thread, M3's five environment variables, and every handler the
+router routes.
+
+Findings are D79–D82, with amendments on D70, D72 and D74. Two of those amendments corrected
+rules that could not have worked: D70's session-expiry comparison could never fire, and D74's
+peer capture would have cost a syscall per connection for a fallback the production shape never
+reaches.
+
+**Outstanding:** GitHub OAuth's token exchange, and a `curl` harness for the `/app` surface. The
+OAuth routes are deliberately unrouted until the exchange exists (D82).
 
 - GitHub OAuth with `state` binding
 - Email + password, Argon2id, OTP verification, queued outbound mail via ZeptoMail

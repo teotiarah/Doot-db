@@ -3152,6 +3152,139 @@ is mid-redirect.
 
 ---
 
+# M3 findings
+
+What building the control plane forced. Each was settled in the record before the code it
+governs, per sequencing rule 2 — the amendments on D70, D72 and D74 are in place above rather
+than collected here, and this section records the ones that needed a decision of their own.
+
+---
+
+## D79 — The control plane's error codes are not in the published catalogue · locked
+
+M3 needs five codes the data plane has no use for: `invalid_email`, `password_too_short`,
+`invalid_challenge`, `invalid_synchroniser`, `key_limit_reached`.
+
+D52 settled that a missing code gets added rather than a near neighbour overloaded, and that
+still holds — `invalid_request` would be a lie for a password that parsed perfectly and was
+merely too short. What is new is *where they are documented*.
+
+Resolution: **they live in `06-auth.md`, not in `02-api.md`'s error table.** That table is the
+published data-plane contract, `tools/dataplane-check.sh` reproduces every row of it with a
+`curl` invocation, and M2's exit condition is stated in terms of it. A code a `/v1` caller can
+never receive has no business in either — it would be a row nothing can reproduce, which
+would either weaken the exit condition or add a check that lies about what it proves.
+
+`Code.controlPlaneOnly()` exists so a test can hold the line: **25 data-plane codes and 5
+control-plane ones**, asserted, so one cannot drift into the other by accident.
+
+**`invalid_challenge` is one code for three internal outcomes** — wrong, expired, and
+attempts exhausted. The table distinguishes them because it must; the wire deliberately does
+not. "That code was wrong" and "that code has expired" together tell an attacker whether a
+code was ever issued for an address, which is the oracle `06-auth.md` and D75 exist to close.
+Its message is asserted not to contain the words that would give it away.
+
+**`403` had no reason phrase.** `Code.reason()` switches on status and its `else` is
+`unreachable`, so the first synchroniser failure would have been a panic rather than a
+`Forbidden`. Found by adding the code, not by hitting it in production — which is the
+argument for adding codes deliberately rather than reaching for a near neighbour.
+
+---
+
+## D80 — Control-plane request bodies are form-encoded · locked
+
+The dashboard is our own plain HTML and vanilla JavaScript (`05-architecture.md`), and
+`06-auth.md` says the control plane is neither public API nor versioned. So the request format
+is ours to choose and nothing external depends on it.
+
+Resolution: **`application/x-www-form-urlencoded`**, parsed in place.
+
+The reason is not taste. Control-plane validation runs on the event loop, and `std.json` needs
+an allocator there. D57's rule is that the loop does memory-only work — and "memory-only" is a
+weaker promise than "allocation-free". A parser that can take a heap lock on the loop can
+stall every connection the loop is serving, which is the same failure D57 was written to
+prevent, arriving through a different door.
+
+Form encoding is also what an HTML form posts natively, so the dashboard needs no serialiser.
+
+**The decoder is deliberately not shared with `api.parse.decodeName`.** They share the
+mechanism and not the rules: a name is decoded from a *path*, where `+` is a literal plus and
+must stay one, while in a form body `+` means space. Sharing would mean a flag, and a flag on
+a decoder is how a name eventually gets a space in it.
+
+The data plane is untouched. `/v1` bodies are opaque bytes and always were (`02-api.md`);
+nothing here reads one.
+
+Rejected: **JSON with a bump-allocator on the loop.** It solves the lock and keeps the
+parser's complexity, to serve a format the only client of which is ours.
+
+Rejected: **JSON parsed on a worker.** It would move validation off the loop, so a malformed
+body would occupy an I/O worker — and D57 put storage on those workers precisely so that
+cheap rejections happen before one is involved.
+
+---
+
+## D81 — The email index is derived at boot, not stored in the log · locked
+
+Login has to find an account from an email address. Nothing could.
+
+`Control` indexes keys by digest and accounts by id; the anchors D72 introduced are keyed by
+anchor hash and exist for the trial grant. None of them answers "which account owns this
+address" — and `Control` **cannot compute an anchor**, because the normalisation that makes
+one lives in `api`, which `control` does not import and must not.
+
+Resolution: **a service-owned map from anchor digest to account id, rebuilt at startup** by
+iterating the control log's account image (`Control.forEachAccount`).
+
+Keyed on the **anchor** rather than the delivery address, so `Some.One@Gmail.com` signs in to
+the account registered as `someone@gmail.com` — the same identity the grant is bound to.
+Matching the raw address would make signing in depend on how the user happened to type it.
+
+Rejected: **widening `account_created` with a 32-byte anchor and bumping its version.** A
+permanent wire change, to serve an index that one pass over an in-RAM map reconstructs — and
+D40 already establishes that image is single-digit megabytes at ten thousand accounts.
+
+Rejected: **claiming the email anchor at account creation instead of at activation**, which
+would make the anchor table itself the index. It would let an account that never verifies hold
+an address forever and lock out the real owner, and it would break the first-claim-wins rule
+the grant depends on.
+
+Rejected: **an exact-match index on the stored address.** It would make login case-sensitive
+in the domain, which no user expects and RFC 1035 does not require.
+
+**Accepted consequence: an address that cannot be normalised is skipped at rebuild rather
+than fatal.** Nothing we accept can be in that state, but a log written by an older build
+might be — and refusing to start over one unindexable account would take the whole service
+down for a row that only affects that account's ability to sign in.
+
+---
+
+## D82 — A route that cannot complete is not routed · locked
+
+Two parts of the control plane are specified and not yet built: the SSE live feed, which D68
+keeps in M2's scope behind a transport seam, and the GitHub OAuth exchange.
+
+Both have a path in `06-auth.md`'s surface table, so the tempting move is to route them and
+answer `501`, or `503`, or an empty stream.
+
+Resolution: **`routeApp` returns `unrouted` for them, so they are `404` like any other unknown
+path.** The `AppRoute` variants stay declared, so `needsSynchroniser` and the router's tests
+keep covering them, and the commit that implements each flow makes it reachable.
+
+A route that answers something is a claim that the endpoint exists. `501` is the most honest
+code available and it is still worse than `404` here, because a client cannot distinguish
+"this deployment has not built it" from "this deployment has it switched off" — and neither is
+true. `404` says exactly what is true: there is nothing at that path yet.
+
+This also keeps a property worth having: **every route `routeApp` returns is answered by a
+handler.** That makes "is the control plane complete" a question the router answers, rather
+than something to audit by reading thirteen branches.
+
+Rejected: **routing them behind a feature flag.** A flag is configuration for something no
+operator has a reason to choose, and it would make the surface depend on which way it was set.
+
+---
+
 ## Deferred
 
 | item | trigger to reopen |
